@@ -17,6 +17,7 @@ if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
 $version = (Get-Content tauri.conf.json | ConvertFrom-Json).version
 Copy-Item target\release\reolink-rs.exe "dist\Reolink-rs_$version.exe" -Force
-Copy-Item target\release\bundle\nsis\*.exe dist\ -Force
-Copy-Item target\release\bundle\msi\*.msi dist\ -Force
+# Only this version: the bundle folders keep installers from earlier builds.
+Copy-Item "target\release\bundle\nsis\Reolink-rs_${version}_*.exe" dist\ -Force
+Copy-Item "target\release\bundle\msi\Reolink-rs_${version}_*.msi" dist\ -Force
 Get-ChildItem dist | Format-Table Name, @{n="MB"; e={[math]::Round($_.Length / 1MB, 1)}}
