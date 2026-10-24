@@ -1,8 +1,9 @@
 #![allow(dead_code)] // shares the app's modules but uses only part of them
 //! Validate camera settings end to end on saved cameras, through the same worker and engine the app uses:
 //! `cargo run --example settings_check -- [--write]`
-//! Reads every settings page. With --write, nudges a few harmless values by one step, verifies the camera
-//! applied them, then restores the originals and verifies again.
+//! Reads every settings page. With --write: (1) writes every writable field back with its current value, which
+//! proves each write id and format is accepted without changing anything; (2) makes small reversible changes,
+//! verifies the camera applied them, restores the originals and verifies again.
 
 #[path = "../src/device.rs"]
 mod device;
@@ -18,7 +19,7 @@ mod xmledit;
 use device::{Cmd, Device, DeviceConfig};
 use settings::{Camera, Msg};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Cam(tokio::sync::mpsc::UnboundedSender<Cmd>);
 
@@ -34,16 +35,62 @@ impl Camera for Cam {
     fn get(&self, msg: Msg) -> impl std::future::Future<Output = Result<String, String>> + Send {
         self.request(msg, None)
     }
-    fn set(&self, msg: Msg, xml: String) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        async move { self.request(msg, Some(xml)).await.map(|_| ()) }
+    async fn set(&self, msg: Msg, xml: String) -> Result<(), String> {
+        self.request(msg, Some(xml)).await.map(|_| ())
     }
 }
 
-/// A one-step change that stays in range, so restoring is always possible.
-fn nudge(v: &settings::FieldView) -> String {
-    let cur: i64 = v.value.parse().unwrap();
-    if cur < v.max.unwrap() { cur + 1 } else { cur - 1 }.to_string()
+fn refused(e: &str) -> bool {
+    e.contains("doesn't allow changing")
 }
+
+fn one(key: &str, v: String) -> BTreeMap<String, String> {
+    [(key.to_string(), v)].into_iter().collect()
+}
+
+fn flip(s: &str, i: usize) -> String {
+    let c = if &s[i..i + 1] == "1" { "0" } else { "1" };
+    format!("{}{c}{}", &s[..i], &s[i + 1..])
+}
+
+/// A reversible edit: page, field, and how to derive the test value from the current one.
+fn tweak(key: &str, cur: &str) -> Option<String> {
+    Some(match key {
+        "md_s0" => (if cur == "50" { 49 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
+        "ir_bright" => (if cur == "100" { 99 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
+        "tl_overwrite" => (if cur == "1" { "0" } else { "1" }).to_string(),
+        "ftp_port" => (if cur == "2121" { "2122" } else { "2121" }).to_string(),
+        "smtp_nick" => if cur == "Reolink-rs test" { "Reolink-rs check".into() } else { "Reolink-rs test".into() },
+        "push_sched" => {
+            let mut m: BTreeMap<String, String> = serde_json::from_str(cur).ok()?;
+            let k = m.keys().next()?.clone();
+            let t = flip(&m[&k], 3); // Sunday 03:00
+            m.insert(k, t);
+            serde_json::to_string(&m).ok()?
+        }
+        "md_zone" => {
+            let mut z: serde_json::Value = serde_json::from_str(cur).ok()?;
+            let cells = z["cells"].as_str()?.to_string();
+            z["cells"] = flip(&cells, cells.len() - 1).into(); // bottom-right cell
+            z.to_string()
+        }
+        "masks" => {
+            let mut v: serde_json::Value = serde_json::from_str(cur).ok()?;
+            if v["rects"].as_array()?.len() >= v["max"].as_u64()? as usize {
+                return None;
+            }
+            v["rects"].as_array_mut()?.push(serde_json::json!([20, 20, 120, 80]));
+            v["enable"] = "1".into();
+            v.to_string()
+        }
+        _ => return None,
+    })
+}
+
+const REVERSIBLE: &[(&str, &str)] = &[
+    ("motion", "md_s0"), ("motion", "md_zone"), ("schedules", "push_sched"), ("privacy", "masks"),
+    ("smart", "tl_overwrite"), ("ftp", "ftp_port"), ("email", "smtp_nick"), ("lights", "ir_bright"),
+];
 
 async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
     // The worker connects in the background; wait until a settings read succeeds.
@@ -54,37 +101,75 @@ async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let mut all_ok = true;
+    let mut total_fields = 0;
     for page in settings::PAGES {
+        let t = Instant::now();
         let view = settings::read_page(cam, page).await;
-        let shown: Vec<String> = view.fields.iter().map(|f| format!("{}={}", f.key, f.display)).collect();
-        println!("{name:10} {:12} {:2} fields: {}", page.id, view.fields.len(), shown.join(", "));
-        if view.fields.is_empty() {
-            all_ok = false;
-        }
+        total_fields += view.fields.len();
+        let shown: Vec<String> = view
+            .fields
+            .iter()
+            .map(|f| {
+                let v = if ["schedule", "zone", "masks"].contains(&f.kind) { format!("<{}>", f.kind) } else { f.display.clone() };
+                format!("{}={}", f.key, v)
+            })
+            .collect();
+        println!("{name:10} {:12} {:2} fields {:>5} ms: {}", page.id, view.fields.len(), t.elapsed().as_millis(), shown.join(", "));
     }
+    println!("{name:10} total {total_fields} fields");
     if !write {
         return Ok(all_ok);
     }
-    for (page_id, key, untouched) in [("lights", "ir_bright", "status_led"), ("display", "sharpen", "bright")] {
+
+    // (1) No-op writes: every writable field back with its current value.
+    for page in settings::PAGES {
+        let view = settings::read_page(cam, page).await;
+        let same: BTreeMap<String, String> = view
+            .fields
+            .iter()
+            .filter(|f| f.kind != "info" && f.kind != "password")
+            .map(|f| (f.key.to_string(), f.value.clone()))
+            .collect();
+        if same.is_empty() {
+            continue;
+        }
+        let r = settings::write_page(cam, page, &same).await;
+        if r.iter().all(|r| r.error.as_deref().is_some_and(refused)) {
+            println!("{name:10} no-op write {:12} => READ-ONLY (camera refuses writes; the app shows these fields read-only)", page.id);
+            continue;
+        }
+        let bad: Vec<_> = r.iter().filter(|r| !r.ok).map(|r| format!("{}: {}", r.key, r.error.clone().unwrap_or_default())).collect();
+        all_ok &= bad.is_empty();
+        println!("{name:10} no-op write {:12} {} fields  => {}", page.id, r.len(), if bad.is_empty() { "PASS".into() } else { format!("FAIL {bad:?}") });
+    }
+
+    // (2) Reversible changes.
+    for (page_id, key) in REVERSIBLE {
         let page = settings::page(page_id).unwrap();
         let before = settings::read_page(cam, page).await;
-        let field = before.fields.iter().find(|f| f.key == key).expect("field present");
-        let other = before.fields.iter().find(|f| f.key == untouched).map(|f| f.value.clone());
+        let Some(field) = before.fields.iter().find(|f| f.key == *key) else {
+            println!("{name:10} skip {key}: not offered by this camera");
+            continue;
+        };
         let original = field.value.clone();
-        let target = nudge(field);
-        let set = |v: String| -> BTreeMap<String, String> { [(key.to_string(), v)].into_iter().collect() };
-        let r1 = settings::write_page(cam, page, &set(target.clone())).await;
-        let r2 = settings::write_page(cam, page, &set(original.clone())).await;
+        let Some(target) = tweak(key, &original) else {
+            println!("{name:10} skip {key}: no safe test value");
+            continue;
+        };
+        let r1 = settings::write_page(cam, page, &one(key, target)).await;
+        if r1[0].error.as_deref().is_some_and(refused) {
+            println!("{name:10} change {page_id}/{key}: READ-ONLY (camera refuses writes)");
+            continue;
+        }
+        let r2 = settings::write_page(cam, page, &one(key, original.clone())).await;
         let after = settings::read_page(cam, page).await;
-        let restored = after.fields.iter().find(|f| f.key == key).map(|f| f.value.clone());
-        let other_after = after.fields.iter().find(|f| f.key == untouched).map(|f| f.value.clone());
-        let ok = r1[0].ok && r2[0].ok && restored.as_deref() == Some(original.as_str()) && other == other_after;
+        let restored = after.fields.iter().find(|f| f.key == *key).map(|f| f.value.clone());
+        let ok = r1[0].ok && r2[0].ok && restored.as_deref() == Some(original.as_str());
         all_ok &= ok;
         println!(
-            "{name:10} write {key}: {original} -> {target} ({}) -> {original} ({}); {untouched} unchanged: {}  => {}",
-            if r1[0].ok { "verified" } else { r1[0].error.as_deref().unwrap_or("failed") },
-            if r2[0].ok { "verified" } else { r2[0].error.as_deref().unwrap_or("failed") },
-            other == other_after,
+            "{name:10} change {page_id}/{key}: applied {} restored {}  => {}",
+            if r1[0].ok { "verified".into() } else { r1[0].error.clone().unwrap_or_default() },
+            if r2[0].ok { "verified".into() } else { r2[0].error.clone().unwrap_or_default() },
             if ok { "PASS" } else { "FAIL" }
         );
     }

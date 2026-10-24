@@ -35,17 +35,20 @@ Phase 1 (done): add/edit/remove devices (IP or UID, NVR channel), 1 / 2-stacked 
 Clear/Fluent streams, double-click a tile for single view (Esc to exit), collapsible PTZ panel (hold to move),
 snapshot, MP4 recording, battery level.
 
-Phase 2 (done): camera settings (device info, display, stream, detection & alerts, lights, system,
-maintenance) and app settings (folders, recording segments, disk-space warning, GPU decoding, network scan,
-run at startup). Inventory and protocol notes: [docs/settings-inventory.md](docs/settings-inventory.md).
+Phase 2 (done): camera settings, 14 pages, 119 fields per camera: device info, display, stream, detection &
+recording, motion (read-only on Argus 4 Pro), privacy masks, schedules, email, FTP, network, smart detection &
+time-lapse, lights, system, maintenance, with schedule/area/mask editors drawn over a live snapshot, email/FTP
+tests, time sync and reboot. App settings: folders, recording segments, disk-space warning, GPU decoding,
+network scan, run at startup. LAN auto-detect of cameras. Inventory, SDK command table and validation results:
+[docs/settings-inventory.md](docs/settings-inventory.md).
+
+Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
 Next phases toward parity with the official client:
 1. Live audio and two-way talk; PTZ presets/zoom/focus
 2. Playback: calendar, timeline, SD/NVR recording search and download
-3. LAN device discovery and auto-detected NVR channels
-4. Remote config pages (display, encoding, recording, alarms, network, users, firmware update)
-5. Alarm/motion notifications and event log
-6. Local settings, language packs, file encryption tools
+3. Alarm/motion notifications and event log; firmware update
+4. Users, Wi-Fi network switching, AI detection config (need protocol work; read-only today)
 
 ## Patching the official client instead
 

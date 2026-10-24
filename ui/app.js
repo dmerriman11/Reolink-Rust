@@ -410,6 +410,22 @@ function control(f) {
       c.append(i);
       break;
     }
+    case "password": {
+      const i = Object.assign(el("input"), { type: "password", id, value: S.values[f.key], placeholder: "Unchanged", autocomplete: "new-password" });
+      if (f.max_len) i.maxLength = f.max_len;
+      i.oninput = () => set(i.value);
+      c.append(i);
+      break;
+    }
+    case "ipv4": {
+      const i = Object.assign(el("input"), { type: "text", id, value: S.values[f.key], maxLength: 15, inputMode: "decimal", placeholder: "0.0.0.0", spellcheck: false });
+      i.oninput = () => set(i.value.trim());
+      c.append(i);
+      break;
+    }
+    case "schedule": c.append(scheduleEditor(f, set)); break;
+    case "zone": c.append(zoneEditor(f, set)); break;
+    case "masks": c.append(masksEditor(f, set)); break;
     case "folder": {
       const p = Object.assign(el("span", "path-val"), { textContent: S.values[f.key], title: S.values[f.key] });
       const b = Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "Change…", id });
@@ -437,6 +453,7 @@ function renderSettingsBody() {
     const row = el("div", "set-row");
     row.dataset.key = f.key;
     const label = Object.assign(el("label", "set-label"), { textContent: f.label, htmlFor: `set-${f.key}` });
+    if (["schedule", "zone", "masks"].includes(f.kind)) row.classList.add("wide");
     row.append(label, control(f));
     if (S.errors[f.key]) row.append(Object.assign(el("div", "set-error"), { textContent: S.errors[f.key] }));
     return row;
@@ -460,6 +477,22 @@ function renderSettingsActions() {
     action("Sync time with this PC", async () => {
       await invoke("sync_camera_time", { id: S.deviceId });
       setStatus("Camera clock set to this PC's time.");
+    });
+  }
+  if (S.page === "email") {
+    action("Send test email", async () => {
+      if (dirty()) throw new Error("Save your changes first; the test uses the camera's saved settings.");
+      setStatus("Sending test email…");
+      await invoke("camera_test", { id: S.deviceId, which: "email" });
+      setStatus("Test email sent. Check the recipient inbox.");
+    });
+  }
+  if (S.page === "ftp") {
+    action("Test FTP", async () => {
+      if (dirty()) throw new Error("Save your changes first; the test uses the camera's saved settings.");
+      setStatus("Testing FTP…");
+      await invoke("camera_test", { id: S.deviceId, which: "ftp" });
+      setStatus("FTP test succeeded.");
     });
   }
   if (S.page === "maintenance") {
@@ -515,6 +548,192 @@ function setupSettings() {
   };
   $("#settings-close").onclick = close;
   $("#settings-dialog").addEventListener("cancel", (e) => { e.preventDefault(); close(); });
+}
+
+
+// ---------- rich editors: schedules, motion area, privacy masks ----------
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// Paint by dragging: the first cell decides whether the drag turns cells on or off.
+function paintable(grid, onPaint) {
+  let painting = null;
+  grid.addEventListener("pointerdown", (e) => {
+    const cell = e.target.closest("[data-i]");
+    if (!cell) return;
+    grid.setPointerCapture(e.pointerId);
+    painting = cell.classList.contains("on") ? "0" : "1";
+    onPaint(+cell.dataset.i, painting);
+  });
+  grid.addEventListener("pointermove", (e) => {
+    if (painting === null) return;
+    const cell = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-i]");
+    if (cell && grid.contains(cell)) onPaint(+cell.dataset.i, painting);
+  });
+  const stop = () => { painting = null; };
+  grid.addEventListener("pointerup", stop);
+  grid.addEventListener("pointercancel", stop);
+}
+
+function scheduleEditor(f, set) {
+  const wrap = el("div", "sched");
+  const value = JSON.parse(S.values[f.key]);
+  const types = Object.keys(value);
+  let current = types[0];
+  const tabs = el("div", "seg sched-tabs");
+  const grid = el("div", "sched-grid");
+  const commit = () => set(JSON.stringify(value));
+  const draw = () => {
+    for (const b of tabs.children) b.setAttribute("aria-pressed", String(b.dataset.t === current));
+    const table = value[current];
+    grid.replaceChildren(el("span", "sched-corner"));
+    for (let h = 0; h < 24; h++) grid.append(Object.assign(el("span", "sched-hour"), { textContent: h % 3 === 0 ? String(h) : "" }));
+    DAYS.forEach((d, day) => {
+      grid.append(Object.assign(el("span", "sched-day"), { textContent: d }));
+      for (let h = 0; h < 24; h++) {
+        const i = day * 24 + h;
+        const c = el("span", "sched-cell" + (table[i] === "1" ? " on" : ""));
+        c.dataset.i = i;
+        c.title = `${d} ${String(h).padStart(2, "0")}:00`;
+        grid.append(c);
+      }
+    });
+  };
+  for (const t of types) {
+    const b = Object.assign(el("button"), { type: "button", textContent: t.replace("_", " / ") });
+    b.dataset.t = t;
+    b.onclick = () => { current = t; draw(); };
+    tabs.append(b);
+  }
+  paintable(grid, (i, v) => {
+    const t = value[current];
+    if (t[i] === v) return;
+    value[current] = t.slice(0, i) + v + t.slice(i + 1);
+    grid.querySelector(`[data-i="${i}"]`).classList.toggle("on", v === "1");
+    commit();
+  });
+  const fill = (v) => { value[current] = v.repeat(168); draw(); commit(); };
+  const tools = el("div", "editor-tools");
+  tools.append(
+    Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "All day, every day", onclick: () => fill("1") }),
+    Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "Clear", onclick: () => fill("0") }),
+  );
+  wrap.append(tabs, grid, tools);
+  draw();
+  return wrap;
+}
+
+// Snapshot behind the zone/mask editors, fetched once per dialog page.
+async function snapshotInto(img, note) {
+  try {
+    img.src = await invoke("camera_snapshot", { id: S.deviceId });
+  } catch (e) {
+    note.textContent = "No snapshot available; drawing on a blank frame.";
+  }
+}
+
+function zoneEditor(f, set) {
+  const z = JSON.parse(S.values[f.key]);
+  const wrap = el("div", "frame-editor");
+  const stage = el("div", "frame-stage");
+  const img = el("img", "frame-img");
+  const note = el("p", "editor-note", "");
+  const grid = el("div", "zone-grid");
+  grid.style.gridTemplateColumns = `repeat(${z.w}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${z.h}, 1fr)`;
+  for (let i = 0; i < z.w * z.h; i++) {
+    const c = el("span", "zone-cell" + (z.cells[i] === "1" ? " on" : ""));
+    c.dataset.i = i;
+    grid.append(c);
+  }
+  const commit = () => set(JSON.stringify(z));
+  paintable(grid, (i, v) => {
+    if (z.cells[i] === v) return;
+    z.cells = z.cells.slice(0, i) + v + z.cells.slice(i + 1);
+    grid.children[i].classList.toggle("on", v === "1");
+    commit();
+  });
+  const fill = (v) => {
+    z.cells = v.repeat(z.w * z.h);
+    for (const c of grid.children) c.classList.toggle("on", v === "1");
+    commit();
+  };
+  const tools = el("div", "editor-tools");
+  tools.append(
+    Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "Whole picture", onclick: () => fill("1") }),
+    Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "Clear", onclick: () => fill("0") }),
+    Object.assign(el("span", "editor-hint"), { textContent: "Drag to paint where motion is detected." }),
+  );
+  stage.append(img, grid);
+  wrap.append(stage, tools, note);
+  snapshotInto(img, note);
+  return wrap;
+}
+
+function masksEditor(f, set) {
+  const v = JSON.parse(S.values[f.key]);
+  const REF = 1000;
+  const wrap = el("div", "frame-editor");
+  const stage = el("div", "frame-stage masks");
+  const img = el("img", "frame-img");
+  const note = el("p", "editor-note", "");
+  const layer = el("div", "mask-layer");
+  const commit = () => set(JSON.stringify(v));
+  const enable = el("label", "switch");
+  const box = Object.assign(el("input"), { type: "checkbox", checked: v.enable === "1" });
+  box.onchange = () => { v.enable = box.checked ? "1" : "0"; commit(); };
+  enable.append(box, el("span"));
+  const count = el("span", "editor-hint");
+  const draw = () => {
+    layer.replaceChildren();
+    v.rects.forEach(([x, y, w, h], i) => {
+      const r = el("div", "mask-rect");
+      Object.assign(r.style, { left: `${x / 10}%`, top: `${y / 10}%`, width: `${w / 10}%`, height: `${h / 10}%` });
+      const x_ = Object.assign(el("button", "mask-del"), { type: "button", textContent: "×", title: "Remove" });
+      x_.onpointerdown = (e) => e.stopPropagation();
+      x_.onclick = () => { v.rects.splice(i, 1); draw(); commit(); };
+      r.append(x_);
+      layer.append(r);
+    });
+    count.textContent = `${v.rects.length} of ${v.max} areas. Drag on the picture to add one.`;
+  };
+  let start = null;
+  const pos = (e) => {
+    const b = layer.getBoundingClientRect();
+    return [Math.min(REF, Math.max(0, Math.round(((e.clientX - b.left) / b.width) * REF))),
+            Math.min(REF, Math.max(0, Math.round(((e.clientY - b.top) / b.height) * REF)))];
+  };
+  let ghost = null;
+  layer.addEventListener("pointerdown", (e) => {
+    if (v.rects.length >= v.max || e.target.closest(".mask-del")) return;
+    layer.setPointerCapture(e.pointerId);
+    start = pos(e);
+    ghost = el("div", "mask-rect ghost");
+    layer.append(ghost);
+  });
+  layer.addEventListener("pointermove", (e) => {
+    if (!start) return;
+    const [x2, y2] = pos(e);
+    Object.assign(ghost.style, {
+      left: `${Math.min(start[0], x2) / 10}%`, top: `${Math.min(start[1], y2) / 10}%`,
+      width: `${Math.abs(x2 - start[0]) / 10}%`, height: `${Math.abs(y2 - start[1]) / 10}%`,
+    });
+  });
+  layer.addEventListener("pointerup", (e) => {
+    if (!start) return;
+    const [x2, y2] = pos(e);
+    const r = [Math.min(start[0], x2), Math.min(start[1], y2), Math.abs(x2 - start[0]), Math.abs(y2 - start[1])];
+    start = null;
+    if (r[2] >= 10 && r[3] >= 10) { v.rects.push(r); if (v.enable !== "1") { v.enable = "1"; box.checked = true; } commit(); }
+    draw();
+  });
+  const tools = el("div", "editor-tools");
+  const lbl = Object.assign(el("span", "editor-hint"), { textContent: "Masks on" });
+  tools.append(enable, lbl, count);
+  stage.append(img, layer);
+  wrap.append(stage, tools, note);
+  draw();
+  snapshotInto(img, note);
+  return wrap;
 }
 
 // ---------- LAN discovery ----------
@@ -641,7 +860,19 @@ function demoInvoke(cmd, args) {
     layout: 2, tiles: [1, 2, null, null, ...Array(12).fill(null)], stream_base: "", token: "",
   };
   if (cmd === "get_prefs") return Promise.resolve({ snapshot_dir: "C:\\Users\\you\\Videos\\Reolink-rs", record_dir: "C:\\Users\\you\\Videos\\Reolink-rs", segment_minutes: 30, space_warning_gb: 5, hardware_decode: true, scan_network: true, run_at_startup: false });
-  if (cmd === "camera_pages") return Promise.resolve([{ id: "display", title: "Display" }, { id: "lights", title: "Lights" }]);
+  if (cmd === "camera_pages") return Promise.resolve([{ id: "display", title: "Display" }, { id: "motion", title: "Motion" }, { id: "privacy", title: "Privacy masks" }, { id: "schedules", title: "Schedules" }, { id: "email", title: "Email" }]);
+  const day = "0".repeat(8) + "1".repeat(12) + "0".repeat(4);
+  const rich = {
+    motion: [{ key: "md_s0", label: "Sensitivity", kind: "range", value: "40", display: "40", min: 1, max: 50, options: [] },
+      { key: "md_zone", label: "Detection area", kind: "zone", value: JSON.stringify({ w: 80, h: 22, cells: "0".repeat(80 * 6) + "1".repeat(80 * 16) }), display: "", options: [] }],
+    privacy: [{ key: "masks", label: "Privacy masks", kind: "masks", value: JSON.stringify({ enable: "1", max: 8, rects: [[600, 80, 250, 200]] }), display: "", options: [] }],
+    schedules: [{ key: "push_sched", label: "Push notifications", kind: "schedule", value: JSON.stringify({ motion: day.repeat(7), timing: "0".repeat(168) }), display: "", options: [] }],
+    email: [{ key: "smtp_host", label: "SMTP server", kind: "text", value: "smtp.example.com", display: "", max_len: 127, options: [] },
+      { key: "smtp_pass", label: "Password", kind: "password", value: "", display: "", max_len: 31, options: [] },
+      { key: "ip", label: "Static IP", kind: "ipv4", value: "192.168.1.50", display: "", options: [] }],
+  };
+  if (cmd === "camera_settings" && rich[args.page]) return Promise.resolve({ id: args.page, title: "", fields: rich[args.page] });
+  if (cmd === "camera_snapshot") return Promise.reject("demo");
   if (cmd === "camera_settings") return Promise.resolve({ id: args.page, title: "", fields: [
     { key: "osd_name", label: "Camera name on video", kind: "text", value: "Front door", display: "Front door", max_len: 31, options: [] },
     { key: "osd_time_on", label: "Show date and time", kind: "toggle", value: "1", display: "1", options: [] },

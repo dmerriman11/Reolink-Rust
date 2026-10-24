@@ -14,6 +14,9 @@ const GETS: &[(u32, &str)] = &[
     (212, "RfAlarmCfg"), (217, "EmailTask"), (219, "PushTask"), (228, "Crop"), (232, "AudioTask"),
     (252, "BatteryInfoList"), (253, "BatteryInfo"), (287, "TimeCfg"), (291, "Floodlight"), (299, "AiCfg"),
     (319, "Timelapse"), (342, "AiDetectCfg"),
+    // Read ids recovered from the SDK command table (docs/baichuan-command-ids.md).
+    (310, "EmailEnable"), (312, "FtpEnable"), (446, "FtpServerCfg"), (504, "DeviceAudioCfg"),
+    (694, "PirMotionCfg"), (344, "AiDetectCfg2"), (87, "NetDisconnectExp"), (60, "AlarmIn"),
     // Rejected by Argus cameras; kept last because repeated rejections can end the session.
     (50, "VideoLoss"), (58, "AbilitySupport"), (78, "VideoInputDesc"), (83, "HandleException"),
 ];

@@ -292,6 +292,37 @@ input[type="range"] { flex: 1; max-width: 320px; accent-color: var(--accent); }
 .settings-loading { display: grid; place-items: center; height: 100%; color: var(--muted); }
 .settings-empty { color: var(--faint); padding: 24px 0; }
 
+.set-row.wide { grid-template-columns: 1fr; }
+.set-row.wide .set-control { display: block; }
+input[type="password"] { max-width: 320px; }
+.editor-tools { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.editor-hint { color: var(--faint); font-size: 12px; }
+.editor-note { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.sched-tabs { display: inline-flex; margin-bottom: 10px; }
+.sched-tabs button { text-transform: capitalize; }
+.sched-grid {
+  display: grid; grid-template-columns: 34px repeat(24, 1fr); gap: 2px; user-select: none; touch-action: none;
+  font: 500 10px/1 var(--display); color: var(--faint);
+}
+.sched-hour { text-align: left; padding-bottom: 2px; }
+.sched-day { display: flex; align-items: center; }
+.sched-cell { height: 16px; border-radius: 3px; background: var(--panel-2); cursor: pointer; }
+.sched-cell.on { background: var(--accent); }
+.frame-editor { max-width: 100%; }
+.frame-stage { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; user-select: none; touch-action: none; }
+.frame-img { display: block; width: 100%; height: 100%; object-fit: fill; opacity: .85; }
+.frame-img:not([src]) { visibility: hidden; }
+.zone-grid { position: absolute; inset: 0; display: grid; }
+.zone-cell { border: 1px solid rgba(255, 255, 255, .05); cursor: crosshair; }
+.zone-cell.on { background: rgba(244, 177, 62, .32); border-color: rgba(244, 177, 62, .25); }
+.mask-layer { position: absolute; inset: 0; cursor: crosshair; }
+.mask-rect { position: absolute; background: rgba(5, 6, 8, .82); border: 1px solid var(--accent); border-radius: 2px; }
+.mask-rect.ghost { background: rgba(244, 177, 62, .18); border-style: dashed; }
+.mask-del {
+  position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border: 0; border-radius: 50%;
+  background: var(--accent); color: var(--accent-ink); font-weight: 700; line-height: 1; cursor: pointer;
+}
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; left: 50%; bottom: 22px; max-width: 70vw; padding: 10px 16px; border-radius: 10px;

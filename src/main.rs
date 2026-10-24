@@ -362,7 +362,8 @@ async fn scan_lan(app: State<'_, App>) -> Result<Vec<FoundDto>, String> {
 }
 
 /// The settings engine's view of a device: requests go through its worker, which owns the connection.
-struct DeviceCam(tokio::sync::mpsc::UnboundedSender<Cmd>);
+/// `.1` holds messages this camera refused to write (400/405), shared for as long as the device exists.
+struct DeviceCam(tokio::sync::mpsc::UnboundedSender<Cmd>, std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u32>>>);
 
 impl DeviceCam {
     async fn request(&self, msg: settings::Msg, set: Option<String>) -> Result<String, String> {
@@ -381,13 +382,23 @@ impl settings::Camera for DeviceCam {
         self.request(msg, None)
     }
     async fn set(&self, msg: settings::Msg, xml: String) -> Result<(), String> {
-        self.request(msg, Some(xml)).await.map(|_| ())
+        let r = self.request(msg, Some(xml)).await.map(|_| ());
+        if let Err(e) = &r
+            && settings::is_refusal(e)
+        {
+            self.1.lock().unwrap().insert(msg.get);
+        }
+        r
+    }
+    fn writable(&self, msg: settings::Msg) -> bool {
+        !self.1.lock().unwrap().contains(&msg.get)
     }
 }
 
 fn device_cam(app: &State<'_, App>, id: u64) -> Result<DeviceCam, String> {
     let inner = app.inner.lock().unwrap();
-    Ok(DeviceCam(inner.devices[inner.index(id)?].sender()))
+    let d = &inner.devices[inner.index(id)?];
+    Ok(DeviceCam(d.sender(), d.read_only.clone()))
 }
 
 #[derive(Serialize)]
@@ -428,6 +439,32 @@ async fn sync_camera_time(app: State<'_, App>, id: u64) -> Result<(), String> {
     let xml = cam.get(settings::SYSTEM_GENERAL).await?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64;
     cam.set(settings::SYSTEM_GENERAL, settings::with_clock(&xml, now)?).await
+}
+
+/// Have the camera send a test email / try the FTP server with its current settings.
+#[tauri::command]
+async fn camera_test(app: State<'_, App>, id: u64, which: String) -> Result<(), String> {
+    let cam = device_cam(&app, id)?;
+    let test = match which.as_str() {
+        "email" => settings::EMAIL_TEST,
+        "ftp" => settings::FTP_TEST,
+        _ => return Err("unknown test".into()),
+    };
+    settings::run_test(&cam, test).await.map_err(|e| format!("Test failed: {e}"))
+}
+
+/// A still from the camera as a data: URL, for drawing motion areas and privacy masks over.
+#[tauri::command]
+async fn camera_snapshot(app: State<'_, App>, id: u64) -> Result<String, String> {
+    use base64::Engine as _;
+    let tx = device_cam(&app, id)?.0;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Cmd::SnapshotJpeg(reply)).map_err(|_| "device was removed".to_string())?;
+    let jpeg = tokio::time::timeout(std::time::Duration::from_secs(20), rx)
+        .await
+        .map_err(|_| "camera didn't answer in time".to_string())?
+        .map_err(|_| "device restarted; try again".to_string())??;
+    Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(jpeg)))
 }
 
 #[tauri::command]
@@ -508,7 +545,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile,
             set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
-            camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera,
+            camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
+            camera_snapshot,
             get_prefs, save_prefs, pick_folder
         ])
         .on_window_event(|window, event| {

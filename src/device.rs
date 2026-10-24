@@ -43,6 +43,8 @@ pub enum Cmd {
     /// Read (`set: None`) or write a settings message; replies with the camera's XML (empty for writes).
     Xml { msg: crate::settings::Msg, set: Option<String>, reply: Reply<String> },
     Reboot(Reply<()>),
+    /// A JPEG still for the settings editors (motion area, privacy masks).
+    SnapshotJpeg(Reply<Vec<u8>>),
     Live(Option<StreamKind>),
     Ptz(Direction),
     Snapshot,
@@ -69,6 +71,8 @@ pub struct Device {
     pub id: u64,
     pub config: DeviceConfig,
     pub frames: watch::Receiver<Frame>,
+    /// Settings messages this camera refused to write; see settings::Camera::writable.
+    pub read_only: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub state: Arc<Mutex<State>>,
     tx: UnboundedSender<Cmd>,
     task: tokio::task::JoinHandle<()>,
@@ -80,7 +84,7 @@ impl Device {
         let (tx, rx) = unbounded_channel();
         let (frame_tx, frames) = watch::channel(None);
         let task = rt.spawn(run(config.clone(), rx, state.clone(), frame_tx));
-        Self { id, config, frames, state, tx, task }
+        Self { id, config, frames, read_only: Default::default(), state, tx, task }
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -169,6 +173,7 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     Some(Cmd::View(b)) => wanted.jpeg_box = b,
                     Some(Cmd::Xml { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Reboot(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::SnapshotJpeg(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(_) => {}
                 },
             }
@@ -349,6 +354,12 @@ async fn session(
                         },
                     };
                     let _ = reply.send(res.map_err(|e| e.to_string()));
+                });
+            }
+            Cmd::SnapshotJpeg(reply) => {
+                let cam = cam.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(cam.get_snapshot().await.map_err(|e| e.to_string()));
                 });
             }
             Cmd::Reboot(reply) => {

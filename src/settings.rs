@@ -1,12 +1,14 @@
 //! Camera settings: a catalog of pages/fields mapped onto Baichuan messages, and an engine that reads them and
 //! writes changes read-modify-write, then reads back to verify the camera applied them.
 //!
-//! Message ids and value domains come from the official client and captured traffic; see
-//! docs/settings-inventory.md. Writes use only ids confirmed by captured official-client traffic.
-//! Fields a camera doesn't answer (message rejected or element missing) are left out, so each camera
-//! shows exactly what it supports.
+//! Message ids come from the official SDK's command table (docs/baichuan-command-ids.md) and captured traffic;
+//! where they disagreed (auto-reboot), the camera's own behaviour decided. Value domains, validation rules and
+//! binary formats (motion zones, privacy masks) come from the official client and SDK (docs/settings-inventory.md).
+//! Fields a camera doesn't answer (message rejected or element missing) are left out, so each camera shows
+//! exactly what it supports.
 
 use crate::xmledit;
+use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
@@ -18,26 +20,48 @@ pub struct Msg {
     pub channel: bool,
 }
 
-const VERSION: Msg = Msg { get: 80, set: None, channel: false };
-const UID: Msg = Msg { get: 114, set: None, channel: false };
-const NET: Msg = Msg { get: 76, set: None, channel: false };
-const BATTERY: Msg = Msg { get: 253, set: None, channel: true };
-const STORAGE: Msg = Msg { get: 102, set: None, channel: false };
-const SIGNAL: Msg = Msg { get: 115, set: None, channel: true };
-const PERF: Msg = Msg { get: 122, set: None, channel: false };
-const IMAGE: Msg = Msg { get: 26, set: Some(25), channel: true };
-const OSD: Msg = Msg { get: 44, set: Some(45), channel: true };
-const ENCODE: Msg = Msg { get: 56, set: Some(57), channel: true };
-const STREAMS: Msg = Msg { get: 146, set: None, channel: true };
-const PIR: Msg = Msg { get: 212, set: Some(213), channel: true };
-const LEDS: Msg = Msg { get: 208, set: Some(209), channel: true };
-const RECORD: Msg = Msg { get: 54, set: Some(55), channel: true };
-const EMAIL_TASK: Msg = Msg { get: 217, set: Some(216), channel: true };
-const PUSH_TASK: Msg = Msg { get: 219, set: Some(218), channel: true };
-const GENERAL: Msg = Msg { get: 104, set: Some(105), channel: false };
-const NTP: Msg = Msg { get: 38, set: Some(39), channel: false };
-const DST: Msg = Msg { get: 106, set: Some(107), channel: false };
-const AUTO_REBOOT: Msg = Msg { get: 101, set: Some(100), channel: false };
+const fn m(get: u32, set: Option<u32>, channel: bool) -> Msg {
+    Msg { get, set, channel }
+}
+
+const VERSION: Msg = m(80, None, false);
+const UID: Msg = m(114, None, false);
+const NET_INFO: Msg = m(76, None, false);
+const BATTERY: Msg = m(253, None, true);
+const STORAGE: Msg = m(102, None, false);
+const SIGNAL: Msg = m(115, None, true);
+const PERF: Msg = m(122, None, false);
+const IMAGE: Msg = m(26, Some(25), true);
+const OSD: Msg = m(44, Some(45), true);
+const ENCODE: Msg = m(56, Some(57), true);
+const STREAMS: Msg = m(146, None, true);
+const PIR: Msg = m(212, Some(213), true);
+const LEDS: Msg = m(208, Some(209), true);
+const RECORD: Msg = m(54, Some(55), true);
+const EMAIL_TASK: Msg = m(217, Some(216), true);
+const PUSH_TASK: Msg = m(219, Some(218), true);
+const GENERAL: Msg = m(104, Some(105), false);
+const NTP: Msg = m(38, Some(39), false);
+const DST: Msg = m(106, Some(107), false);
+// The SDK table labels 100 as GET, but on the camera 101 returns the config and 100 only acknowledges.
+const AUTO_REBOOT: Msg = m(101, Some(100), false);
+const MOTION: Msg = m(46, Some(47), true);
+const MASKS: Msg = m(52, Some(53), true);
+const REC_SCHEDULE: Msg = m(81, Some(82), true);
+const FTP_TASK: Msg = m(70, Some(71), true);
+const SIREN_TASK: Msg = m(232, Some(231), true);
+const EMAIL: Msg = m(42, Some(43), true);
+const FTP: Msg = m(68, Some(69), true);
+const NETWORK: Msg = m(76, Some(77), true);
+const PORTS: Msg = m(37, Some(36), true);
+const UPNP: Msg = m(97, Some(98), true);
+const DDNS: Msg = m(40, Some(41), true);
+const AI: Msg = m(299, Some(300), true);
+const TIMELAPSE: Msg = m(319, Some(320), true);
+/// Test commands: the current Email/Ftp XML sent to the SDK's EMAILTEST (141) / FTP_TEST (194).
+pub const EMAIL_TEST: Msg = m(42, Some(141), true);
+pub const FTP_TEST: Msg = m(68, Some(194), true);
+pub const SYSTEM_GENERAL: Msg = GENERAL;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Fmt {
@@ -48,6 +72,8 @@ pub enum Fmt {
     TimeZone,
     /// Wi-Fi RSSI; the camera reports a -10 dBm placeholder for a few seconds after connecting.
     Dbm,
+    /// A motion sensitivity block (path names the block): "HH:MM–HH:MM".
+    Period,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,13 +89,38 @@ pub enum Opts {
     Retention(Msg, &'static str),
 }
 
+/// Allowed characters, from the official client's validators.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Charset {
+    Any,
+    /// Host names and IPs.
+    Host,
+    Email,
+    /// /^[^\\\/'"`^$?;<>|& ]*$/ (DDNS names and passwords)
+    Ddns,
+    /// /^[a-zA-Z0-9\\\/]*$/ (FTP remote directory)
+    FtpPath,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
     Info(Fmt),
+    /// Slider.
     Range { min: i64, max: i64 },
+    /// Plain number box (ports).
+    Number { min: i64, max: i64 },
     Toggle,
     Choice(Opts),
-    Text { max: usize },
+    Text { max: usize, charset: Charset, required: bool },
+    /// Never sent to the UI; an empty value leaves the camera's password unchanged.
+    Password { max: usize, charset: Charset },
+    Ipv4 { required: bool },
+    /// typeScheduleList: path is the list; value is JSON {type: 168 x "0"/"1"} (7 days x 24 h, Sunday first).
+    Schedule,
+    /// Motion area: path is the MD element; value is JSON {"w","h","cells"} with cells row-major "0"/"1".
+    Zone,
+    /// Privacy masks: path is the Shelter element; value is JSON {"enable","max","rects":[[x,y,w,h],...]} in 0..1000.
+    Masks,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,10 +145,21 @@ const fn f(key: &'static str, label: &'static str, msg: Msg, path: &'static str,
 const INFO: Kind = Kind::Info(Fmt::Plain);
 const PCT: Kind = Kind::Info(Fmt::Suffix("%"));
 const IMG: Kind = Kind::Range { min: 0, max: 255 };
+const PORT: Kind = Kind::Number { min: 1, max: 65535 };
+const MD_SENS: Kind = Kind::Range { min: 1, max: 50 };
+const fn text(max: usize, charset: Charset, required: bool) -> Kind {
+    Kind::Text { max, charset, required }
+}
+const fn pass(max: usize, charset: Charset) -> Kind {
+    Kind::Password { max, charset }
+}
 const WEEKDAYS: &[(&str, &str)] = &[
     ("Sunday", "Sunday"), ("Monday", "Monday"), ("Tuesday", "Tuesday"), ("Wednesday", "Wednesday"),
     ("Thursday", "Thursday"), ("Friday", "Friday"), ("Saturday", "Saturday"),
 ];
+/// Sizes of the coordinate space masks are expressed in; the camera rescales from it (the SDK packs
+/// each coordinate as value<<16 | reference size).
+pub const MASK_REF: i64 = 1000;
 
 pub static PAGES: &[Page] = &[
     Page {
@@ -110,8 +172,8 @@ pub static PAGES: &[Page] = &[
             f("build", "Build", VERSION, "VersionInfo/buildDay", INFO),
             f("serial", "Serial number", VERSION, "VersionInfo/serialNumber", INFO),
             f("uid", "UID", UID, "Uid/uid", INFO),
-            f("ip", "IP address", NET, "Ip/ip", INFO),
-            f("mac", "MAC address", NET, "Ip/mac", INFO),
+            f("ip", "IP address", NET_INFO, "Ip/ip", INFO),
+            f("mac", "MAC address", NET_INFO, "Ip/mac", INFO),
             f("wifi", "Wi-Fi signal", SIGNAL, "WifiSignal/signal", Kind::Info(Fmt::Dbm)),
             f("battery", "Battery", BATTERY, "BatteryInfo/batteryPercent", PCT),
             f("charging", "Charging", BATTERY, "BatteryInfo/chargeStatus", INFO),
@@ -126,7 +188,7 @@ pub static PAGES: &[Page] = &[
         id: "display",
         title: "Display",
         fields: &[
-            f("osd_name", "Camera name on video", OSD, "OsdChannelName/name", Kind::Text { max: 31 }),
+            f("osd_name", "Camera name on video", OSD, "OsdChannelName/name", text(31, Charset::Any, true)),
             f("osd_name_on", "Show camera name", OSD, "OsdChannelName/enable", Kind::Toggle),
             f("osd_time_on", "Show date and time", OSD, "OsdDatetime/enable", Kind::Toggle),
             f("watermark", "Watermark", OSD, "OsdChannelName/enWatermark", Kind::Toggle),
@@ -162,7 +224,7 @@ pub static PAGES: &[Page] = &[
     },
     Page {
         id: "detection",
-        title: "Detection & alerts",
+        title: "Detection & recording",
         fields: &[
             f("pir_on", "Motion sensor (PIR)", PIR, "rfAlarmCfg/enable", Kind::Toggle),
             f("pir_sens", "PIR sensitivity", PIR, "rfAlarmCfg/sensiValue", Kind::Range { min: 1, max: 100 }),
@@ -173,6 +235,108 @@ pub static PAGES: &[Page] = &[
                 Kind::Choice(Opts::Retention(RECORD, "RecordCfg/cyclelist/item"))),
             f("rec_post", "Keep recording after motion (s)", RECORD, "RecordCfg/recordDelayTime",
                 Kind::Choice(Opts::List(RECORD, "RecordCfg/timeList/time"))),
+        ],
+    },
+    Page {
+        id: "motion",
+        title: "Motion detection",
+        fields: &[
+            f("md_on", "Motion detection", MOTION, "MD/enable", Kind::Toggle),
+            f("md_zone", "Detection area", MOTION, "MD", Kind::Zone),
+            f("md_p0", "Period 1", MOTION, "MD/sensitivityInfoList/sensitivityInfo[0]", Kind::Info(Fmt::Period)),
+            f("md_s0", "Period 1 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[0]/sensitivity", MD_SENS),
+            f("md_p1", "Period 2", MOTION, "MD/sensitivityInfoList/sensitivityInfo[1]", Kind::Info(Fmt::Period)),
+            f("md_s1", "Period 2 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[1]/sensitivity", MD_SENS),
+            f("md_p2", "Period 3", MOTION, "MD/sensitivityInfoList/sensitivityInfo[2]", Kind::Info(Fmt::Period)),
+            f("md_s2", "Period 3 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[2]/sensitivity", MD_SENS),
+            f("md_p3", "Period 4", MOTION, "MD/sensitivityInfoList/sensitivityInfo[3]", Kind::Info(Fmt::Period)),
+            f("md_s3", "Period 4 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[3]/sensitivity", MD_SENS),
+        ],
+    },
+    Page {
+        id: "privacy",
+        title: "Privacy masks",
+        fields: &[f("masks", "Masked areas", MASKS, "Shelter", Kind::Masks)],
+    },
+    Page {
+        id: "schedules",
+        title: "Schedules",
+        fields: &[
+            f("rec_on", "SD card recording", REC_SCHEDULE, "Record/enable", Kind::Toggle),
+            f("rec_sched", "Recording schedule", REC_SCHEDULE, "Record/typeScheduleList", Kind::Schedule),
+            f("push_sched", "Push notification schedule", PUSH_TASK, "PushTask/typeScheduleList", Kind::Schedule),
+            f("email_sched", "Email alert schedule", EMAIL_TASK, "EmailTask/typeScheduleList", Kind::Schedule),
+            f("ftp_sched", "FTP upload schedule", FTP_TASK, "FtpTask/typeScheduleList", Kind::Schedule),
+            f("siren_on", "Siren on detection", SIREN_TASK, "AudioTask/enable", Kind::Toggle),
+            f("siren_sched", "Siren schedule", SIREN_TASK, "AudioTask/typeScheduleList", Kind::Schedule),
+        ],
+    },
+    Page {
+        id: "email",
+        title: "Email",
+        fields: &[
+            f("smtp_server", "SMTP server", EMAIL, "Email/smtpServer", text(127, Charset::Host, false)),
+            f("smtp_port", "SMTP port", EMAIL, "Email/smtpPort", PORT),
+            f("smtp_ssl", "SSL/TLS", EMAIL, "Email/ssl", Kind::Toggle),
+            f("smtp_user", "Sender address / username", EMAIL, "Email/userName", text(127, Charset::Email, false)),
+            f("smtp_pass", "Password", EMAIL, "Email/password", pass(127, Charset::Any)),
+            f("smtp_nick", "Sender name", EMAIL, "Email/sendNickname", text(127, Charset::Any, false)),
+            f("rcpt1", "Recipient 1", EMAIL, "Email/address1", text(127, Charset::Email, false)),
+            f("rcpt2", "Recipient 2", EMAIL, "Email/address2", text(127, Charset::Email, false)),
+            f("rcpt3", "Recipient 3", EMAIL, "Email/address3", text(127, Charset::Email, false)),
+            f("attach", "Attach picture", EMAIL, "Email/attachment", Kind::Toggle),
+        ],
+    },
+    Page {
+        id: "ftp",
+        title: "FTP",
+        fields: &[
+            f("ftp_on", "FTP upload", FTP_TASK, "FtpTask/enable", Kind::Toggle),
+            f("ftp_server", "FTP server", FTP, "Ftp/server", text(127, Charset::Host, false)),
+            f("ftp_port", "Port", FTP, "Ftp/port", PORT),
+            f("ftp_anon", "Anonymous login", FTP, "Ftp/nonymous", Kind::Toggle),
+            f("ftp_user", "Username", FTP, "Ftp/userName", text(127, Charset::Any, false)),
+            f("ftp_pass", "Password", FTP, "Ftp/password", pass(127, Charset::Any)),
+            f("ftp_dir", "Remote folder", FTP, "Ftp/remoteDir", text(127, Charset::FtpPath, false)),
+        ],
+    },
+    Page {
+        id: "network",
+        title: "Network",
+        fields: &[
+            f("dhcp", "Get IP address automatically (DHCP)", NETWORK, "Dhcp/enable", Kind::Toggle),
+            f("net_ip", "IP address", NETWORK, "Ip/ip", Kind::Ipv4 { required: true }),
+            f("net_mask", "Subnet mask", NETWORK, "Ip/mask", Kind::Ipv4 { required: true }),
+            f("net_gw", "Gateway", NETWORK, "Ip/gateway", Kind::Ipv4 { required: true }),
+            f("auto_dns", "Get DNS automatically", NETWORK, "AutoDns/enable", Kind::Toggle),
+            f("dns1", "Primary DNS", NETWORK, "Dns/dns1", Kind::Ipv4 { required: false }),
+            f("dns2", "Secondary DNS", NETWORK, "Dns/dns2", Kind::Ipv4 { required: false }),
+            f("upnp", "UPnP", UPNP, "Upnp/enable", Kind::Toggle),
+            f("port_server", "Client port", PORTS, "ServerPort/serverPort", INFO),
+            f("http_on", "HTTP", PORTS, "HttpPort/enable", Kind::Toggle),
+            f("http_port", "HTTP port", PORTS, "HttpPort/httpPort", PORT),
+            f("https_on", "HTTPS", PORTS, "HttpsPort/enable", Kind::Toggle),
+            f("https_port", "HTTPS port", PORTS, "HttpsPort/httpsPort", PORT),
+            f("rtsp_on", "RTSP", PORTS, "RtspPort/enable", Kind::Toggle),
+            f("rtsp_port", "RTSP port", PORTS, "RtspPort/rtspPort", PORT),
+            f("rtmp_on", "RTMP", PORTS, "RtmpPort/enable", Kind::Toggle),
+            f("rtmp_port", "RTMP port", PORTS, "RtmpPort/rtmpPort", PORT),
+            f("onvif_on", "ONVIF", PORTS, "OnvifPort/enable", Kind::Toggle),
+            f("onvif_port", "ONVIF port", PORTS, "OnvifPort/onvifPort", PORT),
+            f("ddns_on", "DDNS", DDNS, "Ddns/enable", Kind::Toggle),
+            f("ddns_type", "DDNS provider", DDNS, "Ddns/ddnsType", INFO),
+            f("ddns_name", "DDNS domain", DDNS, "Ddns/ddnsName", text(127, Charset::Ddns, false)),
+            f("ddns_user", "DDNS username", DDNS, "Ddns/userName", text(127, Charset::Ddns, false)),
+            f("ddns_pass", "DDNS password", DDNS, "Ddns/password", pass(127, Charset::Ddns)),
+        ],
+    },
+    Page {
+        id: "smart",
+        title: "Smart detection & time-lapse",
+        fields: &[
+            f("ai_types", "Detects", AI, "AiCfg/detectType", INFO),
+            f("tl_overwrite", "Time-lapse: overwrite oldest files", TIMELAPSE, "timelapseCfg/overwrite", Kind::Toggle),
+            f("tl_max", "Time-lapse: max files", TIMELAPSE, "timelapseCfg/maxFileNum", INFO),
         ],
     },
     Page {
@@ -190,14 +354,14 @@ pub static PAGES: &[Page] = &[
         id: "system",
         title: "System",
         fields: &[
-            f("name", "Device name", GENERAL, "SystemGeneral/deviceName", Kind::Text { max: 31 }),
+            f("name", "Device name", GENERAL, "SystemGeneral/deviceName", text(31, Charset::Any, true)),
             f("tz", "Time zone", GENERAL, "SystemGeneral/timeZone", Kind::Choice(Opts::TimeZones)),
             f("date_fmt", "Date format", GENERAL, "SystemGeneral/osdFormat",
                 Kind::Choice(Opts::Fixed(&[("MDY", "MM/DD/YYYY"), ("DMY", "DD/MM/YYYY"), ("YMD", "YYYY/MM/DD")]))),
             f("time_fmt", "Time format", GENERAL, "SystemGeneral/timeFormat",
                 Kind::Choice(Opts::Fixed(&[("1", "12-hour"), ("0", "24-hour")]))),
             f("ntp_on", "Sync time from internet (NTP)", NTP, "Ntp/enable", Kind::Toggle),
-            f("ntp_server", "NTP server", NTP, "Ntp/server", Kind::Text { max: 63 }),
+            f("ntp_server", "NTP server", NTP, "Ntp/server", text(63, Charset::Host, true)),
             f("ntp_interval", "NTP sync interval", NTP, "Ntp/synchronizeInterval",
                 Kind::Choice(Opts::Fixed(&[("60", "Every hour"), ("360", "Every 6 hours"), ("720", "Every 12 hours"), ("1440", "Daily"), ("10080", "Weekly")]))),
             f("dst_on", "Daylight saving time", DST, "Dst/enable", Kind::Toggle),
@@ -224,6 +388,16 @@ pub fn page(id: &str) -> Option<&'static Page> {
 pub trait Camera: Sync {
     fn get(&self, msg: Msg) -> impl std::future::Future<Output = Result<String, String>> + Send;
     fn set(&self, msg: Msg, xml: String) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// False once this camera has refused writes to the message (e.g. Argus cameras reject motion-area
+    /// writes with 400); its fields are then shown read-only instead of offering edits that can't work.
+    fn writable(&self, _msg: Msg) -> bool {
+        true
+    }
+}
+
+/// The camera refused the message itself (400/405), as opposed to a transport failure.
+pub fn is_refusal(err: &str) -> bool {
+    err.contains("returned code 400") || err.contains("returned code 405")
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -236,7 +410,7 @@ pub struct Choice {
 pub struct FieldView {
     pub key: &'static str,
     pub label: &'static str,
-    /// "info" | "range" | "toggle" | "choice" | "text"
+    /// info | range | number | toggle | choice | text | password | ipv4 | schedule | zone | masks
     pub kind: &'static str,
     pub value: String,
     pub display: String,
@@ -253,9 +427,11 @@ pub struct PageView {
     pub fields: Vec<FieldView>,
 }
 
+// ---------- formatting ----------
+
 fn format_value(fmt: Fmt, v: &str) -> String {
     match fmt {
-        Fmt::Plain => v.to_string(),
+        Fmt::Plain | Fmt::Period => v.to_string(),
         Fmt::Suffix(s) => format!("{v}{s}"),
         Fmt::Bytes => v.parse::<f64>().map(|b| format!("{:.1} GB", b / 1e9)).unwrap_or_else(|_| v.into()),
         Fmt::TimeZone => v.parse::<i64>().map(tz_label).unwrap_or_else(|_| v.into()),
@@ -310,6 +486,200 @@ fn stream_table(streams_xml: &str, stream: &str, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ---------- compound values: schedules, motion zones, privacy masks ----------
+
+pub const SCHEDULE_LEN: usize = 7 * 24;
+
+fn read_schedule(xml: &str, path: &str) -> Option<String> {
+    let types = xmledit::get_all(xml, &format!("{path}/item/type"));
+    let tables = xmledit::get_all(xml, &format!("{path}/item/valueTable"));
+    if types.is_empty() || types.len() != tables.len() {
+        return None;
+    }
+    let map: BTreeMap<String, String> = types.into_iter().zip(tables).collect();
+    serde_json::to_string(&map).ok()
+}
+
+fn write_schedule(xml: &str, path: &str, value: &str) -> Result<String, String> {
+    let wanted: BTreeMap<String, String> = serde_json::from_str(value).map_err(|_| "invalid schedule".to_string())?;
+    let types = xmledit::get_all(xml, &format!("{path}/item/type"));
+    let mut out = xml.to_string();
+    for (t, table) in wanted {
+        let i = types.iter().position(|x| *x == t).ok_or_else(|| format!("schedule has no {t:?} row"))?;
+        out = xmledit::set(&out, &format!("{path}/item[{i}]/valueTable"), &table).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+fn schedule_summary(value: &str) -> String {
+    let map: BTreeMap<String, String> = serde_json::from_str(value).unwrap_or_default();
+    map.iter()
+        .map(|(t, table)| format!("{t} {}/168 h", table.chars().filter(|c| *c == '1').count()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct ZoneValue {
+    w: usize,
+    h: usize,
+    cells: String,
+}
+
+/// MD scope: a columns x rows bitmap (row-major, first cell in the high bit, base64), of which the top-left
+/// width x height cells are the camera's detection grid. Format from the SDK's encoder (FUN_1801a69b0).
+fn zone_geometry(xml: &str, md: &str) -> Option<(usize, usize, usize, usize, Vec<u8>)> {
+    let num = |p: &str| xmledit::get(xml, &format!("{md}/{p}"))?.parse::<usize>().ok();
+    let (w, h, cols, rows) = (num("width")?, num("height")?, num("scope/columns")?, num("scope/rows")?);
+    let table = xmledit::get(xml, &format!("{md}/scope/valueTable"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(table.split_whitespace().collect::<String>()).ok()?;
+    (w <= cols && h <= rows && bytes.len() * 8 >= cols * rows).then_some((w, h, cols, rows, bytes))
+}
+
+fn bit(bytes: &[u8], i: usize) -> bool {
+    bytes[i / 8] & (0x80 >> (i % 8)) != 0
+}
+
+fn read_zone(xml: &str, md: &str) -> Option<String> {
+    let (w, h, cols, _, bytes) = zone_geometry(xml, md)?;
+    let cells: String = (0..h).flat_map(|r| (0..w).map(move |c| (r, c))).map(|(r, c)| if bit(&bytes, r * cols + c) { '1' } else { '0' }).collect();
+    serde_json::to_string(&ZoneValue { w, h, cells }).ok()
+}
+
+fn write_zone(xml: &str, md: &str, value: &str) -> Result<String, String> {
+    let z: ZoneValue = serde_json::from_str(value).map_err(|_| "invalid detection area".to_string())?;
+    let (w, h, cols, _, mut bytes) = zone_geometry(xml, md).ok_or("camera's detection area couldn't be read")?;
+    if (z.w, z.h) != (w, h) || z.cells.len() != w * h {
+        return Err("detection area doesn't match the camera's grid".into());
+    }
+    // Only the detection grid changes; bits outside it are kept as the camera had them.
+    for (i, ch) in z.cells.chars().enumerate() {
+        let n = (i / w) * cols + i % w;
+        if ch == '1' {
+            bytes[n / 8] |= 0x80 >> (n % 8);
+        } else {
+            bytes[n / 8] &= !(0x80 >> (n % 8));
+        }
+    }
+    let table = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    xmledit::set(xml, &format!("{md}/scope/valueTable"), &table).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct MasksValue {
+    enable: String,
+    max: usize,
+    /// [x, y, w, h] in 0..MASK_REF.
+    rects: Vec<[i64; 4]>,
+}
+
+/// Unpack an SDK mask coordinate (value<<16 | reference size) into the 0..MASK_REF space.
+fn unpack(v: i64) -> i64 {
+    let (coord, reference) = (v >> 16, v & 0xffff);
+    if reference == 0 { coord } else { (coord * MASK_REF + reference / 2) / reference }
+}
+
+fn read_masks(xml: &str, root: &str) -> Option<String> {
+    let enable = xmledit::get(xml, &format!("{root}/enable"))?;
+    let max = xmledit::get(xml, &format!("{root}/maxNum")).and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut rects = vec![];
+    // The camera answers with <shelterList>; the SDK writes <ShelterList>. Accept either.
+    for list in ["shelterList", "ShelterList"] {
+        let items = format!("{root}/{list}/Shelter");
+        let on = xmledit::get_all(xml, &format!("{items}/enable"));
+        for (i, e) in on.iter().enumerate() {
+            if e != "1" {
+                continue;
+            }
+            let num = |p: &str| xmledit::get(xml, &format!("{items}[{i}]/{p}")).and_then(|v| v.parse::<i64>().ok());
+            if let (Some(x), Some(y), Some(w), Some(h)) = (num("topLeftX"), num("topLeftY"), num("width"), num("height")) {
+                rects.push([unpack(x), unpack(y), unpack(w), unpack(h)]);
+            }
+        }
+    }
+    serde_json::to_string(&MasksValue { enable, max, rects }).ok()
+}
+
+/// The full Shelter write as the SDK builds it (BaichuanConfigurator, FUN_1801185b0).
+fn write_masks(xml: &str, root: &str, value: &str) -> Result<String, String> {
+    let v: MasksValue = serde_json::from_str(value).map_err(|_| "invalid privacy masks".to_string())?;
+    let channel = xmledit::get(xml, &format!("{root}/channelId")).unwrap_or_else(|| "0".into());
+    let max = xmledit::get(xml, &format!("{root}/maxNum")).and_then(|v| v.parse().ok()).unwrap_or(v.max);
+    let mut list = String::new();
+    for i in 0..max {
+        match v.rects.get(i) {
+            Some([x, y, w, h]) => list.push_str(&format!(
+                "<Shelter>\n<id>{i}</id>\n<enable>1</enable>\n<topLeftX>{}</topLeftX>\n<topLeftY>{}</topLeftY>\n<width>{}</width>\n<height>{}</height>\n</Shelter>\n",
+                x << 16 | MASK_REF, y << 16 | MASK_REF, w << 16 | MASK_REF, h << 16 | MASK_REF
+            )),
+            None => list.push_str(&format!("<Shelter>\n<id>{i}</id>\n<enable>0</enable>\n</Shelter>\n")),
+        }
+    }
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Shelter version=\"1.1\">\n<channelId>{channel}</channelId>\n<enable>{}</enable>\n<ShelterList>\n{list}</ShelterList>\n</Shelter>\n</body>\n",
+        v.enable
+    ))
+}
+
+fn masks_close(a: &str, b: &str) -> bool {
+    // Camera rescaling can round a coordinate by a unit or two.
+    match (serde_json::from_str::<MasksValue>(a), serde_json::from_str::<MasksValue>(b)) {
+        (Ok(a), Ok(b)) => {
+            a.enable == b.enable
+                && a.rects.len() == b.rects.len()
+                && a.rects.iter().zip(&b.rects).all(|(p, q)| p.iter().zip(q).all(|(u, v)| (u - v).abs() <= 3))
+        }
+        _ => false,
+    }
+}
+
+fn zone_summary(value: &str) -> String {
+    serde_json::from_str::<ZoneValue>(value)
+        .map(|z| format!("{} of {} areas active", z.cells.chars().filter(|c| *c == '1').count(), z.w * z.h))
+        .unwrap_or_default()
+}
+
+fn period_label(xml: &str, path: &str) -> Option<String> {
+    let n = |p: &str| xmledit::get(xml, &format!("{path}/{p}"))?.parse::<u32>().ok();
+    Some(format!("{:02}:{:02}–{:02}:{:02}", n("beginHour")?, n("beginMinute")?, n("endHour")?, n("endMinute")?))
+}
+
+/// The field's current value from its message's XML, in the form the UI edits.
+fn extract(field: &Field, xml: &str) -> Option<String> {
+    match field.kind {
+        Kind::Schedule => read_schedule(xml, field.path),
+        Kind::Zone => read_zone(xml, field.path),
+        Kind::Masks => read_masks(xml, field.path),
+        Kind::Info(Fmt::Period) => period_label(xml, field.path),
+        // Present but never revealed.
+        Kind::Password { .. } => xmledit::get(xml, field.path).map(|_| String::new()),
+        _ => xmledit::get(xml, field.path),
+    }
+}
+
+/// `xml` with the field set to `value` (already validated).
+fn apply(field: &Field, xml: &str, value: &str) -> Result<String, String> {
+    match field.kind {
+        Kind::Schedule => write_schedule(xml, field.path, value),
+        Kind::Zone => write_zone(xml, field.path, value),
+        Kind::Masks => write_masks(xml, field.path, value),
+        // The camera stores empty strings as a single space.
+        Kind::Text { .. } | Kind::Ipv4 { .. } if value.is_empty() => xmledit::set(xml, field.path, " ").map_err(|e| e.to_string()),
+        _ => xmledit::set(xml, field.path, value).map_err(|e| e.to_string()),
+    }
+}
+
+/// What a successful write must read back as.
+fn applied(field: &Field, after: &str, value: &str) -> bool {
+    match field.kind {
+        Kind::Masks => read_masks(after, field.path).is_some_and(|got| masks_close(&got, value)),
+        Kind::Password { .. } => xmledit::get(after, field.path).as_deref() == Some(value),
+        _ => extract(field, after).as_deref() == Some(value),
+    }
+}
+
+// ---------- engine ----------
+
 async fn options<C: Camera>(cam: &C, opts: Opts, cache: &mut HashMap<Msg, Option<String>>) -> Vec<Choice> {
     let plain = |v: Vec<String>| v.into_iter().map(|v| Choice { label: v.clone(), value: v }).collect();
     match opts {
@@ -342,20 +712,41 @@ async fn fetch<C: Camera>(cam: &C, msg: Msg, cache: &mut HashMap<Msg, Option<Str
     x
 }
 
-/// Read a page. Fields whose message or element the camera doesn't provide are omitted.
+/// Read a page. Each distinct message is requested once, concurrently; fields the camera doesn't provide are omitted.
 pub async fn read_page<C: Camera>(cam: &C, page: &Page) -> PageView {
-    let mut cache = HashMap::new();
+    let mut msgs: Vec<Msg> = page.fields.iter().map(|f| f.msg).collect();
+    for f in page.fields {
+        match f.kind {
+            Kind::Choice(Opts::StreamTable(..)) => msgs.push(STREAMS),
+            Kind::Choice(Opts::List(m, _) | Opts::Retention(m, _)) => msgs.push(m),
+            _ => {}
+        }
+    }
+    msgs.sort_by_key(|m| (m.get, m.set));
+    msgs.dedup();
+    let replies = futures::future::join_all(msgs.iter().map(|m| cam.get(*m))).await;
+    let mut cache: HashMap<Msg, Option<String>> = msgs.into_iter().zip(replies.into_iter().map(Result::ok)).collect();
+
     let mut fields = vec![];
     for field in page.fields {
         let Some(xml) = fetch(cam, field.msg, &mut cache).await else { continue };
-        let Some(value) = xmledit::get(&xml, field.path) else { continue };
-        let writable = field.msg.set.is_some();
+        let Some(value) = extract(field, &xml) else { continue };
+        let writable = field.msg.set.is_some() && cam.writable(field.msg);
         let (kind, min, max, max_len, opts, display) = match field.kind {
             Kind::Info(fmt) => ("info", None, None, None, vec![], format_value(fmt, &value)),
+            Kind::Password { .. } if !writable => continue,
+            Kind::Zone if !writable => ("info", None, None, None, vec![], zone_summary(&value)),
+            Kind::Masks | Kind::Schedule if !writable => ("info", None, None, None, vec![], "set in the Reolink app".into()),
             _ if !writable => ("info", None, None, None, vec![], value.clone()),
             Kind::Range { min, max } => ("range", Some(min), Some(max), None, vec![], value.clone()),
+            Kind::Number { min, max } => ("number", Some(min), Some(max), None, vec![], value.clone()),
             Kind::Toggle => ("toggle", None, None, None, vec![], value.clone()),
-            Kind::Text { max } => ("text", None, None, Some(max), vec![], value.clone()),
+            Kind::Text { max, .. } => ("text", None, None, Some(max), vec![], value.clone()),
+            Kind::Password { max, .. } => ("password", None, None, Some(max), vec![], String::new()),
+            Kind::Ipv4 { .. } => ("ipv4", None, None, Some(15), vec![], value.clone()),
+            Kind::Schedule => ("schedule", None, None, None, vec![], schedule_summary(&value)),
+            Kind::Zone => ("zone", None, None, None, vec![], String::new()),
+            Kind::Masks => ("masks", None, None, None, vec![], String::new()),
             Kind::Choice(o) => {
                 let mut opts = options(cam, o, &mut cache).await;
                 if opts.is_empty() {
@@ -375,30 +766,116 @@ pub async fn read_page<C: Camera>(cam: &C, page: &Page) -> PageView {
     PageView { id: page.id, title: page.title, fields }
 }
 
+fn charset_ok(charset: Charset, v: &str) -> bool {
+    match charset {
+        Charset::Any => true,
+        Charset::Host => v.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:".contains(c)),
+        Charset::Email => {
+            v.is_empty()
+                || (v.chars().all(|c| !c.is_whitespace())
+                    && v.split_once('@').is_some_and(|(a, d)| !a.is_empty() && d.contains('.') && !d.starts_with('.') && !d.ends_with('.')))
+        }
+        Charset::Ddns => !v.chars().any(|c| "\\/'\"`^$?;<>|& ".contains(c)),
+        Charset::FtpPath => v.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '\\'),
+    }
+}
+
+fn charset_hint(charset: Charset) -> &'static str {
+    match charset {
+        Charset::Any => "",
+        Charset::Host => " (letters, digits, . - _ :)",
+        Charset::Email => " (an email address)",
+        Charset::Ddns => " (no spaces or \\ / ' \" ` ^ $ ? ; < > | &)",
+        Charset::FtpPath => " (letters, digits and /)",
+    }
+}
+
+fn parse_ipv4(v: &str) -> Option<u32> {
+    v.parse::<std::net::Ipv4Addr>().ok().map(u32::from)
+}
+
 /// Check a requested value against the field's domain before anything is sent to the camera.
 pub fn validate(field: &Field, value: &str, options: &[Choice]) -> Result<(), String> {
+    let label = field.label;
+    let text_ok = |max: usize, charset: Charset, required: bool| {
+        if required && value.trim().is_empty() {
+            Err(format!("{label} can't be empty"))
+        } else if value.chars().count() > max {
+            Err(format!("{label} can be at most {max} characters"))
+        } else if value.chars().any(|c| c.is_control()) || !charset_ok(charset, value) {
+            Err(format!("{label} has invalid characters{}", charset_hint(charset)))
+        } else {
+            Ok(())
+        }
+    };
     match field.kind {
-        Kind::Info(_) => Err(format!("{} is read-only", field.label)),
-        Kind::Range { min, max } => match value.parse::<i64>() {
+        Kind::Info(_) => Err(format!("{label} is read-only")),
+        Kind::Range { min, max } | Kind::Number { min, max } => match value.parse::<i64>() {
             Ok(v) if (min..=max).contains(&v) => Ok(()),
-            _ => Err(format!("{} must be a whole number from {min} to {max}", field.label)),
+            _ => Err(format!("{label} must be a whole number from {min} to {max}")),
         },
-        Kind::Toggle => if value == "0" || value == "1" { Ok(()) } else { Err(format!("{} must be on or off", field.label)) },
-        Kind::Text { max } => {
-            if value.trim().is_empty() {
-                Err(format!("{} can't be empty", field.label))
-            } else if value.chars().count() > max {
-                Err(format!("{} can be at most {max} characters", field.label))
-            } else if value.chars().any(|c| c.is_control()) {
-                Err(format!("{} contains invalid characters", field.label))
+        Kind::Toggle => if value == "0" || value == "1" { Ok(()) } else { Err(format!("{label} must be on or off")) },
+        Kind::Text { max, charset, required } => text_ok(max, charset, required),
+        Kind::Password { max, charset } => text_ok(max, charset, false),
+        Kind::Ipv4 { required } => {
+            if value.is_empty() && !required || parse_ipv4(value).is_some() {
+                Ok(())
+            } else {
+                Err(format!("{label} must be an IPv4 address like 192.168.1.20"))
+            }
+        }
+        Kind::Choice(_) => {
+            if options.iter().any(|c| c.value == value) { Ok(()) } else { Err(format!("{label} has no option {value:?}")) }
+        }
+        Kind::Schedule => {
+            let map: BTreeMap<String, String> = serde_json::from_str(value).map_err(|_| format!("{label} is malformed"))?;
+            if map.values().all(|t| t.len() == SCHEDULE_LEN && t.chars().all(|c| c == '0' || c == '1')) {
+                Ok(())
+            } else {
+                Err(format!("{label} must have 168 hourly slots per type"))
+            }
+        }
+        Kind::Zone => {
+            let z: ZoneValue = serde_json::from_str(value).map_err(|_| format!("{label} is malformed"))?;
+            if z.cells.len() == z.w * z.h && z.cells.chars().all(|c| c == '0' || c == '1') {
+                Ok(())
+            } else {
+                Err(format!("{label} is malformed"))
+            }
+        }
+        Kind::Masks => {
+            let v: MasksValue = serde_json::from_str(value).map_err(|_| format!("{label} is malformed"))?;
+            let in_frame = v.rects.iter().all(|[x, y, w, h]| {
+                *x >= 0 && *y >= 0 && *w > 0 && *h > 0 && x + w <= MASK_REF && y + h <= MASK_REF
+            });
+            if !(v.enable == "0" || v.enable == "1") || v.rects.len() > v.max || !in_frame {
+                Err(format!("{label}: at most {} areas, each inside the picture", v.max))
             } else {
                 Ok(())
             }
         }
-        Kind::Choice(_) => {
-            if options.iter().any(|c| c.value == value) { Ok(()) } else { Err(format!("{} has no option {value:?}", field.label)) }
-        }
     }
+}
+
+/// Whole-page checks that single fields can't express. Network: a static address must be usable.
+fn validate_page(page: &Page, merged: &BTreeMap<&str, String>) -> Result<(), String> {
+    if page.id != "network" || merged.get("dhcp").map(String::as_str) != Some("0") {
+        return Ok(());
+    }
+    let ip = merged.get("net_ip").and_then(|v| parse_ipv4(v)).ok_or("A static IP address is required")?;
+    let mask = merged.get("net_mask").and_then(|v| parse_ipv4(v)).ok_or("A subnet mask is required")?;
+    let gw = merged.get("net_gw").and_then(|v| parse_ipv4(v)).ok_or("A gateway is required")?;
+    if mask == 0 || (!mask).wrapping_add(1) & !mask != 0 {
+        return Err("Subnet mask must be contiguous, like 255.255.255.0".into());
+    }
+    let host = ip & !mask;
+    if host == 0 || host == !mask {
+        return Err("IP address can't be the network or broadcast address".into());
+    }
+    if ip & mask != gw & mask || gw == ip {
+        return Err("Gateway must be a different address on the same subnet as the IP address".into());
+    }
+    Ok(())
 }
 
 /// Requested changes to one message: each field with its new value.
@@ -416,8 +893,28 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
     let mut results = vec![];
     let mut cache = HashMap::new();
     let mut by_msg: BTreeMap<u32, (Msg, Edits)> = BTreeMap::new();
+    // Blank passwords mean "keep the current one".
+    let changes: BTreeMap<&String, &String> = changes
+        .iter()
+        .filter(|(k, v)| !(v.is_empty() && page.fields.iter().any(|f| f.key == k.as_str() && matches!(f.kind, Kind::Password { .. }))))
+        .collect();
+
+    // Page-level validation sees the camera's current values with the requested changes on top.
+    let mut merged: BTreeMap<&str, String> = BTreeMap::new();
+    for f in page.fields {
+        if let Some(v) = changes.get(&f.key.to_string()) {
+            merged.insert(f.key, (*v).clone());
+        } else if let Some(xml) = fetch(cam, f.msg, &mut cache).await
+            && let Some(v) = extract(f, &xml) {
+                merged.insert(f.key, v);
+            }
+    }
+    if let Err(e) = validate_page(page, &merged) {
+        return changes.keys().map(|k| WriteResult { key: (*k).clone(), ok: false, error: Some(e.clone()) }).collect();
+    }
+
     for (key, value) in changes {
-        let Some(field) = page.fields.iter().find(|f| f.key == key) else {
+        let Some(field) = page.fields.iter().find(|f| f.key == key.as_str()) else {
             results.push(WriteResult { key: key.clone(), ok: false, error: Some("unknown setting".into()) });
             continue;
         };
@@ -430,7 +927,7 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
             _ => vec![],
         };
         // The camera's current value is always an acceptable choice (it may predate our option list).
-        let current = fetch(cam, field.msg, &mut cache).await.and_then(|x| xmledit::get(&x, field.path));
+        let current = fetch(cam, field.msg, &mut cache).await.and_then(|x| extract(field, &x));
         let ok = validate(field, value, &opts).or_else(|e| if current.as_deref() == Some(value.as_str()) { Ok(()) } else { Err(e) });
         match ok {
             Ok(()) => by_msg.entry(field.msg.get).or_insert((field.msg, vec![])).1.push((field, value)),
@@ -453,9 +950,9 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
         };
         let mut edit_err = None;
         for (f, v) in &edits {
-            match xmledit::set(&xml, f.path, v) {
+            match apply(f, &xml, v) {
                 Ok(x) => xml = x,
-                Err(e) => edit_err = Some(e.to_string()),
+                Err(e) => edit_err = Some(e),
             }
         }
         if let Some(e) = edit_err {
@@ -463,21 +960,34 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
             continue;
         }
         if let Err(e) = cam.set(msg, xml).await {
-            fail(&mut results, &edits, format!("camera rejected the change: {e}"));
+            let why = if is_refusal(&e) {
+                "this camera doesn't allow changing this setting (it refused the write)".to_string()
+            } else {
+                format!("camera rejected the change: {e}")
+            };
+            fail(&mut results, &edits, why);
             continue;
         }
         let after = cam.get(msg).await.ok();
         for (f, v) in edits {
-            let got = after.as_deref().and_then(|x| xmledit::get(x, f.path));
-            let ok = got.as_deref() == Some(v.as_str());
-            results.push(WriteResult {
-                key: f.key.into(),
-                ok,
-                error: (!ok).then(|| format!("camera kept {:?} instead of {v:?}", got.unwrap_or_default())),
+            let ok = after.as_deref().is_some_and(|x| applied(f, x, v));
+            let error = (!ok).then(|| match f.kind {
+                Kind::Password { .. } => "camera didn't keep the new password".to_string(),
+                _ => format!(
+                    "camera kept {:?} instead of {v:?}",
+                    after.as_deref().and_then(|x| extract(f, x)).unwrap_or_default()
+                ),
             });
+            results.push(WriteResult { key: f.key.into(), ok, error });
         }
     }
     results
+}
+
+/// Send the camera's current Email/Ftp settings to its test command (141/194); the camera reports success.
+pub async fn run_test<C: Camera>(cam: &C, test: Msg) -> Result<(), String> {
+    let xml = cam.get(test).await?;
+    cam.set(test, xml).await
 }
 
 /// SystemGeneral XML set to `utc_secs` expressed in the camera's own time zone (for "sync time with this PC").
@@ -500,23 +1010,52 @@ pub fn with_clock(general_xml: &str, utc_secs: i64) -> Result<String, String> {
     Ok(xml)
 }
 
-pub const SYSTEM_GENERAL: Msg = GENERAL;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// In-memory camera: per-message XML; a write replaces it unless the field is "sticky" (camera refuses).
+    /// In-memory camera: per-message XML; a write replaces it unless a path is "sticky" (camera refuses).
     struct Fake {
         xml: Mutex<HashMap<u32, String>>,
         refuse_writes_to: Option<&'static str>,
         sets: Mutex<Vec<u32>>,
+        /// Masks: answer with the camera's lowercase <shelterList> form after a write.
+        masks_echo: bool,
+        /// Refuse writes to this get-id with 400, like Argus cameras do for motion (47).
+        refuse_msg: Option<u32>,
+        refused: Mutex<Vec<u32>>,
     }
 
     impl Fake {
         fn new(msgs: &[(u32, &str)]) -> Self {
-            Fake { xml: Mutex::new(msgs.iter().map(|(i, x)| (*i, x.to_string())).collect()), refuse_writes_to: None, sets: Mutex::new(vec![]) }
+            Fake {
+                xml: Mutex::new(msgs.iter().map(|(i, x)| (*i, x.to_string())).collect()),
+                refuse_writes_to: None,
+                sets: Mutex::new(vec![]),
+                masks_echo: false,
+                refuse_msg: None,
+                refused: Mutex::new(vec![]),
+            }
+        }
+
+        fn apply(&self, msg: Msg, xml: String) -> Result<(), String> {
+            if self.refuse_msg == Some(msg.get) {
+                self.refused.lock().unwrap().push(msg.get);
+                return Err(format!("Msg of type {} returned code 400", msg.set.unwrap()));
+            }
+            self.sets.lock().unwrap().push(msg.set.unwrap());
+            let mut map = self.xml.lock().unwrap();
+            let mut new = xml;
+            if let Some(path) = self.refuse_writes_to {
+                let old = xmledit::get(&map[&msg.get], path).unwrap();
+                new = xmledit::set(&new, path, &old).unwrap();
+            }
+            if self.masks_echo {
+                new = new.replace("ShelterList", "shelterList").replace("<channelId>0</channelId>", "<channelId>0</channelId>\n<maxNum>8</maxNum>");
+            }
+            map.insert(msg.get, new);
+            Ok(())
         }
     }
 
@@ -529,19 +1068,8 @@ mod tests {
             let r = self.apply(msg, xml);
             async move { r }
         }
-    }
-
-    impl Fake {
-        fn apply(&self, msg: Msg, xml: String) -> Result<(), String> {
-            self.sets.lock().unwrap().push(msg.set.unwrap());
-            let mut map = self.xml.lock().unwrap();
-            let mut new = xml;
-            if let Some(path) = self.refuse_writes_to {
-                let old = xmledit::get(&map[&msg.get], path).unwrap();
-                new = xmledit::set(&new, path, &old).unwrap();
-            }
-            map.insert(msg.get, new);
-            Ok(())
+        fn writable(&self, msg: Msg) -> bool {
+            !self.refused.lock().unwrap().contains(&msg.get)
         }
     }
 
@@ -550,8 +1078,38 @@ mod tests {
     const ENCODE_XML: &str = "<body><Compression version=\"1.1\"><mainStream><resolutionName>5120*1440</resolutionName><frame>15</frame><bitRate>4096</bitRate></mainStream><subStream><resolutionName>1536*432</resolutionName><frame>15</frame><bitRate>1024</bitRate></subStream></Compression></body>";
     const GENERAL_XML: &str = "<body><SystemGeneral version=\"1.1\"><timeZone>25200</timeZone><osdFormat>MDY</osdFormat><year>2026</year><month>10</month><day>24</day><hour>13</hour><minute>17</minute><second>47</second><timeFormat>1</timeFormat><deviceName>Backyard</deviceName></SystemGeneral></body>";
 
+    fn ones(n: usize) -> String {
+        "1".repeat(n)
+    }
+
+    fn schedule_xml(root: &str) -> String {
+        format!(
+            "<body><{root} version=\"1.1\"><channelId>0</channelId><enable>1</enable><typeScheduleList><item><type>people</type><valueTable>{}</valueTable></item><item><type>vehicle</type><valueTable>{}</valueTable></item></typeScheduleList></{root}></body>",
+            ones(168), ones(168)
+        )
+    }
+
+    /// 96x64 scope with an 80x22 grid, every grid cell on (like the cameras' default).
+    fn md_xml() -> String {
+        let mut bytes = vec![0u8; 96 * 64 / 8];
+        for r in 0..22 {
+            for c in 0..80 {
+                let n = r * 96 + c;
+                bytes[n / 8] |= 0x80 >> (n % 8);
+            }
+        }
+        let table = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        format!(
+            "<body><MD version=\"1.1\"><channelId>0</channelId><enable>1</enable><width>80</width><height>22</height><scope><columns>96</columns><rows>64</rows><valueTable>{table}</valueTable></scope><sensitivityInfoList><sensitivityInfo><id>0</id><sensitivity>10</sensitivity><beginHour>0</beginHour><beginMinute>0</beginMinute><endHour>6</endHour><endMinute>0</endMinute></sensitivityInfo></sensitivityInfoList></MD></body>"
+        )
+    }
+
     fn run<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+
+    fn changes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
     }
 
     #[test]
@@ -580,9 +1138,7 @@ mod tests {
     fn writes_validate_apply_and_verify() {
         let cam = Fake::new(&[(208, LEDS_XML)]);
         let p = page("lights").unwrap();
-        let changes: BTreeMap<String, String> =
-            [("ir_bright".into(), "55".into()), ("ir".into(), "auto".into())].into_iter().collect();
-        let r = run(write_page(&cam, p, &changes));
+        let r = run(write_page(&cam, p, &changes(&[("ir_bright", "55"), ("ir", "auto")])));
         assert!(r.iter().all(|r| r.ok), "{r:?}");
         assert_eq!(*cam.sets.lock().unwrap(), vec![209], "one write for both fields of the message");
         let xml = cam.xml.lock().unwrap()[&208].clone();
@@ -595,8 +1151,7 @@ mod tests {
         let cam = Fake::new(&[(208, LEDS_XML)]);
         let p = page("lights").unwrap();
         for (k, v) in [("ir_bright", "101"), ("ir_bright", "x"), ("ir", "strobe"), ("model", "y")] {
-            let changes: BTreeMap<String, String> = [(k.into(), v.into())].into_iter().collect();
-            let r = run(write_page(&cam, p, &changes));
+            let r = run(write_page(&cam, p, &changes(&[(k, v)])));
             assert!(!r[0].ok, "{k}={v} should be rejected");
         }
         assert!(cam.sets.lock().unwrap().is_empty());
@@ -606,8 +1161,7 @@ mod tests {
     fn reports_when_camera_ignores_a_write() {
         let mut cam = Fake::new(&[(208, LEDS_XML)]);
         cam.refuse_writes_to = Some("LedState/IRLedBrightness");
-        let changes: BTreeMap<String, String> = [("ir_bright".into(), "10".into())].into_iter().collect();
-        let r = run(write_page(&cam, page("lights").unwrap(), &changes));
+        let r = run(write_page(&cam, page("lights").unwrap(), &changes(&[("ir_bright", "10")])));
         assert!(!r[0].ok);
         assert!(r[0].error.as_deref().unwrap().contains("kept \"80\""));
     }
@@ -629,6 +1183,114 @@ mod tests {
     }
 
     #[test]
+    fn schedules_read_and_write_one_row() {
+        let cam = Fake::new(&[(81, &schedule_xml("Record"))]);
+        let p = page("schedules").unwrap();
+        let v = run(read_page(&cam, p));
+        let s = v.fields.iter().find(|f| f.key == "rec_sched").unwrap();
+        assert_eq!(s.display, "people 168/168 h, vehicle 168/168 h");
+        // Turn off Sunday 00:00-01:00 for vehicles only.
+        let mut map: BTreeMap<String, String> = serde_json::from_str(&s.value).unwrap();
+        map.get_mut("vehicle").unwrap().replace_range(0..1, "0");
+        let r = run(write_page(&cam, p, &changes(&[("rec_sched", &serde_json::to_string(&map).unwrap())])));
+        assert!(r[0].ok, "{r:?}");
+        let xml = cam.xml.lock().unwrap()[&81].clone();
+        assert_eq!(xmledit::get_all(&xml, "Record/typeScheduleList/item/valueTable"), [ones(168), format!("0{}", ones(167))]);
+        // Malformed schedules are refused before sending.
+        let bad = run(write_page(&cam, p, &changes(&[("rec_sched", "{\"people\":\"10\"}")])));
+        assert!(!bad[0].ok);
+    }
+
+    #[test]
+    fn motion_zone_roundtrips_bits_msb_first() {
+        let cam = Fake::new(&[(46, &md_xml())]);
+        let p = page("motion").unwrap();
+        let v = run(read_page(&cam, p));
+        let zone = v.fields.iter().find(|f| f.key == "md_zone").unwrap();
+        let mut z: ZoneValue = serde_json::from_str(&zone.value).unwrap();
+        assert_eq!((z.w, z.h), (80, 22));
+        assert!(z.cells.chars().all(|c| c == '1'));
+        assert_eq!(v.fields.iter().find(|f| f.key == "md_p0").unwrap().display, "00:00–06:00");
+        // Clear the first cell of the second row; it must land at bit 96 (byte 12, high bit).
+        z.cells.replace_range(80..81, "0");
+        let r = run(write_page(&cam, p, &changes(&[("md_zone", &serde_json::to_string(&z).unwrap()), ("md_s0", "25")])));
+        assert!(r.iter().all(|r| r.ok), "{r:?}");
+        let xml = cam.xml.lock().unwrap()[&46].clone();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(xmledit::get(&xml, "MD/scope/valueTable").unwrap()).unwrap();
+        assert_eq!(bytes[12], 0x7f);
+        assert_eq!(bytes[11], 0x00, "cells outside the 80-wide grid stay as they were");
+        assert_eq!(xmledit::get(&xml, "MD/sensitivityInfoList/sensitivityInfo[0]/sensitivity").as_deref(), Some("25"));
+        assert!(!run(write_page(&cam, p, &changes(&[("md_s0", "51")])))[0].ok, "official range is 1-50");
+    }
+
+    #[test]
+    fn refused_writes_become_read_only_for_that_camera() {
+        let mut cam = Fake::new(&[(46, &md_xml())]);
+        cam.refuse_msg = Some(46);
+        let p = page("motion").unwrap();
+        let r = run(write_page(&cam, p, &changes(&[("md_s0", "20")])));
+        assert!(!r[0].ok && r[0].error.as_deref().unwrap().contains("doesn't allow changing"), "{r:?}");
+        let v = run(read_page(&cam, p));
+        assert!(v.fields.iter().all(|f| f.kind == "info"), "motion fields shown read-only after the refusal");
+        assert_eq!(v.fields.iter().find(|f| f.key == "md_zone").unwrap().display, "1760 of 1760 areas active");
+    }
+
+    #[test]
+    fn privacy_masks_use_the_sdk_layout() {
+        let read = "<body><Shelter version=\"1.1\"><channelId>0</channelId><enable>0</enable><maxNum>8</maxNum><shelterList /></Shelter></body>";
+        let mut cam = Fake::new(&[(52, read)]);
+        cam.masks_echo = true;
+        let p = page("privacy").unwrap();
+        let v = run(read_page(&cam, p));
+        assert_eq!(v.fields[0].value, r#"{"enable":"0","max":8,"rects":[]}"#);
+        let want = r#"{"enable":"1","max":8,"rects":[[100,200,300,150]]}"#;
+        let r = run(write_page(&cam, p, &changes(&[("masks", want)])));
+        assert!(r[0].ok, "{r:?}");
+        let xml = cam.xml.lock().unwrap()[&52].clone();
+        // x<<16 | reference, exactly as the SDK packs it; 8 entries, the unused ones disabled.
+        assert!(xml.contains(&format!("<topLeftX>{}</topLeftX>", 100 << 16 | 1000)));
+        assert_eq!(xmledit::get_all(&xml, "Shelter/shelterList/Shelter/enable").len(), 8);
+        // Out-of-frame or too many areas are refused.
+        assert!(!run(write_page(&cam, p, &changes(&[("masks", r#"{"enable":"1","max":8,"rects":[[900,0,200,10]]}"#)])))[0].ok);
+    }
+
+    #[test]
+    fn passwords_are_never_shown_and_blank_keeps_them() {
+        let ftp = "<body><Ftp version=\"1.1\"><server>ftp.example.com</server><port>21</port><nonymous>0</nonymous><remoteDir> </remoteDir><userName>cam</userName><password>s3cret</password></Ftp></body>";
+        let cam = Fake::new(&[(68, ftp)]);
+        let p = page("ftp").unwrap();
+        let v = run(read_page(&cam, p));
+        let pw = v.fields.iter().find(|f| f.key == "ftp_pass").unwrap();
+        assert_eq!((pw.kind, pw.value.as_str(), pw.display.as_str()), ("password", "", ""));
+        assert!(!serde_json::to_string(&v).unwrap().contains("s3cret"));
+        // Blank = unchanged: nothing is written at all.
+        assert!(run(write_page(&cam, p, &changes(&[("ftp_pass", "")]))).is_empty());
+        assert!(cam.sets.lock().unwrap().is_empty());
+        let r = run(write_page(&cam, p, &changes(&[("ftp_pass", "n3w"), ("ftp_dir", "cams/front")])));
+        assert!(r.iter().all(|r| r.ok), "{r:?}");
+        assert!(!run(write_page(&cam, p, &changes(&[("ftp_dir", "bad dir!")])))[0].ok, "official path rule");
+    }
+
+    #[test]
+    fn network_rejects_settings_that_would_strand_the_camera() {
+        let net = "<body><Dhcp version=\"1.1\"><enable>1</enable></Dhcp><AutoDns version=\"1.1\"><enable>1</enable></AutoDns><Ip version=\"1.1\"><ip>192.168.1.254</ip><mask>255.255.255.0</mask><mac>00:00:00:00:00:00</mac><gateway>192.168.1.1</gateway></Ip><Dns version=\"1.1\"><dns1>9.9.9.9</dns1><dns2> </dns2></Dns></body>";
+        let cam = Fake::new(&[(76, net)]);
+        let p = page("network").unwrap();
+        for bad in [
+            vec![("dhcp", "0"), ("net_gw", "10.0.0.1")],
+            vec![("dhcp", "0"), ("net_mask", "255.0.255.0")],
+            vec![("dhcp", "0"), ("net_ip", "192.168.1.255")],
+            vec![("net_ip", "300.1.1.1")],
+        ] {
+            let r = run(write_page(&cam, p, &changes(&bad)));
+            assert!(r.iter().all(|r| !r.ok), "{bad:?} should be refused");
+        }
+        assert!(cam.sets.lock().unwrap().is_empty());
+        let r = run(write_page(&cam, p, &changes(&[("dhcp", "0"), ("net_ip", "192.168.1.60"), ("dns2", "")])));
+        assert!(r.iter().all(|r| r.ok), "{r:?}");
+    }
+
+    #[test]
     fn time_zone_and_clock() {
         assert_eq!(tz_label(25200), "UTC−7:00");
         assert_eq!(tz_label(-19800), "UTC+5:30");
@@ -642,9 +1304,10 @@ mod tests {
 
     #[test]
     fn every_field_path_targets_a_known_message() {
+        let mut keys = std::collections::HashSet::new();
         for p in PAGES {
             for f in p.fields {
-                assert!(f.path.contains('/'), "{}", f.key);
+                assert!(keys.insert((p.id, f.key)), "duplicate key {}", f.key);
                 if !matches!(f.kind, Kind::Info(_)) {
                     assert!(f.msg.set.is_some(), "{} is editable but has no write id", f.key);
                 }
