@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
 
 const LAYOUTS: [usize; 5] = [1, 2, 4, 9, 16];
 const MAX_TILES: usize = 16;
@@ -39,6 +39,12 @@ struct Inner {
     clear: Vec<u64>,
     /// Last live request sent to each device, so syncing only sends changes.
     sent: HashMap<u64, Option<StreamKind>>,
+    /// Tile shown alone (double-click); the other tiles are hidden and shouldn't stream.
+    solo: Option<usize>,
+    /// Window minimized: stop streams nobody can see (recordings keep theirs).
+    hidden: bool,
+    /// Last JPEG box sent to each device.
+    boxes: HashMap<u64, (u32, u32)>,
     next_id: u64,
 }
 
@@ -65,11 +71,24 @@ impl Inner {
         self.devices.iter().position(|d| d.id == id).ok_or_else(|| "unknown device".to_string())
     }
 
-    /// Stream exactly the devices in visible tiles, at their chosen quality.
+    /// Stream only what's on screen. Clear (main) is honored only where a tile is big enough to show it
+    /// (single view or 1/2 layouts); smaller tiles get the sub stream, ~5x less camera Wi-Fi airtime.
     fn sync_live(&mut self) {
-        let visible: Vec<u64> = self.tiles[..self.layout].iter().flatten().copied().collect();
+        let visible: Vec<u64> = match (self.hidden, self.solo) {
+            (true, _) => vec![],
+            (false, Some(t)) => self.tiles.get(t).copied().flatten().into_iter().collect(),
+            (false, None) => self.tiles[..self.layout].iter().flatten().copied().collect(),
+        };
+        let big = self.solo.is_some() || self.layout <= 2;
         for d in &self.devices {
-            let want = visible.contains(&d.id).then(|| if self.clear.contains(&d.id) { StreamKind::Main } else { StreamKind::Sub });
+            let want = if visible.contains(&d.id) {
+                Some(if big && self.clear.contains(&d.id) { StreamKind::Main } else { StreamKind::Sub })
+            } else if d.state.lock().unwrap().recording.is_some() {
+                // Off screen but recording: keep the stream as it is.
+                self.sent.get(&d.id).copied().flatten()
+            } else {
+                None
+            };
             if self.sent.get(&d.id) != Some(&want) {
                 d.send(Cmd::Live(want));
                 self.sent.insert(d.id, want);
@@ -126,7 +145,8 @@ struct StateDto {
 
 #[tauri::command]
 fn get_state(app: State<App>) -> StateDto {
-    let inner = app.inner.lock().unwrap();
+    let mut inner = app.inner.lock().unwrap();
+    inner.sync_live(); // picks up recordings that ended off screen, so their streams stop
     let devices = inner
         .devices
         .iter()
@@ -227,6 +247,7 @@ fn set_layout(app: State<App>, layout: usize) -> Result<(), String> {
     }
     let mut inner = app.inner.lock().unwrap();
     inner.layout = layout;
+    inner.solo = None;
     inner.changed();
     Ok(())
 }
@@ -247,6 +268,28 @@ fn assign_tile(app: State<App>, tile: usize, id: Option<u64>) -> Result<(), Stri
     inner.tiles[tile] = id;
     inner.changed();
     Ok(())
+}
+
+#[tauri::command]
+fn set_solo(app: State<App>, tile: Option<usize>) {
+    let mut inner = app.inner.lock().unwrap();
+    inner.solo = tile.filter(|&t| t < MAX_TILES);
+    inner.sync_live();
+}
+
+/// Tile sizes in device pixels, so each decoder makes JPEGs no bigger than what's shown.
+#[tauri::command]
+fn set_view_sizes(app: State<App>, sizes: Vec<(u64, u32, u32)>) {
+    let mut inner = app.inner.lock().unwrap();
+    for (id, w, h) in sizes {
+        let b = media::jpeg_box(w, h);
+        if inner.boxes.get(&id) != Some(&b)
+            && let Some(d) = inner.devices.iter().find(|d| d.id == id)
+        {
+            d.send(Cmd::View(b));
+            inner.boxes.insert(id, b);
+        }
+    }
 }
 
 #[tauri::command]
@@ -329,7 +372,7 @@ fn main() {
     let saved: Saved = std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let app = App {
         rt,
-        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), next_id: 0 }),
+        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, boxes: HashMap::new(), next_id: 0 }),
         feeds,
         port,
         token,
@@ -349,8 +392,19 @@ fn main() {
         .manage(app)
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile,
-            set_clear, ptz, snapshot, record, open_media_folder, scan_lan
+            set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Resized(_) = event {
+                let hidden = window.is_minimized().unwrap_or(false);
+                let app = window.state::<App>();
+                let mut inner = app.inner.lock().unwrap();
+                if inner.hidden != hidden {
+                    inner.hidden = hidden;
+                    inner.sync_live();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("run tauri app");
 }

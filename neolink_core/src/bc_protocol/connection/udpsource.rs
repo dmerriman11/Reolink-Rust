@@ -330,7 +330,8 @@ impl UdpPayloadInner {
         // and the socket
 
         let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(500);
-        let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(500);
+        // ~4 main-stream keyframes of headroom (a 280 KB keyframe is ~210 packets).
+        let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(1000);
         // let (mut socket_tx, mut socket_rx) = inner.split();
 
         // Send/Recv on the socket
@@ -355,10 +356,26 @@ impl UdpPayloadInner {
                             }
                             packet = inner.next() => {
                                 log::trace!("Cam->App");
-                                let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
+                                let packet = match packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))? {
+                                    Ok(p) => p,
+                                    // The camera ending the session is final.
+                                    Err(e @ (Error::CameraTerminate | Error::RelayTerminate)) => break Err(e),
+                                    // Anything else is one bad datagram; UdpFramed carries on with the next.
+                                    Err(e) => {
+                                        log::debug!("Skipping undecodable UDP packet: {e}");
+                                        continue;
+                                    }
+                                };
                                 recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
-                                // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
-                                socket_out_tx.try_send(packet).map_err(|e| Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))))?;
+                                match socket_out_tx.try_send(packet) {
+                                    Ok(()) => {}
+                                    // Consumer briefly behind: drop this packet rather than the whole link.
+                                    // It is never acked, so the camera resends it.
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        log::debug!("UDP receive queue full; dropped a packet for the camera to resend");
+                                    }
+                                    Err(e) => break Err(Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}")))),
+                                }
                                 continue;
                             },
                             packet = socket_in_rx.next() => {
@@ -401,6 +418,10 @@ impl UdpPayloadInner {
                     Ok(())
                 } => v,
             };
+            if let Err(e) = &result {
+                // The run loop only sees this as NoneRecieved; log the real cause.
+                log::error!("UDP socket thread ended: {e:?}");
+            }
             send_cancel.cancel();
             result
         });

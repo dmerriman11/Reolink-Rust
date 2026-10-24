@@ -41,6 +41,8 @@ pub enum Cmd {
     Ptz(Direction),
     Snapshot,
     Record(bool),
+    /// Largest JPEG (device pixels) the tile can show; see media::jpeg_box.
+    View((u32, u32)),
 }
 
 #[derive(Default)]
@@ -113,10 +115,11 @@ fn safe_name(name: &str) -> String {
 struct Wanted {
     live: Option<StreamKind>,
     record: bool,
+    jpeg_box: (u32, u32),
 }
 
 async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex<State>>, frames: watch::Sender<Frame>) {
-    let mut wanted = Wanted { live: None, record: false };
+    let mut wanted = Wanted { live: None, record: false, jpeg_box: crate::media::DEFAULT_BOX };
     let mut backoff = 1;
     loop {
         let err = match session(&cfg, &mut rx, &state, &frames, &mut wanted).await {
@@ -141,6 +144,7 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     None => return,
                     Some(Cmd::Live(k)) => { wanted.live = k; state.lock().unwrap().live = k; }
                     Some(Cmd::Record(r)) => wanted.record = r,
+                    Some(Cmd::View(b)) => wanted.jpeg_box = b,
                     Some(_) => {}
                 },
             }
@@ -185,6 +189,8 @@ struct Live {
     recorder: Option<Recorder>,
     /// Recorder starts on the next video frame, once the codec is known.
     record: bool,
+    /// Decoder output box; a change takes effect at the next keyframe.
+    jpeg_box: (u32, u32),
 }
 
 async fn next_media(live: &mut Option<Live>) -> Result<Result<BcMedia, neolink_core::Error>, neolink_core::Error> {
@@ -255,10 +261,14 @@ async fn session(
         match cmd {
             Cmd::Live(kind) => {
                 wanted.live = kind;
+                if kind.is_none() && live.is_some() {
+                    log::info!("{}: live stopped", cfg.name);
+                }
                 live = None; // dropping StreamData sends the stop to the camera
                 if let Some(k) = kind {
+                    log::info!("{}: live {k}", cfg.name);
                     let stream = cam.start_video(k, 0, false).await.context("start live")?;
-                    live = Some(Live { stream, decoder: None, recorder: None, record: wanted.record });
+                    live = Some(Live { stream, decoder: None, recorder: None, record: wanted.record, jpeg_box: wanted.jpeg_box });
                 }
                 if kind.is_none() {
                     frames.send_replace(None);
@@ -281,6 +291,12 @@ async fn session(
                 if !on {
                     l.recorder = None;
                     set(&|s| s.recording = None);
+                }
+            }
+            Cmd::View(b) => {
+                wanted.jpeg_box = b;
+                if let Some(l) = live.as_mut() {
+                    l.jpeg_box = b;
                 }
             }
             Cmd::Ptz(dir) => {
@@ -335,7 +351,10 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         r.push(&data, key);
     }
 
-    let stale = live.decoder.as_ref().is_some_and(|d| std::mem::discriminant(&d.codec) != std::mem::discriminant(&codec));
+    // Swap decoders only at a keyframe so the new one starts clean; the old one keeps the tile live until then.
+    let stale = live.decoder.as_ref().is_some_and(|d| {
+        std::mem::discriminant(&d.codec) != std::mem::discriminant(&codec) || (key && d.jpeg_box != live.jpeg_box)
+    });
     if stale {
         live.decoder = None;
     }
@@ -347,7 +366,7 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         let on_frame = move |jpeg: Vec<u8>| {
             tx.send_replace(Some(Arc::new(jpeg)));
         };
-        match Decoder::new(codec, on_frame) {
+        match Decoder::new(codec, live.jpeg_box, on_frame) {
             Ok(d) => live.decoder = Some(d),
             Err(e) => {
                 state.lock().unwrap().message = Some(format!("Decoder failed (is ffmpeg installed?): {e}"));

@@ -13,6 +13,7 @@ connected (pinged every 5 s) and reconnects automatically, resuming its live vie
 - Stream and connection task errors are surfaced/logged instead of a bare `StreamFinished`.
 
 Test a saved camera end to end (stream, decode, ~8 s recording): `cargo run --example probe -- "<device name>" [main|sub]`.
+Measure each saved camera's video/audio bitrate per stream: `cargo run --release --example bitrate`.
 
 ## Run
 

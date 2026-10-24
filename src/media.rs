@@ -7,8 +7,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 
-/// Largest decoded width; 4K RGBA at full size would push ~600 MB/s through the pipe.
-const MAX_WIDTH: u32 = 1920;
+/// Largest JPEG we produce; even a maximized single view rarely shows more than this.
+const MAX_BOX: (u32, u32) = (2560, 1440);
+/// Box sizes are rounded up to this step so window resizes don't constantly restart the decoder.
+const BOX_STEP: u32 = 128;
+
+/// The JPEG bounding box for a tile of `w`x`h` device pixels: rounded up to BOX_STEP, capped at MAX_BOX.
+pub fn jpeg_box(w: u32, h: u32) -> (u32, u32) {
+    let up = |v: u32, max: u32| v.max(1).div_ceil(BOX_STEP).saturating_mul(BOX_STEP).min(max);
+    (up(w, MAX_BOX.0), up(h, MAX_BOX.1))
+}
+
+/// Before the UI reports a tile size.
+pub const DEFAULT_BOX: (u32, u32) = (1280, 720);
 
 
 fn ffmpeg() -> PathBuf {
@@ -58,6 +69,7 @@ fn feeder(mut stdin: ChildStdin) -> SyncSender<Vec<u8>> {
 
 pub struct Decoder {
     pub codec: VideoType,
+    pub jpeg_box: (u32, u32),
     child: Child,
     tx: Option<SyncSender<Vec<u8>>>,
     waiting_for_key: bool,
@@ -66,13 +78,17 @@ pub struct Decoder {
 impl Decoder {
     pub fn new(
         codec: VideoType,
+        jpeg_box: (u32, u32),
         on_frame: impl Fn(Vec<u8>) + Send + 'static,
     ) -> std::io::Result<Self> {
         // JPEG frames carry their own size, so we never need the camera to tell us the resolution
         // (some, like the Argus 4 Pro, never send the stream info header).
-        let scale = format!("scale='min({MAX_WIDTH},iw)':-2");
+        // Fit the tile's box (never upscaling): JPEG cost scales with pixels, so don't make more than is shown.
+        let (w, h) = jpeg_box;
+        let scale = format!("scale=w='min(iw,{w})':h='min(ih,{h})':force_original_aspect_ratio=decrease:force_divisible_by=2");
         let mut child = spawn(
             &[
+                "-hwaccel", "auto", // GPU decode when available (~3x less CPU), silent software fallback
                 "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
                 "-f", format_of(codec), "-i", "pipe:0",
                 "-vf", &scale, "-c:v", "mjpeg", "-q:v", "4", "-f", "mpjpeg", "pipe:1",
@@ -86,7 +102,7 @@ impl Decoder {
                 on_frame(frame);
             }
         });
-        Ok(Self { codec, child, tx: Some(tx), waiting_for_key: true })
+        Ok(Self { codec, jpeg_box, child, tx: Some(tx), waiting_for_key: true })
     }
 
     pub fn push(&mut self, data: Vec<u8>, keyframe: bool) {
@@ -186,7 +202,7 @@ mod tests {
             .expect("ffmpeg on PATH");
         assert!(out.status.success() && !out.stdout.is_empty());
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut dec = Decoder::new(codec, move |jpeg| { let _ = tx.send(jpeg); }).unwrap();
+        let mut dec = Decoder::new(codec, (1920, 1080), move |jpeg| { let _ = tx.send(jpeg); }).unwrap();
         dec.push(out.stdout, true);
         dec.tx.take(); // EOF flushes the decoder
         let jpeg = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a decoded frame");
@@ -206,6 +222,14 @@ mod tests {
     #[test]
     fn decodes_h265() {
         roundtrip(VideoType::H265, "libx265");
+    }
+
+    #[test]
+    fn jpeg_box_rounds_up_and_caps() {
+        assert_eq!(jpeg_box(900, 400), (1024, 512));
+        assert_eq!(jpeg_box(1024, 512), (1024, 512));
+        assert_eq!(jpeg_box(5000, 3000), (2560, 1440));
+        assert_eq!(jpeg_box(0, 0), (128, 128));
     }
 
     #[test]

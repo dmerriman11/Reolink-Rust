@@ -123,6 +123,30 @@ function renderDevices() {
 }
 
 // ---------- tiles ----------
+// Single view: the backend stops streams for the hidden tiles and may switch the shown one to Clear.
+function setSolo(idx) {
+  solo = idx;
+  renderTiles();
+  call("set_solo", { tile: idx });
+}
+
+// Report each streaming tile's size in device pixels so JPEGs are made no bigger than shown.
+let sizeTimer;
+function reportSizes() {
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(() => {
+    const dpr = window.devicePixelRatio || 1;
+    const sizes = [];
+    tiles.forEach((t, idx) => {
+      const id = state.tiles[idx];
+      if (id == null || !t.root.isConnected || t.root.offsetParent === null) return;
+      const r = t.root.getBoundingClientRect();
+      sizes.push([id, Math.round(r.width * dpr), Math.round(r.height * dpr)]);
+    });
+    if (sizes.length) invoke("set_view_sizes", { sizes }).catch(() => {});
+  }, 250);
+}
+new ResizeObserver(reportSizes).observe(document.querySelector("#grid"));
 function makeTile(idx) {
   const t = { root: el("div", "tile"), img: el("img"), key: null };
   t.img.alt = "";
@@ -130,8 +154,7 @@ function makeTile(idx) {
   t.root.onclick = () => { selected = idx; renderTiles(); renderPtz(); };
   t.root.ondblclick = (e) => {
     if (e.target.closest(".tile-bar")) return;
-    solo = solo === idx ? null : idx;
-    renderTiles();
+    setSolo(solo === idx ? null : idx);
   };
   return t;
 }
@@ -183,6 +206,7 @@ function renderTiles() {
     for (const [label, clear] of [["Fluent", false], ["Clear", true]]) {
       const b = Object.assign(el("button"), { textContent: label });
       b.setAttribute("aria-pressed", String(d.clear === clear));
+      if (clear) b.title = "HD in single view and 1–2 camera layouts; smaller tiles use Fluent to save bandwidth";
       b.onclick = (e) => { e.stopPropagation(); call("set_clear", { id: d.id, clear }).then(refresh); };
       seg.append(b);
     }
@@ -195,7 +219,7 @@ function renderTiles() {
     close.title = "Close live view";
     close.onclick = (e) => {
       e.stopPropagation();
-      if (solo === idx) solo = null;
+      if (solo === idx) setSolo(null);
       call("assign_tile", { tile: idx, id: null }).then(refresh);
     };
     bar.append(seg, snap, rec, el("span", "spacer"), close);
@@ -336,10 +360,11 @@ async function refresh() {
   renderDevices();
   renderTiles();
   renderPtz();
+  reportSizes();
 }
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && solo != null && !$("#device-dialog").open) { solo = null; renderTiles(); }
+  if (e.key === "Escape" && solo != null && !$("#device-dialog").open) setSolo(null);
 });
 $("#media-folder").onclick = () => call("open_media_folder");
 

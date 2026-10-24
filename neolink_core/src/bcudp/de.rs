@@ -70,8 +70,10 @@ fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
     let (buf, checksum) = error_context("DISC: Missing checksum", le_u32)(buf)?;
     let (buf, enc_data_slice) = take(payload_size)(buf)?;
 
-    let actual_checksum = calc_crc(enc_data_slice);
-    assert_eq!(checksum, actual_checksum);
+    // A corrupt or foreign datagram must not panic the connection task; reject it instead.
+    if calc_crc(enc_data_slice) != checksum {
+        return Err(Err::Error(make_error(buf, "DISC: Bad checksum", ErrorKind::Verify)));
+    }
 
     let decrypted_payload = decrypt(tid, enc_data_slice);
     let payload = UdpXml::try_parse(decrypted_payload.as_slice()).map_err(|e| {
