@@ -167,6 +167,11 @@ h2 { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .14em; text-tra
 }
 .chip { padding: 3px 6px; border-radius: 5px; font: 600 9.5px/1 var(--display); letter-spacing: .12em; background: rgba(255, 255, 255, .1); color: var(--text); }
 .chip.live::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: var(--live); vertical-align: 1px; }
+.tile.motion { box-shadow: inset 0 0 0 2px var(--accent); }
+.tile.motion .tile-head::after {
+  content: "MOTION"; margin-left: 6px; padding: 2px 6px; border-radius: 4px;
+  background: var(--accent); color: var(--accent-ink); font: 600 10px/1.2 var(--display); letter-spacing: .06em;
+}
 .chip.rec { margin-left: auto; background: var(--rec); color: #fff; animation: pulse 1.6s ease-in-out infinite; }
 
 .tile-bar {

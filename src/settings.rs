@@ -72,8 +72,6 @@ pub enum Fmt {
     TimeZone,
     /// Wi-Fi RSSI; the camera reports a -10 dBm placeholder for a few seconds after connecting.
     Dbm,
-    /// A motion sensitivity block (path names the block): "HH:MM–HH:MM".
-    Period,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +145,7 @@ const PCT: Kind = Kind::Info(Fmt::Suffix("%"));
 const IMG: Kind = Kind::Range { min: 0, max: 255 };
 const PORT: Kind = Kind::Number { min: 1, max: 65535 };
 const MD_SENS: Kind = Kind::Range { min: 1, max: 50 };
+const MD_SENS_DEFAULT: &str = "MD/sensInfoNew/sensitivityDefault";
 const fn text(max: usize, charset: Charset, required: bool) -> Kind {
     Kind::Text { max, charset, required }
 }
@@ -243,14 +242,9 @@ pub static PAGES: &[Page] = &[
         fields: &[
             f("md_on", "Motion detection", MOTION, "MD/enable", Kind::Toggle),
             f("md_zone", "Detection area", MOTION, "MD", Kind::Zone),
-            f("md_p0", "Period 1", MOTION, "MD/sensitivityInfoList/sensitivityInfo[0]", Kind::Info(Fmt::Period)),
-            f("md_s0", "Period 1 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[0]/sensitivity", MD_SENS),
-            f("md_p1", "Period 2", MOTION, "MD/sensitivityInfoList/sensitivityInfo[1]", Kind::Info(Fmt::Period)),
-            f("md_s1", "Period 2 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[1]/sensitivity", MD_SENS),
-            f("md_p2", "Period 3", MOTION, "MD/sensitivityInfoList/sensitivityInfo[2]", Kind::Info(Fmt::Period)),
-            f("md_s2", "Period 3 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[2]/sensitivity", MD_SENS),
-            f("md_p3", "Period 4", MOTION, "MD/sensitivityInfoList/sensitivityInfo[3]", Kind::Info(Fmt::Period)),
-            f("md_s3", "Period 4 sensitivity", MOTION, "MD/sensitivityInfoList/sensitivityInfo[3]/sensitivity", MD_SENS),
+            // The official client edits sensInfoNew whenever the camera reports it (iSensVerion != 0);
+            // shortcut: older cameras with only the legacy sensitivityInfoList don't show this field.
+            f("md_sens", "Sensitivity", MOTION, MD_SENS_DEFAULT, MD_SENS),
         ],
     },
     Page {
@@ -431,7 +425,7 @@ pub struct PageView {
 
 fn format_value(fmt: Fmt, v: &str) -> String {
     match fmt {
-        Fmt::Plain | Fmt::Period => v.to_string(),
+        Fmt::Plain => v.to_string(),
         Fmt::Suffix(s) => format!("{v}{s}"),
         Fmt::Bytes => v.parse::<f64>().map(|b| format!("{:.1} GB", b / 1e9)).unwrap_or_else(|_| v.into()),
         Fmt::TimeZone => v.parse::<i64>().map(tz_label).unwrap_or_else(|_| v.into()),
@@ -639,18 +633,12 @@ fn zone_summary(value: &str) -> String {
         .unwrap_or_default()
 }
 
-fn period_label(xml: &str, path: &str) -> Option<String> {
-    let n = |p: &str| xmledit::get(xml, &format!("{path}/{p}"))?.parse::<u32>().ok();
-    Some(format!("{:02}:{:02}–{:02}:{:02}", n("beginHour")?, n("beginMinute")?, n("endHour")?, n("endMinute")?))
-}
-
 /// The field's current value from its message's XML, in the form the UI edits.
 fn extract(field: &Field, xml: &str) -> Option<String> {
     match field.kind {
         Kind::Schedule => read_schedule(xml, field.path),
         Kind::Zone => read_zone(xml, field.path),
         Kind::Masks => read_masks(xml, field.path),
-        Kind::Info(Fmt::Period) => period_label(xml, field.path),
         // Present but never revealed.
         Kind::Password { .. } => xmledit::get(xml, field.path).map(|_| String::new()),
         _ => xmledit::get(xml, field.path),
@@ -665,6 +653,14 @@ fn apply(field: &Field, xml: &str, value: &str) -> Result<String, String> {
         Kind::Masks => write_masks(xml, field.path, value),
         // The camera stores empty strings as a single space.
         Kind::Text { .. } | Kind::Ipv4 { .. } if value.is_empty() => xmledit::set(xml, field.path, " ").map_err(|e| e.to_string()),
+        // Like the official "default sensitivity" control: the default and every time period take the value.
+        _ if field.path == MD_SENS_DEFAULT => {
+            let mut x = xmledit::set(xml, field.path, value).map_err(|e| e.to_string())?;
+            for i in 0..xmledit::get_all(xml, "MD/sensInfoNew/sensInfoList/sensInfo").len() {
+                x = xmledit::set(&x, &format!("MD/sensInfoNew/sensInfoList/sensInfo[{i}]/sensitivity"), value).map_err(|e| e.to_string())?;
+            }
+            Ok(x)
+        }
         _ => xmledit::set(xml, field.path, value).map_err(|e| e.to_string()),
     }
 }
@@ -676,6 +672,54 @@ fn applied(field: &Field, after: &str, value: &str) -> bool {
         Kind::Password { .. } => xmledit::get(after, field.path).as_deref() == Some(value),
         _ => extract(field, after).as_deref() == Some(value),
     }
+}
+
+/// The camera's text for the first `<tag>` element (with its children), or None.
+fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let start = [format!("<{tag}>"), format!("<{tag} "), format!("<{tag}/")].iter().filter_map(|t| xml.find(t.as_str())).min()?;
+    let rest = &xml[start..];
+    let end = match rest.find(&format!("</{tag}>")) {
+        Some(i) => i + tag.len() + 3,
+        None => rest.find("/>")? + 2,
+    };
+    Some(&rest[..end])
+}
+
+/// What to send for a write. Most messages take the edited document whole; motion (47) must be the SDK's
+/// partial `<MD>` (FUN_18014e120): channelId plus only the groups being changed. Argus cameras answer 400 to the
+/// whole document read back from 46 (its empty timeBlockList/handleException aren't accepted as input).
+fn outgoing(msg: Msg, xml: String, edits: &[(&Field, &String)]) -> Result<String, String> {
+    if msg != MOTION {
+        return Ok(xml);
+    }
+    let mut groups = vec![];
+    for (f, _) in edits {
+        let tags: &[&str] = match f.key {
+            "md_on" => &["enable"],
+            "md_zone" => &["width", "height", "scope"],
+            "md_sens" => &["sensInfoNew"],
+            _ => return Err(format!("{} can't be written", f.label)),
+        };
+        for t in tags {
+            let e = element(&xml, t).ok_or_else(|| format!("camera's motion settings have no {t}"))?;
+            if !groups.contains(&e) {
+                groups.push(e);
+            }
+        }
+    }
+    let channel = element(&xml, "channelId").ok_or("camera's motion settings have no channelId")?;
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>
+<body>
+<MD version=\"1.1\">
+{channel}
+{}
+</MD>
+</body>
+",
+        groups.join("
+")
+    ))
 }
 
 // ---------- engine ----------
@@ -959,6 +1003,13 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
             fail(&mut results, &edits, e);
             continue;
         }
+        let xml = match outgoing(msg, xml, &edits) {
+            Ok(x) => x,
+            Err(e) => {
+                fail(&mut results, &edits, e);
+                continue;
+            }
+        };
         if let Err(e) = cam.set(msg, xml).await {
             let why = if is_refusal(&e) {
                 "this camera doesn't allow changing this setting (it refused the write)".to_string()
@@ -1051,6 +1102,19 @@ mod tests {
                 let old = xmledit::get(&map[&msg.get], path).unwrap();
                 new = xmledit::set(&new, path, &old).unwrap();
             }
+            if msg == MOTION {
+                // Cameras refuse the whole document read back from 46 and merge the partial one.
+                if new.contains("<timeBlockList") || new.contains("<handleException") || new.contains("<sensitivityInfoList") {
+                    return Err("Msg of type 47 returned code 400".into());
+                }
+                let mut merged = map[&msg.get].clone();
+                for t in ["enable", "width", "height", "scope", "sensInfoNew"] {
+                    if let (Some(old), Some(part)) = (element(&merged, t).map(str::to_string), element(&new, t)) {
+                        merged = merged.replacen(&old, part, 1);
+                    }
+                }
+                new = merged;
+            }
             if self.masks_echo {
                 new = new.replace("ShelterList", "shelterList").replace("<channelId>0</channelId>", "<channelId>0</channelId>\n<maxNum>8</maxNum>");
             }
@@ -1100,7 +1164,7 @@ mod tests {
         }
         let table = base64::engine::general_purpose::STANDARD.encode(&bytes);
         format!(
-            "<body><MD version=\"1.1\"><channelId>0</channelId><enable>1</enable><width>80</width><height>22</height><scope><columns>96</columns><rows>64</rows><valueTable>{table}</valueTable></scope><sensitivityInfoList><sensitivityInfo><id>0</id><sensitivity>10</sensitivity><beginHour>0</beginHour><beginMinute>0</beginMinute><endHour>6</endHour><endMinute>0</endMinute></sensitivityInfo></sensitivityInfoList></MD></body>"
+            "<body><MD version=\"1.1\"><channelId>0</channelId><enable>1</enable><width>80</width><height>22</height><scope><columns>96</columns><rows>64</rows><valueTable>{table}</valueTable></scope><sensitivityInfoList><sensitivityInfo><id>0</id><sensitivity>10</sensitivity><beginHour>0</beginHour><beginMinute>0</beginMinute><endHour>6</endHour><endMinute>0</endMinute></sensitivityInfo></sensitivityInfoList><sensInfoNew><sensitivityDefault>10</sensitivityDefault><sensInfoList><sensInfo><priority>0</priority><sensitivity>10</sensitivity><beginHour>0</beginHour><beginMinute>0</beginMinute><endHour>6</endHour><endMinute>0</endMinute></sensInfo></sensInfoList></sensInfoNew><timeBlockList /><handleException><handleType>none</handleType></handleException></MD></body>"
         )
     }
 
@@ -1210,17 +1274,34 @@ mod tests {
         let mut z: ZoneValue = serde_json::from_str(&zone.value).unwrap();
         assert_eq!((z.w, z.h), (80, 22));
         assert!(z.cells.chars().all(|c| c == '1'));
-        assert_eq!(v.fields.iter().find(|f| f.key == "md_p0").unwrap().display, "00:00–06:00");
+        assert_eq!(v.fields.iter().find(|f| f.key == "md_sens").unwrap().value, "10");
         // Clear the first cell of the second row; it must land at bit 96 (byte 12, high bit).
         z.cells.replace_range(80..81, "0");
-        let r = run(write_page(&cam, p, &changes(&[("md_zone", &serde_json::to_string(&z).unwrap()), ("md_s0", "25")])));
-        assert!(r.iter().all(|r| r.ok), "{r:?}");
+        let r = run(write_page(&cam, p, &changes(&[("md_zone", &serde_json::to_string(&z).unwrap()), ("md_sens", "25")])));
+        assert!(r.iter().all(|r| r.ok), "{r:?} (the fake refuses whole documents like the cameras)");
         let xml = cam.xml.lock().unwrap()[&46].clone();
         let bytes = base64::engine::general_purpose::STANDARD.decode(xmledit::get(&xml, "MD/scope/valueTable").unwrap()).unwrap();
         assert_eq!(bytes[12], 0x7f);
         assert_eq!(bytes[11], 0x00, "cells outside the 80-wide grid stay as they were");
-        assert_eq!(xmledit::get(&xml, "MD/sensitivityInfoList/sensitivityInfo[0]/sensitivity").as_deref(), Some("25"));
-        assert!(!run(write_page(&cam, p, &changes(&[("md_s0", "51")])))[0].ok, "official range is 1-50");
+        assert_eq!(xmledit::get(&xml, MD_SENS_DEFAULT).as_deref(), Some("25"));
+        assert_eq!(xmledit::get(&xml, "MD/sensInfoNew/sensInfoList/sensInfo[0]/sensitivity").as_deref(), Some("25"), "periods follow the default");
+        assert_eq!(xmledit::get(&xml, "MD/sensitivityInfoList/sensitivityInfo[0]/sensitivity").as_deref(), Some("10"), "legacy list untouched");
+        assert!(!run(write_page(&cam, p, &changes(&[("md_sens", "51")])))[0].ok, "official range is 1-50");
+    }
+
+    #[test]
+    fn motion_writes_send_only_the_changed_groups() {
+        let edited = md_xml();
+        let field = |k: &str| page("motion").unwrap().fields.iter().find(|f| f.key == k).unwrap();
+        let v = String::new();
+        let doc = outgoing(MOTION, edited.clone(), &[(field("md_sens"), &v)]).unwrap();
+        assert!(doc.contains("<channelId>0</channelId>") && doc.contains("<sensInfoNew>"), "{doc}");
+        for absent in ["<enable>", "<scope>", "<timeBlockList", "<handleException>", "<sensitivityInfoList>"] {
+            assert!(!doc.contains(absent), "{absent} in {doc}");
+        }
+        let doc = outgoing(MOTION, edited, &[(field("md_zone"), &v), (field("md_on"), &v)]).unwrap();
+        assert!(["<enable>1</enable>", "<width>80</width>", "<height>22</height>", "<valueTable>"].iter().all(|t| doc.contains(t)), "{doc}");
+        assert!(!doc.contains("sensInfoNew"));
     }
 
     #[test]
@@ -1228,7 +1309,7 @@ mod tests {
         let mut cam = Fake::new(&[(46, &md_xml())]);
         cam.refuse_msg = Some(46);
         let p = page("motion").unwrap();
-        let r = run(write_page(&cam, p, &changes(&[("md_s0", "20")])));
+        let r = run(write_page(&cam, p, &changes(&[("md_sens", "20")])));
         assert!(!r[0].ok && r[0].error.as_deref().unwrap().contains("doesn't allow changing"), "{r:?}");
         let v = run(read_page(&cam, p));
         assert!(v.fields.iter().all(|f| f.kind == "info"), "motion fields shown read-only after the refusal");

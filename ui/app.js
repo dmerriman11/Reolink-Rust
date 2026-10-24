@@ -178,6 +178,7 @@ function renderTiles() {
     t.root.classList.toggle("solo", idx === solo);
     t.root.style.animationDelay = `${idx * 35}ms`;
     const d = device(state.tiles[idx]);
+    t.root.classList.toggle("motion", !!d?.motion);
     // Rebuild a tile only when what it shows changes; the <img> keeps its stream connection otherwise.
     const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.live ? "" : d.status].join("|") : "empty";
     if (key === t.key) return;
@@ -297,6 +298,7 @@ async function openAppSettings() {
   showSettingsPage("app");
 }
 
+const LOCAL_RECORD = [["off", "Off (record only when I press Record)"], ["motion", "When a camera detects motion"], ["continuous", "Continuously"]];
 const SEGMENTS = [[0, "One file per recording"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"], [30, "30 minutes"], [60, "60 minutes"]];
 
 function prefsToView(p) {
@@ -311,6 +313,10 @@ function prefsToView(p) {
       { key: "hardware_decode", label: "Hardware video decoding", kind: "toggle", value: p.hardware_decode ? "1" : "0" },
       { key: "scan_network", label: "Find new cameras on the network", kind: "toggle", value: p.scan_network ? "1" : "0" },
       { key: "run_at_startup", label: "Run at Windows startup", kind: "toggle", value: p.run_at_startup ? "1" : "0" },
+      { key: "alarm_beep", label: "Beep when a camera detects motion", kind: "toggle", value: p.alarm_beep ? "1" : "0" },
+      { key: "alarm_volume", label: "Beep volume", kind: "range", value: String(p.alarm_volume), min: 0, max: 100 },
+      { key: "local_record", label: "Record to this PC automatically", kind: "choice", value: p.local_record, options: opt(LOCAL_RECORD) },
+      { key: "record_schedule", label: "Automatic recording hours", kind: "schedule", value: JSON.stringify({ record: p.record_schedule }) },
     ],
   };
 }
@@ -321,6 +327,8 @@ function viewToPrefs(values) {
     segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
     hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
     run_at_startup: values.run_at_startup === "1",
+    alarm_beep: values.alarm_beep === "1", alarm_volume: Math.round(+values.alarm_volume || 0),
+    local_record: values.local_record, record_schedule: JSON.parse(values.record_schedule).record,
   };
 }
 
@@ -512,6 +520,7 @@ async function saveSettings() {
   try {
     if (S.mode === "app") {
       const p = await invoke("save_prefs", { prefs: viewToPrefs(S.values) });
+      appPrefs = p;
       S.view = prefsToView(p);
       S.original = Object.fromEntries(S.view.fields.map((f) => [f.key, f.value]));
       S.values = { ...S.original };
@@ -816,6 +825,41 @@ function setupDialog() {
   };
 }
 
+// ---------- motion alarm ----------
+let appPrefs = null;
+const motionSeen = new Map();
+let audio = null;
+
+// A short two-tone beep (official "alarm beep"), at the user's volume.
+function beep(volume) {
+  audio ||= new AudioContext();
+  const t = audio.currentTime;
+  const gain = audio.createGain();
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, volume / 100 * 0.4), t + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+  gain.connect(audio.destination);
+  [[880, 0], [660, 0.25]].forEach(([f, at]) => {
+    const o = audio.createOscillator();
+    o.frequency.value = f;
+    o.connect(gain);
+    o.start(t + at);
+    o.stop(t + at + 0.22);
+  });
+}
+
+async function checkMotion() {
+  let fresh = false;
+  for (const d of state.devices) {
+    const seen = motionSeen.get(d.id);
+    if (seen !== undefined && d.motion_events > seen) fresh = true;
+    motionSeen.set(d.id, d.motion_events);
+  }
+  if (!fresh) return;
+  try { appPrefs ||= await invoke("get_prefs"); } catch { return; }
+  if (appPrefs.alarm_beep && appPrefs.alarm_volume > 0) beep(appPrefs.alarm_volume);
+}
+
 // ---------- refresh loop ----------
 async function refresh() {
   try {
@@ -823,6 +867,7 @@ async function refresh() {
   } catch (e) {
     return;
   }
+  checkMotion();
   for (const d of state.devices) if (d.message) toast(d.message);
   for (const b of document.querySelectorAll(".layout-btn")) {
     b.setAttribute("aria-checked", String(+b.dataset.n === state.layout));
@@ -852,18 +897,18 @@ setInterval(() => scanLan(true), 120_000);
 function demoInvoke(cmd, args) {
   const demo = demoInvoke.state ||= {
     devices: [
-      { id: 1, name: "Front Yard", online: true, status: "Online", battery: 100, charging: false, wifi_dbm: -70, wifi_level: 1, live: "sub", clear: false, recording: true },
+      { id: 1, name: "Front Yard", online: true, status: "Online", battery: 100, charging: false, wifi_dbm: -70, wifi_level: 1, live: "sub", clear: false, recording: true, motion: true, motion_events: 3 },
       { id: 2, name: "Driveway", online: true, status: "Online", battery: 64, charging: true, wifi_dbm: -45, wifi_level: 2, live: "main", clear: true, recording: false },
       { id: 3, name: "Back Gate", online: false, status: "Reconnecting in 4s: connect: Timed out", battery: 12, charging: false, live: null, clear: false, recording: false },
       { id: 4, name: "Garage NVR ch1", online: true, status: "Online", battery: null, charging: false, live: null, clear: false, recording: false },
     ],
     layout: 2, tiles: [1, 2, null, null, ...Array(12).fill(null)], stream_base: "", token: "",
   };
-  if (cmd === "get_prefs") return Promise.resolve({ snapshot_dir: "C:\\Users\\you\\Videos\\Reolink-rs", record_dir: "C:\\Users\\you\\Videos\\Reolink-rs", segment_minutes: 30, space_warning_gb: 5, hardware_decode: true, scan_network: true, run_at_startup: false });
+  if (cmd === "get_prefs") return Promise.resolve({ snapshot_dir: "C:\\Users\\you\\Videos\\Reolink-rs", record_dir: "C:\\Users\\you\\Videos\\Reolink-rs", segment_minutes: 30, space_warning_gb: 5, hardware_decode: true, scan_network: true, run_at_startup: false, alarm_beep: true, alarm_volume: 60, local_record: "motion", record_schedule: "1".repeat(168) });
   if (cmd === "camera_pages") return Promise.resolve([{ id: "display", title: "Display" }, { id: "motion", title: "Motion" }, { id: "privacy", title: "Privacy masks" }, { id: "schedules", title: "Schedules" }, { id: "email", title: "Email" }]);
   const day = "0".repeat(8) + "1".repeat(12) + "0".repeat(4);
   const rich = {
-    motion: [{ key: "md_s0", label: "Sensitivity", kind: "range", value: "40", display: "40", min: 1, max: 50, options: [] },
+    motion: [{ key: "md_sens", label: "Sensitivity", kind: "range", value: "40", display: "40", min: 1, max: 50, options: [] },
       { key: "md_zone", label: "Detection area", kind: "zone", value: JSON.stringify({ w: 80, h: 22, cells: "0".repeat(80 * 6) + "1".repeat(80 * 16) }), display: "", options: [] }],
     privacy: [{ key: "masks", label: "Privacy masks", kind: "masks", value: JSON.stringify({ enable: "1", max: 8, rects: [[600, 80, 250, 200]] }), display: "", options: [] }],
     schedules: [{ key: "push_sched", label: "Push notifications", kind: "schedule", value: JSON.stringify({ motion: day.repeat(7), timing: "0".repeat(168) }), display: "", options: [] }],

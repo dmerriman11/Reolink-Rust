@@ -21,7 +21,19 @@ pub struct Prefs {
     pub run_at_startup: bool,
     /// Look for new cameras on the LAN automatically.
     pub scan_network: bool,
+    /// Beep when a camera reports motion (official "Alarm beep"), at this volume 0-100.
+    pub alarm_beep: bool,
+    pub alarm_volume: u32,
+    /// Local recording without pressing Record (official "Local record schedule"): "off", "motion", "continuous".
+    pub local_record: String,
+    /// Hours it applies: 7x24 '0'/'1', Sunday first, local time.
+    pub record_schedule: String,
 }
+
+pub const LOCAL_RECORD: [&str; 3] = ["off", "motion", "continuous"];
+
+/// Seconds a motion recording continues after the camera reports the motion has stopped.
+pub const MOTION_POST_SECS: u64 = 30;
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -34,6 +46,10 @@ impl Default for Prefs {
             hardware_decode: true,
             run_at_startup: false,
             scan_network: true,
+            alarm_beep: false,
+            alarm_volume: 60,
+            local_record: "off".into(),
+            record_schedule: "1".repeat(168),
         }
     }
 }
@@ -54,6 +70,15 @@ impl Prefs {
         if !SEGMENT_MINUTES.contains(&self.segment_minutes) {
             return Err("Video file duration must be one of the listed options".into());
         }
+        if self.alarm_volume > 100 {
+            return Err("Alarm volume must be 0-100".into());
+        }
+        if !LOCAL_RECORD.contains(&self.local_record.as_str()) {
+            return Err("Local recording must be off, on motion or continuous".into());
+        }
+        if self.record_schedule.len() != 168 || !self.record_schedule.chars().all(|c| c == '0' || c == '1') {
+            return Err("Recording schedule must cover 7 days x 24 hours".into());
+        }
         if self.space_warning_gb > 10_000 {
             return Err("Space warning must be 10,000 GB or less".into());
         }
@@ -67,6 +92,13 @@ impl Prefs {
             let _ = std::fs::remove_file(probe);
         }
         Ok(())
+    }
+}
+
+impl Prefs {
+    /// Whether local recording applies at `weekday` (0 = Sunday) and `hour`.
+    pub fn scheduled(&self, weekday: u8, hour: u8) -> bool {
+        self.local_record != "off" && self.record_schedule.as_bytes().get(weekday as usize * 24 + hour as usize) == Some(&b'1')
     }
 }
 
@@ -133,8 +165,19 @@ mod tests {
         assert!(ok.validate().is_ok());
         assert!(Prefs { segment_minutes: 7, ..ok.clone() }.validate().is_err());
         assert!(Prefs { record_dir: "relative".into(), ..ok.clone() }.validate().is_err());
-        assert!(Prefs { space_warning_gb: 20_000, ..ok }.validate().is_err());
+        assert!(Prefs { space_warning_gb: 20_000, ..ok.clone() }.validate().is_err());
+        assert!(Prefs { alarm_volume: 101, ..ok.clone() }.validate().is_err());
+        assert!(Prefs { local_record: "sometimes".into(), ..ok.clone() }.validate().is_err());
+        assert!(Prefs { record_schedule: "1".repeat(167), ..ok }.validate().is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn schedule_hours_are_sunday_first() {
+        let mut p = Prefs { local_record: "motion".into(), record_schedule: "0".repeat(168), ..Prefs::default() };
+        p.record_schedule.replace_range(24 + 9..24 + 10, "1"); // Monday 09:00
+        assert!(p.scheduled(1, 9) && !p.scheduled(1, 10) && !p.scheduled(0, 9));
+        assert!(!Prefs { local_record: "off".into(), ..Prefs::default() }.scheduled(1, 9));
     }
 
     #[cfg(windows)]

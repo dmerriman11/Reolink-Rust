@@ -48,12 +48,28 @@ Write ids confirmed on both cameras (no-op write of every field + reversible cha
 25, 36, 39, 41, 43, 45, 53, 55, 57, 69, 71, 77, 82, 98, 100, 105, 107, 209, 213, 216, 218, 231, 300, 320, and
 reboot (23, timed below). Email/FTP test: 141/194.
 
-**Motion detection (47) is read-only on these cameras.** Argus 4 Pro firmware v3.0.0.4978 answers 400 to every
-read-modify-write of `<MD>` (full document, with/without `sensInfoNew`, enable-only), while the other 12 pages
-accept writes. A stripped-down `<MD>` document made one camera drop off Baichuan for ~20 minutes (it answered
-ping; it came back on its own, effective config unchanged; it had migrated its four sensitivity periods into
-`sensInfoNew`). No further probing is done on live cameras. The app shows motion fields normally; the first
-refused write marks them read-only for that camera with an explanation (`settings::Camera::writable`).
+**Motion detection (47): the official client never sends the whole `<MD>` document.** Argus 4 Pro firmware
+v3.0.0.4978 answers 400 to the full document read back from 46 (it carries an empty `<timeBlockList/>` and
+`<handleException>` the camera doesn't take as input). Traced in both layers:
+- JS (REA `analyze_javascript_application` over the remoteConfig/localSettings/wifiSettings bundles, evidence
+  `ev_0033c64c57af7836fc8931fd97148f81aeaf680d4add1988c0f48e7d58987c3a`; 3 files, 426,729 AST nodes, application
+  coverage complete): `alarmArea.vue` saves through `setMotionAlarmArea` (or `setAlarmAreas` on AI-config
+  devices), `motionSensitivity.vue` through `setMotionSensitivityCfg`; `isNewSensitivity` is `iSensVerion != 0`,
+  so cameras that report `<sensInfoNew>` are edited there (default sensitivity + optional periods).
+- SDK (`FUN_18014e120`, Ghidra via REA): builds `<MD version="1.1"><channelId>` plus only the groups present in
+  the request: `enable`/`usepir`, `width`/`height`/`scope`, `timeBlockList`, `handleException`, and *either*
+  `sensInfoNew` *or* `sensitivityInfoList`. Msg 345 (`FUN_1801bcbd0`) is the AI variant:
+  `<AlarmArea version="1.1"><chn>N</chn><mdArea|personArea|vehicleArea|…><width/><height/><area>base64</area>`
+  with a raw width×height bitmap.
+
+The app now sends exactly that partial document (`settings::outgoing`): channelId plus the changed groups.
+Sensitivity is the `sensInfoNew` default (1–50); changing it also sets every period, like the official control.
+If a camera still refuses a write, its fields turn read-only for that camera with an explanation
+(`settings::Camera::writable`).
+
+An earlier hand-made enable-only `<MD>` probe made one camera drop off Baichuan for ~20 minutes (it answered
+ping, came back on its own, config unchanged). Live-camera validation of the new partial writes therefore waits
+for the owner's go-ahead (`examples/settings_check.rs --write` covers motion).
 
 Intentionally read-only: Wi-Fi network switching (116/117: a wrong value strands a battery camera), users
 (58 rejected), AI detection config (342/344 rejected without a request payload).
@@ -66,7 +82,7 @@ Intentionally read-only: Wi-Fi network switching (116/117: a wrong value strands
 | Display | camera name on video, show name, show date/time, watermark, brightness, contrast, saturation, hue, sharpness, day/night, anti-flicker | 44/45, 26/25 |
 | Stream | Clear/Fluent resolution (read-only), frame rate and bitrate (options from StreamInfoList), audio per stream | 56/57, 146 |
 | Detection & recording | PIR on, PIR sensitivity, reduce false alarms, push on, email on, SD retention, post-motion record time | 212/213, 219/218, 217/216, 54/55 |
-| Motion detection | on, detection area (painted grid over a live snapshot), four time periods with sensitivity | 46/47 (read-only, see above) |
+| Motion detection | on, detection area (painted grid over a live snapshot), sensitivity | 46/47 (partial documents, see above) |
 | Privacy masks | on, up to 8 rectangles drawn over a live snapshot | 52/53 |
 | Schedules | record on + schedule, push / email / FTP schedules, siren on + schedule (7×24 paint grid per alarm type) | 81/82, 219/218, 217/216, 70/71, 232/231 |
 | Email | SMTP server/port/SSL, user, password (write-only), sender name, 3 recipients, attachment; "Send test email" | 42/43, 141 |
@@ -102,6 +118,7 @@ camera didn't keep is reported per field. Pages read their messages concurrently
 | Hardware acceleration | Implemented (GPU decode toggle) |
 | Auto-add devices (LAN search loop) | Implemented as "scan network for cameras" toggle |
 | Download path | Not applicable until playback/download exists |
-| Alarm beep, volume | Not applicable until alarms/live audio exist |
+| Alarm beep, volume | Implemented: beep on each motion start reported by any camera (motion events, msg 31/33), volume 0–100 |
 | Auto login, automatic client update | Not applicable (no Reolink account or update server) |
-| Local record schedule, record stream type, folder size cap | Not implemented: needs always-on streams (drains battery cameras) or deleting user files |
+| Local record schedule | Implemented: off / on motion (plus 30 s after it stops) / continuous, within a 7×24 schedule; records the Clear stream without decoding when no tile shows the camera. Verified on Frontyard (`examples/auto_record_check.rs`): recording in 0.6 s, stopped in 0.4 s |
+| Record stream type, folder size cap | Not implemented: Clear stream is always recorded; a size cap would delete user files |

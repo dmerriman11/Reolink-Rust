@@ -56,7 +56,7 @@ fn flip(s: &str, i: usize) -> String {
 /// A reversible edit: page, field, and how to derive the test value from the current one.
 fn tweak(key: &str, cur: &str) -> Option<String> {
     Some(match key {
-        "md_s0" => (if cur == "50" { 49 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
+        "md_sens" => (if cur == "50" { 49 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
         "ir_bright" => (if cur == "100" { 99 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
         "tl_overwrite" => (if cur == "1" { "0" } else { "1" }).to_string(),
         "ftp_port" => (if cur == "2121" { "2122" } else { "2121" }).to_string(),
@@ -88,7 +88,7 @@ fn tweak(key: &str, cur: &str) -> Option<String> {
 }
 
 const REVERSIBLE: &[(&str, &str)] = &[
-    ("motion", "md_s0"), ("motion", "md_zone"), ("schedules", "push_sched"), ("privacy", "masks"),
+    ("motion", "md_sens"), ("motion", "md_zone"), ("schedules", "push_sched"), ("privacy", "masks"),
     ("smart", "tl_overwrite"), ("ftp", "ftp_port"), ("email", "smtp_nick"), ("lights", "ir_bright"),
 ];
 

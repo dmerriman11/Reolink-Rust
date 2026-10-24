@@ -7,15 +7,15 @@
 use crate::media::{Decoder, Recorder};
 use anyhow::{Context as _, Result};
 use neolink_core::bc_protocol::{
-    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, Direction,
-    StreamData, StreamKind,
+    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, Direction, MotionData,
+    MotionStatus, StreamData, StreamKind,
 };
 use neolink_core::bcmedia::model::BcMedia;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
@@ -51,6 +51,8 @@ pub enum Cmd {
     Record(bool),
     /// Largest JPEG (device pixels) the tile can show; see media::jpeg_box.
     View((u32, u32)),
+    /// Internal: the local recording schedule's wish changed (see prefs::Prefs::local_record).
+    Auto,
 }
 
 #[derive(Default)]
@@ -64,6 +66,10 @@ pub struct State {
     pub live: Option<StreamKind>,
     pub recording: Option<PathBuf>,
     pub message: Option<String>,
+    /// The camera currently reports motion.
+    pub motion: bool,
+    /// Motion starts seen since the app started; the UI beeps when it grows.
+    pub motion_events: u64,
 }
 
 pub struct Device {
@@ -220,6 +226,8 @@ struct Live {
     record: bool,
     /// Decoder output box; a change takes effect at the next keyframe.
     jpeg_box: (u32, u32),
+    /// False for a stream that only feeds a scheduled recording: nothing on screen, so nothing is decoded.
+    show: bool,
 }
 
 async fn next_media(live: &mut Option<Live>) -> Result<Result<BcMedia, neolink_core::Error>, neolink_core::Error> {
@@ -227,6 +235,19 @@ async fn next_media(live: &mut Option<Live>) -> Result<Result<BcMedia, neolink_c
         Some(l) => l.stream.get_data().await,
         None => std::future::pending().await,
     }
+}
+
+async fn next_motion(m: &mut Option<MotionData>) -> Result<MotionStatus, neolink_core::Error> {
+    match m {
+        Some(m) => m.next_motion().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the local recording schedule wants this camera recorded right now.
+fn auto_record_wanted(p: &crate::prefs::Prefs, moving: bool) -> bool {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    p.scheduled(now.weekday().number_days_from_sunday(), now.hour()) && (p.local_record == "continuous" || moving)
 }
 
 async fn session(
@@ -257,6 +278,17 @@ async fn session(
     let mut wifi_poll = tokio::time::interval(Duration::from_secs(30));
     let mut wifi_supported = true; // cleared once a wired camera rejects the query
     let mut space_poll = tokio::time::interval(Duration::from_secs(60));
+    // Motion events drive the alarm beep and motion recording; not every camera offers them.
+    let mut motion = match cam.listen_on_motion().await {
+        Ok(m) => Some(m),
+        Err(e) => {
+            log::info!("{}: no motion events: {e}", cfg.name);
+            None
+        }
+    };
+    let mut motion_until: Option<Instant> = None;
+    let mut auto = false; // the local recording schedule is recording this camera
+    let mut schedule_tick = tokio::time::interval(Duration::from_secs(1));
     // Resume what was on screen (and recording) before a drop.
     let mut pending = vec![Cmd::Live(wanted.live)];
 
@@ -289,6 +321,34 @@ async fn session(
                     }
                     None
                 }
+                ev = next_motion(&mut motion) => {
+                    match ev {
+                        Ok(MotionStatus::Start(_)) => {
+                            motion_until = None;
+                            set(&|s| {
+                                if !s.motion {
+                                    s.motion_events += 1;
+                                }
+                                s.motion = true;
+                            });
+                        }
+                        Ok(MotionStatus::Stop(_)) => {
+                            motion_until = Some(Instant::now() + Duration::from_secs(crate::prefs::MOTION_POST_SECS));
+                            set(&|s| s.motion = false);
+                        }
+                        Ok(MotionStatus::NoChange(_)) => {}
+                        Err(e) => {
+                            log::warn!("{}: motion events stopped: {e}", cfg.name);
+                            motion = None;
+                        }
+                    }
+                    None
+                }
+                _ = schedule_tick.tick() => {
+                    let moving = state.lock().unwrap().motion || motion_until.is_some_and(|t| Instant::now() < t);
+                    let want = auto_record_wanted(&crate::prefs::get(), moving);
+                    (want != auto).then(|| { auto = want; Cmd::Auto })
+                }
                 m = next_media(&mut live) => {
                     let media = m.context("stream")?.context("stream data")?;
                     on_media(live.as_mut().expect("live set"), media, &cfg.name, state, frames);
@@ -304,17 +364,19 @@ async fn session(
                     log::info!("{}: live stopped", cfg.name);
                 }
                 live = None; // dropping StreamData sends the stop to the camera
-                if let Some(k) = kind {
-                    log::info!("{}: live {k}", cfg.name);
+                // Off screen while the schedule records: keep a stream for the recording only.
+                if let Some(k) = kind.or(auto.then_some(StreamKind::Main)) {
+                    log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
                     let stream = cam.start_video(k, 0, false).await.context("start live")?;
-                    live = Some(Live { stream, decoder: None, recorder: None, record: wanted.record, jpeg_box: wanted.jpeg_box });
+                    let record = wanted.record || auto;
+                    live = Some(Live { stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: kind.is_some() });
                 }
                 if kind.is_none() {
                     frames.send_replace(None);
                 }
                 set(&|s| {
                     s.live = kind;
-                    if kind.is_none() {
+                    if live.is_none() {
                         s.recording = None;
                     }
                 });
@@ -326,10 +388,26 @@ async fn session(
                     wanted.record = false;
                     continue;
                 };
-                l.record = on;
-                if !on {
+                l.record = on || auto;
+                if !l.record {
                     l.recorder = None;
                     set(&|s| s.recording = None);
+                }
+            }
+            Cmd::Auto => {
+                log::info!("{}: scheduled recording {}", cfg.name, if auto { "starts" } else { "ends" });
+                match live.as_mut() {
+                    // Nothing streaming: start (or, when the schedule ends, stop) a recording-only stream.
+                    None if auto => pending.push(Cmd::Live(wanted.live)),
+                    Some(l) if !l.show && !auto && !wanted.record => pending.push(Cmd::Live(wanted.live)),
+                    Some(l) => {
+                        l.record = wanted.record || auto;
+                        if !l.record {
+                            l.recorder = None;
+                            set(&|s| s.recording = None);
+                        }
+                    }
+                    None => {}
                 }
             }
             Cmd::View(b) => {
@@ -414,6 +492,9 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     }
     if let Some(r) = live.recorder.as_mut() {
         r.push(&data, key);
+    }
+    if !live.show {
+        return;
     }
 
     // Swap decoders only at a keyframe so the new one starts clean; the old one keeps the tile live until then.

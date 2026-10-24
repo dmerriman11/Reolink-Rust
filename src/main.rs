@@ -137,6 +137,8 @@ struct DeviceDto {
     live: Option<&'static str>,
     clear: bool,
     recording: bool,
+    motion: bool,
+    motion_events: u64,
     message: Option<String>,
 }
 
@@ -170,6 +172,8 @@ fn get_state(app: State<App>) -> StateDto {
                 live: s.live.map(|k| if k == StreamKind::Main { "main" } else { "sub" }),
                 clear: inner.clear.contains(&d.id),
                 recording: s.recording.is_some(),
+                motion: s.motion,
+                motion_events: s.motion_events,
                 message: s.message.take(),
             }
         })
