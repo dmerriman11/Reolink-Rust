@@ -7,3 +7,5 @@ gen/
 
 # Backups of Reolink's proprietary client JS made while patching; not ours to commit.
 /patch/original/
+bundle/
+dist/

@@ -3,13 +3,40 @@
   "productName": "Reolink-rs",
   "version": "0.1.0",
   "identifier": "dev.reolink-rs.client",
-  "build": { "frontendDist": "ui" },
+  "build": {
+    "frontendDist": "ui"
+  },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "title": "Reolink-rs", "width": 1360, "height": 860, "minWidth": 900, "minHeight": 560 }],
+    "windows": [
+      {
+        "title": "Reolink-rs",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 900,
+        "minHeight": 560
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' http://127.0.0.1:*; style-src 'self' 'unsafe-inline'"
     }
   },
-  "bundle": { "icon": ["icons/icon.ico", "icons/icon.png"] }
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "publisher": "Reolink-rs",
+    "shortDescription": "Reolink camera client without the battery idle disconnect",
+    "copyright": "AGPL-3.0-or-later",
+    "resources": {
+      "bundle/ffmpeg.exe": "ffmpeg.exe",
+      "bundle/FFMPEG-LICENSE.txt": "FFMPEG-LICENSE.txt"
+    }
+  }
 }

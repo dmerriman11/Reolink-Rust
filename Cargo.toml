@@ -16,4 +16,4 @@ tauri = { version = "2.12", features = ["custom-protocol"] }
 tokio = { version = "1.54.1", features = ["full"] }
 
 [build-dependencies]
-tauri-build = "2.7"
+tauri-build = { version = "2.7", features = [] }
