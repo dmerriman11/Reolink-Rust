@@ -58,6 +58,16 @@ const UPNP: Msg = m(97, Some(98), true);
 const DDNS: Msg = m(40, Some(41), true);
 const AI: Msg = m(299, Some(300), true);
 const TIMELAPSE: Msg = m(319, Some(320), true);
+// Found by the official-setter audit (docs/settings-inventory.md); write ids from the SDK command table.
+const DN_THRESHOLD: Msg = m(296, Some(297), true);
+const AI_DENOISE: Msg = m(439, Some(440), true);
+const STITCH: Msg = m(417, Some(418), true);
+const PUSH_CFG: Msg = m(363, Some(364), true);
+const SPEAKER: Msg = m(264, Some(265), true);
+const POWER_SAVING: Msg = m(423, Some(424), true);
+const AUTO_UPDATE: Msg = m(195, Some(196), true);
+const P2P: Msg = m(210, Some(211), true);
+const ACCESS_USERS: Msg = m(511, None, true);
 /// Test commands: the current Email/Ftp XML sent to the SDK's EMAILTEST (141) / FTP_TEST (194).
 pub const EMAIL_TEST: Msg = m(42, Some(141), true);
 pub const FTP_TEST: Msg = m(68, Some(194), true);
@@ -200,6 +210,12 @@ pub static PAGES: &[Page] = &[
                 Kind::Choice(Opts::Fixed(&[("auto", "Auto"), ("color", "Always color"), ("blackAndWhite", "Always black & white")]))),
             f("antiflicker", "Anti-flicker", IMAGE, "InputAdvanceCfg/PowerLineFrequency/mode",
                 Kind::Choice(Opts::Fixed(&[("50hz", "50 Hz"), ("60hz", "60 Hz")]))),
+            f("dn_level", "Day/night switch level", DN_THRESHOLD, "DayNightThreshold/thresholdval/cur", Kind::Range { min: 0, max: 100 }),
+            f("ai_denoise", "AI noise reduction", AI_DENOISE, "aiDenoise/enable", Kind::Toggle),
+            // Dual-lens cameras: where the two images are joined (ranges as the camera reports them).
+            f("stitch_dist", "Stitching distance (m)", STITCH, "BinoStitch/distance/cur", Kind::Range { min: 2, max: 20 }),
+            f("stitch_x", "Stitching horizontal offset", STITCH, "BinoStitch/xpixel/cur", Kind::Range { min: -100, max: 100 }),
+            f("stitch_y", "Stitching vertical offset", STITCH, "BinoStitch/ypixel/cur", Kind::Range { min: -100, max: 100 }),
         ],
     },
     Page {
@@ -229,6 +245,8 @@ pub static PAGES: &[Page] = &[
             f("pir_sens", "PIR sensitivity", PIR, "rfAlarmCfg/sensiValue", Kind::Range { min: 1, max: 100 }),
             f("pir_reduce", "Reduce false alarms", PIR, "rfAlarmCfg/reduceFalseAlarm", Kind::Toggle),
             f("push_on", "Push notifications", PUSH_TASK, "PushTask/enable", Kind::Toggle),
+            f("push_interval", "Minimum time between push notifications (s)", PUSH_CFG, "PushCfg/interval", Kind::Number { min: 0, max: 3600 }),
+            f("rich_push", "Rich notifications (with picture)", PUSH_CFG, "PushCfg/richNotificationEnable", Kind::Toggle),
             f("email_on", "Email alerts", EMAIL_TASK, "EmailTask/enable", Kind::Toggle),
             f("rec_retention", "SD card recordings", RECORD, "RecordCfg/cycle",
                 Kind::Choice(Opts::Retention(RECORD, "RecordCfg/cyclelist/item"))),
@@ -345,6 +363,22 @@ pub static PAGES: &[Page] = &[
         ],
     },
     Page {
+        id: "audio",
+        title: "Speaker & siren",
+        fields: &[
+            f("spk_volume", "Speaker volume", SPEAKER, "audioCfg/volume", Kind::Range { min: 0, max: 100 }),
+            f("pre_alarm", "Pre-recorded alarm sound", SPEAKER, "audioCfg/preAlarm", Kind::Toggle),
+        ],
+    },
+    Page {
+        id: "power",
+        title: "Power saving",
+        fields: &[
+            f("ps_on", "Power-saving schedule", POWER_SAVING, "PowerSaving/enable", Kind::Toggle),
+            f("ps_sched", "Power-saving hours", POWER_SAVING, "PowerSaving/timeTable", Kind::Schedule),
+        ],
+    },
+    Page {
         id: "system",
         title: "System",
         fields: &[
@@ -360,6 +394,10 @@ pub static PAGES: &[Page] = &[
                 Kind::Choice(Opts::Fixed(&[("60", "Every hour"), ("360", "Every 6 hours"), ("720", "Every 12 hours"), ("1440", "Daily"), ("10080", "Weekly")]))),
             f("dst_on", "Daylight saving time", DST, "Dst/enable", Kind::Toggle),
             f("login_lock", "Lock out after repeated failed logins", GENERAL, "SystemGeneral/loginLock", Kind::Toggle),
+            f("auto_update", "Automatic firmware updates", AUTO_UPDATE, "AutoUpdate/enable", Kind::Toggle),
+            f("p2p", "Reolink P2P (remote access by UID)", P2P, "PTOP/enable", Kind::Toggle),
+            // 58 (user list) is refused by battery cameras; 511 only reports how many extra users the camera takes.
+            f("access_users", "Additional users supported", ACCESS_USERS, "accessUserList/maxAccessUserNum", Kind::Info(Fmt::Plain)),
         ],
     },
     Page {
@@ -484,7 +522,17 @@ fn stream_table(streams_xml: &str, stream: &str, table: &str) -> Vec<String> {
 
 pub const SCHEDULE_LEN: usize = 7 * 24;
 
+/// Key for schedules stored as one bare 168-char table (e.g. PowerSaving/timeTable) rather than a typed list.
+const PLAIN_TABLE: &str = "hours";
+
+fn plain_table(xml: &str, path: &str) -> Option<String> {
+    xmledit::get(xml, path).filter(|t| t.len() == 168 && t.chars().all(|c| c == '0' || c == '1'))
+}
+
 fn read_schedule(xml: &str, path: &str) -> Option<String> {
+    if let Some(t) = plain_table(xml, path) {
+        return serde_json::to_string(&BTreeMap::from([(PLAIN_TABLE, t)])).ok();
+    }
     let types = xmledit::get_all(xml, &format!("{path}/item/type"));
     let tables = xmledit::get_all(xml, &format!("{path}/item/valueTable"));
     if types.is_empty() || types.len() != tables.len() {
@@ -496,6 +544,10 @@ fn read_schedule(xml: &str, path: &str) -> Option<String> {
 
 fn write_schedule(xml: &str, path: &str, value: &str) -> Result<String, String> {
     let wanted: BTreeMap<String, String> = serde_json::from_str(value).map_err(|_| "invalid schedule".to_string())?;
+    if plain_table(xml, path).is_some() {
+        let t = wanted.get(PLAIN_TABLE).ok_or("invalid schedule")?;
+        return xmledit::set(xml, path, t).map_err(|e| e.to_string());
+    }
     let types = xmledit::get_all(xml, &format!("{path}/item/type"));
     let mut out = xml.to_string();
     for (t, table) in wanted {
@@ -1314,6 +1366,23 @@ mod tests {
         let v = run(read_page(&cam, p));
         assert!(v.fields.iter().all(|f| f.kind == "info"), "motion fields shown read-only after the refusal");
         assert_eq!(v.fields.iter().find(|f| f.key == "md_zone").unwrap().display, "1760 of 1760 areas active");
+    }
+
+    #[test]
+    fn plain_time_tables_edit_like_typed_schedules() {
+        let xml = format!("<body><PowerSaving version=\"1.1\"><enable>0</enable><timeTable>{}</timeTable></PowerSaving></body>", "0".repeat(168));
+        let cam = Fake::new(&[(423, &xml)]);
+        let p = page("power").unwrap();
+        let v = run(read_page(&cam, p));
+        let sched = v.fields.iter().find(|f| f.key == "ps_sched").unwrap();
+        assert_eq!(sched.kind, "schedule");
+        let mut m: BTreeMap<String, String> = serde_json::from_str(&sched.value).unwrap();
+        m.insert("hours".into(), format!("{}{}", "1".repeat(8), "0".repeat(160)));
+        let r = run(write_page(&cam, p, &changes(&[("ps_sched", &serde_json::to_string(&m).unwrap()), ("ps_on", "1")])));
+        assert!(r.iter().all(|r| r.ok), "{r:?}");
+        let after = cam.xml.lock().unwrap()[&423].clone();
+        assert!(xmledit::get(&after, "PowerSaving/timeTable").unwrap().starts_with("111111110"));
+        assert_eq!(xmledit::get(&after, "PowerSaving/enable").as_deref(), Some("1"));
     }
 
     #[test]

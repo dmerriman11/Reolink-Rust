@@ -17,6 +17,10 @@ const GETS: &[(u32, &str)] = &[
     // Read ids recovered from the SDK command table (docs/baichuan-command-ids.md).
     (310, "EmailEnable"), (312, "FtpEnable"), (446, "FtpServerCfg"), (504, "DeviceAudioCfg"),
     (694, "PirMotionCfg"), (344, "AiDetectCfg2"), (87, "NetDisconnectExp"), (60, "AlarmIn"),
+    // Getters behind official setters not yet in the app (setter-coverage audit, docs/settings-inventory.md).
+    (439, "AiDenoise"), (195, "AutoUpdate"), (430, "Gdpr"), (210, "P2p"), (451, "PowerMode"), (537, "WifiSdb"),
+    (264, "RingtoneCfg"), (427, "AutoReply"), (626, "BatteryMode"), (739, "AiEnhance"), (296, "DayNightThreshold"),
+    (423, "PowerSavingTask"), (511, "AccessUser"), (363, "PushConfig"), (417, "BinoStitch"), (206, "CameraCfg"),
     // Rejected by Argus cameras; kept last because repeated rejections can end the session.
     (50, "VideoLoss"), (58, "AbilitySupport"), (78, "VideoInputDesc"), (83, "HandleException"),
 ];

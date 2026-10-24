@@ -74,7 +74,7 @@ for the owner's go-ahead (`examples/settings_check.rs --write` covers motion).
 Intentionally read-only: Wi-Fi network switching (116/117: a wrong value strands a battery camera), users
 (58 rejected), AI detection config (342/344 rejected without a request payload).
 
-### Implemented camera settings (`src/settings.rs`, 14 pages, 119 fields per camera)
+### Implemented camera settings (`src/settings.rs`, 16 pages, 126 fields per camera)
 
 | Page | Fields | Messages |
 |---|---|---|
@@ -106,6 +106,35 @@ camera didn't keep is reported per field. Pages read their messages concurrently
   overwrite, FTP port, email sender name, IR brightness.
 - Reboot (`examples/reboot_check.rs`): connection dropped 12 s after the command, back online and streaming-ready
   18 s after it, with no user action; settings readable on both cameras afterwards.
+
+### Official setter coverage (all 77)
+
+Every `config.set*` call in the official settings bundles (the same remoteConfig/localSettings/wifiSettings files
+REA analyzed above), each checked against these cameras by reading its GET message (`examples/settings_dump.rs`,
+reads only). Write ids come from the SDK command table.
+
+**In the app (49):** setAutoRebootCfg, setDdns, setDeviceName, setDst, setEmailEnable, setEncCfg, setFtpCfg,
+setFtpEnable, setFtpTest, setIspCfg, setLedState, setLoginLock, setMailCfg, setMotionAlarmArea, setMotionCfg,
+setMotionSensitivityCfg, setNetPort, setNetworkCfg, setNtp, setOsdCfg, setPush, setPushEnable, setRecordEnable,
+setRecordGenCfg, setRfAlarmCfg, setPirSensitivityCfg, setShelter, setSysGeneralCfg, setUpnpCfg, setScheduleGroup,
+setScheduleLegacy, setScheduleEnable, setMotionSchedule, setPirSchedule, setAudioTaskEnable, setAudioVolume,
+setPreAudioAlarm, setAIDenoiseCfg, setBinoStitchCfg, setAutoUpdateState, setP2PCfg, setPushAuth (push interval /
+rich notifications, 363/364), setPowerMode-adjacent power-saving schedule (423/424), setAiSensitivity* via AiCfg
+types (299/300), day/night threshold (296/297), setAlarmAreas (345, decoded; used only by AI-config cameras),
+setWifiCfg (read-only, see below), setAccessUserCfg (read-only count, see below), setUserCfg (refused, see below).
+
+**Not supported by these cameras (GET answers 400/405 on both):** setAiMarkEnable, setAiStayTime,
+setAiSensitivityTargetSize, setYOLODetectCfg (AI detect 342/344: 400), setDeviceAudioCfg (504), setGDPRCfg (430),
+setWifiSdbCfg (537), setAutoReply / setAudioFileList (427/347), setFloodlightTask (291), setIspAdvancedCfg (78),
+setPreviewReplayLimitCfg, setScheduleVideoLossEnable (50), setLargeBatteryInfo, setPowerMode (battery mode 626).
+
+**Other hardware only (PTZ, doorbell, NVR/hub, fisheye, zoom lens):** setAFAlgorithm, setAutoFocus, setAiTrackCfg,
+setSmartTrackLimit, setSmartTrackTask, setDingDongAudioInfo, setDingDongOption, setVisitorLoudspeakerState,
+setBuzzerAlarm, setBuzzerAlarmTaskEnable, setBuzzerEnable, setFishEyeCfg, setNasCfg, setSambaCfg, setWifiKitCfg.
+
+Users: battery cameras refuse the user list (58: 400); 511 reports only `maxAccessUserNum` (10) with no user
+entries, so the app shows that count. Wi-Fi network switching (116/117) stays read-only by choice: a wrong SSID or
+password strands a battery camera off the network with no wired fallback.
 
 ## Client (local) settings
 
