@@ -40,6 +40,7 @@ mod support;
 mod talk;
 mod time;
 mod uid;
+mod wifi;
 mod users;
 mod version;
 

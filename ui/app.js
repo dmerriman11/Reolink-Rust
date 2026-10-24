@@ -12,6 +12,7 @@ const ICON = {
   camera: '<svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>',
   rec: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  wifi: '<svg viewBox="0 0 24 24"><path class="a3" d="M2.5 9.5a14 14 0 0 1 19 0"/><path class="a2" d="M5.5 13a9.5 9.5 0 0 1 13 0"/><path class="a1" d="M8.6 16.4a4.8 4.8 0 0 1 6.8 0"/><circle cx="12" cy="19.6" r="1.4" fill="currentColor" stroke="none"/></svg>',
   plus: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 9v6M9 12h6"/></svg>',
 };
 
@@ -71,7 +72,7 @@ function renderDevices() {
   $("#empty-hint").hidden = state.devices.length > 0;
   const visible = state.tiles.slice(0, state.layout);
   // Rebuild only on change: re-inserting rows every poll restarts their fade-in and flickers.
-  const key = JSON.stringify([visible, state.devices.map((d) => [d.id, d.name, d.online, d.status, d.battery, d.charging])]);
+  const key = JSON.stringify([visible, state.devices.map((d) => [d.id, d.name, d.online, d.status, d.battery, d.charging, d.wifi_dbm])]);
   if (key === devicesKey) return;
   const firstRender = devicesKey === null;
   devicesKey = key;
@@ -83,15 +84,21 @@ function renderDevices() {
     li.title = d.status;
     li.append(el("span", "dot" + (d.online ? " on" : "")));
     li.append(Object.assign(el("span", "device-name"), { textContent: d.name }));
+    const meta = el("span", "device-meta");
+    if (d.online && d.wifi_level != null) {
+      const w = el("span", `wifi lvl-${d.wifi_level}`, ICON.wifi);
+      w.title = `Wi-Fi ${d.wifi_dbm} dBm`;
+      w.setAttribute("aria-label", `Wi-Fi signal ${d.wifi_level} of 3 (${d.wifi_dbm} dBm)`);
+      meta.append(w);
+    }
     if (d.battery != null) {
       const b = el("span", "battery" + (d.battery <= 20 && !d.charging ? " low" : ""));
       const i = el("i");
       i.style.setProperty("--pct", d.battery);
       b.append(i, `${d.battery}%${d.charging ? " ⚡" : ""}`);
-      li.append(b);
-    } else {
-      li.append(el("span"));
+      meta.append(b);
     }
+    li.append(meta);
     if (!d.online) li.append(Object.assign(el("span", "device-status"), { textContent: d.status }));
     const menu = el("span", "device-menu");
     const edit = Object.assign(el("button"), { textContent: "Edit" });
@@ -349,8 +356,8 @@ setInterval(scanLan, 120_000);
 function demoInvoke(cmd, args) {
   const demo = demoInvoke.state ||= {
     devices: [
-      { id: 1, name: "Front Yard", online: true, status: "Online", battery: 100, charging: false, live: "sub", clear: false, recording: true },
-      { id: 2, name: "Driveway", online: true, status: "Online", battery: 64, charging: true, live: "main", clear: true, recording: false },
+      { id: 1, name: "Front Yard", online: true, status: "Online", battery: 100, charging: false, wifi_dbm: -70, wifi_level: 1, live: "sub", clear: false, recording: true },
+      { id: 2, name: "Driveway", online: true, status: "Online", battery: 64, charging: true, wifi_dbm: -45, wifi_level: 2, live: "main", clear: true, recording: false },
       { id: 3, name: "Back Gate", online: false, status: "Reconnecting in 4s: connect: Timed out", battery: 12, charging: false, live: null, clear: false, recording: false },
       { id: 4, name: "Garage NVR ch1", online: true, status: "Online", battery: null, charging: false, live: null, clear: false, recording: false },
     ],

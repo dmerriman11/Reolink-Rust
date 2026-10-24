@@ -56,6 +56,8 @@ pub const MSG_ID_SET_GENERAL: u32 = 105;
 pub const MSG_ID_SNAP: u32 = 109;
 /// Used to grab the UID
 pub const MSG_ID_UID: u32 = 114;
+/// Wi-Fi signal strength (E_BC_CMD_GET_WIFI_SIGNAL in the official SDK)
+pub const MSG_ID_WIFI_SIGNAL: u32 = 115;
 /// Used to pass the token and client ID for push notifications
 pub const MSG_ID_PUSH_INFO: u32 = 124;
 /// Send a test email configuration

@@ -99,6 +99,9 @@ pub struct BcXml {
     /// Thre list of streams and their configuration
     #[serde(rename = "Uid", skip_serializing_if = "Option::is_none")]
     pub uid: Option<Uid>,
+    /// Wi-Fi signal strength report
+    #[serde(rename = "WifiSignal", skip_serializing_if = "Option::is_none")]
+    pub wifi_signal: Option<WifiSignal>,
     /// The floodlight settings for automatically turning on/off on schedule/motion
     #[serde(rename = "FloodlightTask", skip_serializing_if = "Option::is_none")]
     pub floodlight_task: Option<FloodlightTask>,
@@ -901,8 +904,22 @@ pub struct StreamResolution {
     pub height: u32,
 }
 
+/// WifiSignal xml (msg 115)
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct WifiSignal {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel the report is for
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Signal strength as reported by the camera
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+}
+
 /// Uid xml
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct Uid {
     /// XML Version
     #[serde(rename = "@version")]

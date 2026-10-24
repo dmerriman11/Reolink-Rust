@@ -77,6 +77,12 @@ h2 { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .14em; text-tra
 .dot.on { background: var(--live); box-shadow: 0 0 0 3px rgba(63, 214, 138, .14); }
 .device-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .device-status { grid-column: 2 / 4; margin-top: -6px; color: var(--faint); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.device-meta { display: inline-flex; align-items: center; gap: 9px; }
+.wifi { display: inline-grid; color: var(--muted); }
+.wifi svg { width: 15px; height: 15px; stroke-width: 2.4; }
+.wifi path { opacity: .22; }
+.wifi.lvl-1 .a1, .wifi.lvl-2 .a1, .wifi.lvl-2 .a2, .wifi.lvl-3 path { opacity: 1; }
+.wifi.lvl-0 { color: var(--rec); }
 .battery {
   display: inline-flex; align-items: center; gap: 4px;
   font: 500 11px/1 var(--display); font-variant-numeric: tabular-nums; color: var(--muted);

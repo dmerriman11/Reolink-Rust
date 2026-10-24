@@ -49,6 +49,8 @@ pub struct State {
     pub online: bool,
     pub battery: Option<u32>,
     pub charging: bool,
+    /// Wi-Fi RSSI in dBm; None for wired cameras or before the first reading.
+    pub wifi_dbm: Option<i32>,
     pub live: Option<StreamKind>,
     pub recording: Option<PathBuf>,
     pub message: Option<String>,
@@ -81,6 +83,16 @@ impl Device {
 impl Drop for Device {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Signal bars 0..=3 using the official client's thresholds (calcSignalStrength).
+pub fn wifi_level(dbm: i32) -> u8 {
+    match dbm {
+        d if d < -70 => 0,
+        d if d < -50 => 1,
+        d if d < -40 => 2,
+        _ => 3,
     }
 }
 
@@ -206,6 +218,8 @@ async fn session(
     let mut live: Option<Live> = None;
     let mut ping = tokio::time::interval(Duration::from_secs(5));
     let mut battery_poll = tokio::time::interval(Duration::from_secs(60));
+    let mut wifi_poll = tokio::time::interval(Duration::from_secs(30));
+    let mut wifi_supported = true; // cleared once a wired camera rejects the query
     // Resume what was on screen (and recording) before a drop.
     let mut pending = vec![Cmd::Live(wanted.live)];
 
@@ -219,6 +233,14 @@ async fn session(
                 _ = battery_poll.tick(), if battery.is_some() => {
                     if let Ok(b) = cam.battery_info().await {
                         set(&|s| { s.battery = Some(b.battery_percent); s.charging = b.charge_status == "charging"; });
+                    }
+                    None
+                }
+                _ = wifi_poll.tick(), if wifi_supported => {
+                    match cam.wifi_signal().await {
+                        Ok(dbm) => set(&|s| s.wifi_dbm = dbm),
+                        Err(neolink_core::Error::CameraServiceUnavailable { .. }) => wifi_supported = false,
+                        Err(e) => log::debug!("{}: wifi signal: {e}", cfg.name),
                     }
                     None
                 }
@@ -334,4 +356,14 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         }
     }
     live.decoder.as_mut().unwrap().push(data, key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wifi_level;
+
+    #[test]
+    fn wifi_levels_match_official_client() {
+        assert_eq!([-80, -71, -70, -58, -51, -50, -41, -40, -30].map(wifi_level), [0, 0, 1, 1, 1, 2, 2, 3, 3]);
+    }
 }
