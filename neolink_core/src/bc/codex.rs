@@ -90,7 +90,14 @@ impl Decoder for BcCodex {
         let bc = match bc {
             Ok(bc) => bc,
             Err(Error::NomIncomplete(_)) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A frame we can't parse (bad magic, odd firmware layout) must not end the connection:
+                // drop bytes up to the next message magic and carry on. Only that one message is lost.
+                let skip = next_magic(src.as_bytes()).unwrap_or(src.len().saturating_sub(3));
+                log::warn!("Skipping {skip} unparseable bytes on the BC stream: {e}");
+                let _ = src.split_to(skip.max(1).min(src.len()));
+                return self.decode(src);
+            }
         };
         // Update context
         if let Bc {
@@ -148,5 +155,29 @@ impl Decoder for BcCodex {
         }
 
         Ok(Some(bc))
+    }
+}
+
+/// Offset (after the first byte) of the next Baichuan message magic, in either byte order.
+fn next_magic(buf: &[u8]) -> Option<usize> {
+    (1..buf.len().saturating_sub(3)).find(|&i| {
+        let v = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        v == MAGIC_HEADER || v == MAGIC_HEADER_REV
+    })
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    #[test]
+    fn finds_next_magic_after_garbage() {
+        let mut buf = vec![0x36, 0xBD, 0xB6, 0xF4, 0x11];
+        buf.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
+        buf.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(next_magic(&buf), Some(5));
+        assert_eq!(next_magic(&[0u8; 16]), None);
+        // A magic at offset 0 is the frame that just failed; look past it.
+        assert_eq!(next_magic(&MAGIC_HEADER.to_le_bytes()), None);
     }
 }

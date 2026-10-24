@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
@@ -36,7 +36,13 @@ pub struct DeviceConfig {
     pub channel: u8,
 }
 
+/// Reply channel for request/response commands.
+pub type Reply<T> = tokio::sync::oneshot::Sender<Result<T, String>>;
+
 pub enum Cmd {
+    /// Read (`set: None`) or write a settings message; replies with the camera's XML (empty for writes).
+    Xml { msg: crate::settings::Msg, set: Option<String>, reply: Reply<String> },
+    Reboot(Reply<()>),
     Live(Option<StreamKind>),
     Ptz(Direction),
     Snapshot,
@@ -80,12 +86,21 @@ impl Device {
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
     }
+
+    pub fn sender(&self) -> UnboundedSender<Cmd> {
+        self.tx.clone()
+    }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// False for the -10 dBm placeholder Argus cameras report for ~5 s after connecting; real Wi-Fi is below -20.
+pub fn real_rssi(dbm: i32) -> bool {
+    dbm <= -20
 }
 
 /// Signal bars 0..=3 using the official client's thresholds (calcSignalStrength).
@@ -98,13 +113,20 @@ pub fn wifi_level(dbm: i32) -> u8 {
     }
 }
 
-pub fn media_dir() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-    base.join("Videos").join("Reolink-rs")
+/// Local time as YYYY-MM-DD_HH-MM-SS for file names (UTC if the local offset can't be determined).
+fn stamp() -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let f = time::macros::format_description!("[year]-[month]-[day]_[hour]-[minute]-[second]");
+    now.format(&f).unwrap_or_else(|_| now.unix_timestamp().to_string())
 }
 
-fn stamp() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+/// A warning when the recording drive is below the configured free-space threshold.
+fn space_warning() -> Option<String> {
+    let p = crate::prefs::get();
+    let free = crate::prefs::free_bytes(&p.record_dir)?;
+    let limit = p.space_warning_gb as u64 * 1_000_000_000;
+    (p.space_warning_gb > 0 && free < limit)
+        .then(|| format!("Low disk space: {:.1} GB free in {}", free as f64 / 1e9, p.record_dir.display()))
 }
 
 fn safe_name(name: &str) -> String {
@@ -145,6 +167,8 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     Some(Cmd::Live(k)) => { wanted.live = k; state.lock().unwrap().live = k; }
                     Some(Cmd::Record(r)) => wanted.record = r,
                     Some(Cmd::View(b)) => wanted.jpeg_box = b,
+                    Some(Cmd::Xml { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::Reboot(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(_) => {}
                 },
             }
@@ -209,7 +233,8 @@ async fn session(
 ) -> Result<()> {
     let set = |f: &dyn Fn(&mut State)| f(&mut state.lock().unwrap());
     set(&|s| s.status = "Connecting".into());
-    let cam = BcCamera::new(&camera_opts(cfg)?).await.context("connect")?;
+    // Shared so settings requests can run as their own tasks without pausing the live stream.
+    let cam = std::sync::Arc::new(BcCamera::new(&camera_opts(cfg)?).await.context("connect")?);
     set(&|s| s.status = "Logging in".into());
     cam.login().await.context("login")?;
 
@@ -226,6 +251,7 @@ async fn session(
     let mut battery_poll = tokio::time::interval(Duration::from_secs(60));
     let mut wifi_poll = tokio::time::interval(Duration::from_secs(30));
     let mut wifi_supported = true; // cleared once a wired camera rejects the query
+    let mut space_poll = tokio::time::interval(Duration::from_secs(60));
     // Resume what was on screen (and recording) before a drop.
     let mut pending = vec![Cmd::Live(wanted.live)];
 
@@ -242,8 +268,16 @@ async fn session(
                     }
                     None
                 }
+                _ = space_poll.tick(), if live.as_ref().is_some_and(|l| l.recorder.is_some()) => {
+                    if let Some(w) = space_warning() {
+                        set(&|s| s.message = Some(w.clone()));
+                    }
+                    None
+                }
                 _ = wifi_poll.tick(), if wifi_supported => {
                     match cam.wifi_signal().await {
+                        // Not measured yet right after connecting: try again shortly instead of showing it.
+                        Ok(Some(d)) if !real_rssi(d) => wifi_poll.reset_after(Duration::from_secs(5)),
                         Ok(dbm) => set(&|s| s.wifi_dbm = dbm),
                         Err(neolink_core::Error::CameraServiceUnavailable { .. }) => wifi_supported = false,
                         Err(e) => log::debug!("{}: wifi signal: {e}", cfg.name),
@@ -304,10 +338,27 @@ async fn session(
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
             }
+            Cmd::Xml { msg, set, reply } => {
+                let cam = cam.clone();
+                tokio::spawn(async move {
+                    let res = match set {
+                        None => cam.get_xml(msg.get, msg.channel).await,
+                        Some(xml) => match msg.set {
+                            Some(id) => cam.set_xml(id, msg.channel, xml).await.map(|_| String::new()),
+                            None => Err(neolink_core::Error::Other("setting is read-only")),
+                        },
+                    };
+                    let _ = reply.send(res.map_err(|e| e.to_string()));
+                });
+            }
+            Cmd::Reboot(reply) => {
+                let res = cam.reboot().await.map_err(|e| e.to_string());
+                let _ = reply.send(res);
+            }
             Cmd::Snapshot => {
                 let res = async {
                     let jpg = cam.get_snapshot().await?;
-                    let dir = media_dir();
+                    let dir = crate::prefs::get().snapshot_dir;
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("{}_{}.jpg", safe_name(&cfg.name), stamp()));
                     std::fs::write(&path, jpg)?;
@@ -332,14 +383,17 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     };
 
     if live.record && live.recorder.is_none() {
-        let dir = media_dir();
-        let path = dir.join(format!("{}_{}.mp4", safe_name(name), stamp()));
-        let res = std::fs::create_dir_all(&dir).and_then(|_| Recorder::new(codec, &path));
+        let prefs = crate::prefs::get();
+        let dir = prefs.record_dir.clone();
+        let res = std::fs::create_dir_all(&dir).and_then(|_| Recorder::new(codec, &dir, &safe_name(name), prefs.segment_minutes));
         let mut s = state.lock().unwrap();
         match res {
             Ok(r) => {
                 s.recording = Some(r.path.clone());
                 live.recorder = Some(r);
+                if let Some(w) = space_warning() {
+                    s.message = Some(w);
+                }
             }
             Err(e) => {
                 live.record = false;
@@ -384,5 +438,6 @@ mod tests {
     #[test]
     fn wifi_levels_match_official_client() {
         assert_eq!([-80, -71, -70, -58, -51, -50, -41, -40, -30].map(wifi_level), [0, 0, 1, 1, 1, 2, 2, 3, 3]);
+        assert!(!super::real_rssi(-10) && super::real_rssi(-20) && super::real_rssi(-59));
     }
 }

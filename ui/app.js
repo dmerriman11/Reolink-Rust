@@ -101,6 +101,8 @@ function renderDevices() {
     li.append(meta);
     if (!d.online) li.append(Object.assign(el("span", "device-status"), { textContent: d.status }));
     const menu = el("span", "device-menu");
+    const gear = Object.assign(el("button"), { textContent: "Settings" });
+    gear.onclick = (e) => { e.stopPropagation(); openCameraSettings(d.id); };
     const edit = Object.assign(el("button"), { textContent: "Edit" });
     edit.onclick = (e) => { e.stopPropagation(); openDialog(d.id); };
     const del = Object.assign(el("button", "danger"), { textContent: "Remove" });
@@ -108,7 +110,7 @@ function renderDevices() {
       e.stopPropagation();
       if (confirm(`Remove ${d.name}?`)) call("remove_device", { id: d.id }).then(refresh);
     };
-    menu.append(edit, del);
+    menu.append(gear, edit, del);
     li.append(menu);
     const show = () => {
       const free = state.tiles.slice(0, state.layout).findIndex((t) => t == null);
@@ -269,10 +271,259 @@ function setupPtz() {
   }
 }
 
+
+// ---------- settings (camera + app) ----------
+// One dialog renders pages of fields: {key,label,kind,value,display,min,max,max_len,options}.
+// kind: info | range | toggle | choice | text | folder | number
+const S = { mode: null, deviceId: null, pages: [], page: null, view: null, original: {}, values: {}, errors: {}, busy: false };
+
+function openSettingsDialog() {
+  const d = $("#settings-dialog");
+  if (!d.open) d.showModal();
+}
+
+async function openCameraSettings(id) {
+  const d = device(id);
+  Object.assign(S, { mode: "camera", deviceId: id, view: null, pages: await call("camera_pages") });
+  $("#settings-kicker").textContent = d ? d.name : "Camera";
+  openSettingsDialog();
+  showSettingsPage(S.pages[0].id);
+}
+
+async function openAppSettings() {
+  Object.assign(S, { mode: "app", deviceId: null, view: null, pages: [{ id: "app", title: "App" }] });
+  $("#settings-kicker").textContent = "Reolink-rs";
+  openSettingsDialog();
+  showSettingsPage("app");
+}
+
+const SEGMENTS = [[0, "One file per recording"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"], [30, "30 minutes"], [60, "60 minutes"]];
+
+function prefsToView(p) {
+  const opt = (pairs) => pairs.map(([v, l]) => ({ value: String(v), label: l }));
+  return {
+    id: "app", title: "App settings",
+    fields: [
+      { key: "snapshot_dir", label: "Save snapshots to", kind: "folder", value: p.snapshot_dir },
+      { key: "record_dir", label: "Save recordings to", kind: "folder", value: p.record_dir },
+      { key: "segment_minutes", label: "Video file duration", kind: "choice", value: String(p.segment_minutes), options: opt(SEGMENTS) },
+      { key: "space_warning_gb", label: "Warn when free space is below (GB, 0 = off)", kind: "number", value: String(p.space_warning_gb), min: 0, max: 10000 },
+      { key: "hardware_decode", label: "Hardware video decoding", kind: "toggle", value: p.hardware_decode ? "1" : "0" },
+      { key: "scan_network", label: "Find new cameras on the network", kind: "toggle", value: p.scan_network ? "1" : "0" },
+      { key: "run_at_startup", label: "Run at Windows startup", kind: "toggle", value: p.run_at_startup ? "1" : "0" },
+    ],
+  };
+}
+
+function viewToPrefs(values) {
+  return {
+    snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
+    segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
+    hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
+    run_at_startup: values.run_at_startup === "1",
+  };
+}
+
+async function showSettingsPage(pageId) {
+  if (dirty() && !confirm("Discard unsaved changes?")) return;
+  S.page = pageId;
+  S.view = null;
+  S.errors = {};
+  $("#settings-nav").replaceChildren(...S.pages.map((p) => {
+    const b = Object.assign(el("button"), { textContent: p.title, type: "button" });
+    if (p.id === pageId) b.setAttribute("aria-current", "page");
+    b.onclick = () => showSettingsPage(p.id);
+    return b;
+  }));
+  $("#settings-title").textContent = S.pages.find((p) => p.id === pageId).title;
+  $("#settings-body").replaceChildren(el("div", "settings-loading", '<div><div class="spinner"></div>Reading settings…</div>'));
+  setStatus("");
+  renderSettingsActions();
+  updateFooter();
+  let view;
+  try {
+    view = S.mode === "camera"
+      ? await invoke("camera_settings", { id: S.deviceId, page: pageId })
+      : prefsToView(await invoke("get_prefs"));
+  } catch (e) {
+    $("#settings-body").replaceChildren(Object.assign(el("p", "settings-empty"), { textContent: String(e) }));
+    return;
+  }
+  if (S.page !== pageId) return; // user moved on while this loaded
+  S.view = view;
+  S.original = Object.fromEntries(view.fields.map((f) => [f.key, f.value]));
+  S.values = { ...S.original };
+  renderSettingsBody();
+}
+
+function dirty() {
+  return !!S.view && Object.keys(S.values).some((k) => S.values[k] !== S.original[k]);
+}
+
+function setStatus(text, err = false) {
+  const s = $("#settings-status");
+  s.textContent = text;
+  s.classList.toggle("err", err);
+}
+
+function updateFooter() {
+  $("#settings-save").disabled = !dirty() || S.busy;
+  $("#settings-revert").disabled = !dirty() || S.busy;
+  for (const row of document.querySelectorAll("#settings-body .set-row")) {
+    row.classList.toggle("changed", S.values[row.dataset.key] !== S.original[row.dataset.key]);
+  }
+}
+
+function control(f) {
+  const c = el("div", "set-control");
+  const set = (v) => { S.values[f.key] = String(v); delete S.errors[f.key]; updateFooter(); };
+  const id = `set-${f.key}`;
+  switch (f.kind) {
+    case "range": {
+      const r = Object.assign(el("input"), { type: "range", id, min: f.min, max: f.max, step: 1, value: S.values[f.key] });
+      const out = Object.assign(el("span", "range-val"), { textContent: S.values[f.key] });
+      r.oninput = () => { out.textContent = r.value; set(r.value); };
+      c.append(r, out);
+      break;
+    }
+    case "toggle": {
+      const w = el("label", "switch");
+      const i = Object.assign(el("input"), { type: "checkbox", id, checked: S.values[f.key] === "1" });
+      i.onchange = () => set(i.checked ? "1" : "0");
+      w.append(i, el("span"));
+      c.append(w);
+      break;
+    }
+    case "choice": {
+      const s = Object.assign(el("select"), { id });
+      for (const o of f.options) s.append(Object.assign(el("option"), { value: o.value, textContent: o.label, selected: o.value === S.values[f.key] }));
+      s.onchange = () => set(s.value);
+      c.append(s);
+      break;
+    }
+    case "text":
+    case "number": {
+      const i = Object.assign(el("input"), { type: f.kind === "number" ? "number" : "text", id, value: S.values[f.key] });
+      if (f.max_len) i.maxLength = f.max_len;
+      if (f.kind === "number") Object.assign(i, { min: f.min, max: f.max, step: 1 });
+      i.oninput = () => set(i.value);
+      c.append(i);
+      break;
+    }
+    case "folder": {
+      const p = Object.assign(el("span", "path-val"), { textContent: S.values[f.key], title: S.values[f.key] });
+      const b = Object.assign(el("button", "ghost-btn"), { type: "button", textContent: "Change…", id });
+      b.onclick = async () => {
+        const picked = await invoke("pick_folder", { current: S.values[f.key] });
+        if (picked) { p.textContent = picked; p.title = picked; set(picked); }
+      };
+      c.append(p, b);
+      break;
+    }
+    default:
+      c.append(Object.assign(el("span", "set-info"), { textContent: f.display || f.value || "—", id }));
+  }
+  return c;
+}
+
+function renderSettingsBody() {
+  const body = $("#settings-body");
+  if (!S.view.fields.length) {
+    body.replaceChildren(Object.assign(el("p", "settings-empty"), { textContent: "This camera doesn't offer these settings, or is offline." }));
+    updateFooter();
+    return;
+  }
+  body.replaceChildren(...S.view.fields.map((f) => {
+    const row = el("div", "set-row");
+    row.dataset.key = f.key;
+    const label = Object.assign(el("label", "set-label"), { textContent: f.label, htmlFor: `set-${f.key}` });
+    row.append(label, control(f));
+    if (S.errors[f.key]) row.append(Object.assign(el("div", "set-error"), { textContent: S.errors[f.key] }));
+    return row;
+  }));
+  updateFooter();
+}
+
+function renderSettingsActions() {
+  const box = $("#settings-actions");
+  box.replaceChildren();
+  const action = (label, fn) => {
+    const b = Object.assign(el("button", "ghost-btn"), { type: "button", textContent: label });
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await fn(); } catch (e) { setStatus(String(e), true); } finally { b.disabled = false; }
+    };
+    box.append(b);
+  };
+  if (S.mode !== "camera") return;
+  if (S.page === "system") {
+    action("Sync time with this PC", async () => {
+      await invoke("sync_camera_time", { id: S.deviceId });
+      setStatus("Camera clock set to this PC's time.");
+    });
+  }
+  if (S.page === "maintenance") {
+    action("Reboot camera", async () => {
+      if (!confirm("Reboot the camera now? It will be offline for about a minute, then reconnect automatically.")) return;
+      await invoke("reboot_camera", { id: S.deviceId });
+      setStatus("Camera is rebooting; it will reconnect automatically.");
+    });
+  }
+}
+
+async function saveSettings() {
+  const changes = Object.fromEntries(Object.keys(S.values).filter((k) => S.values[k] !== S.original[k]).map((k) => [k, S.values[k]]));
+  S.busy = true;
+  updateFooter();
+  setStatus("Saving…");
+  try {
+    if (S.mode === "app") {
+      const p = await invoke("save_prefs", { prefs: viewToPrefs(S.values) });
+      S.view = prefsToView(p);
+      S.original = Object.fromEntries(S.view.fields.map((f) => [f.key, f.value]));
+      S.values = { ...S.original };
+      renderSettingsBody();
+      setStatus("Saved.");
+      return;
+    }
+    const results = await invoke("save_camera_settings", { id: S.deviceId, page: S.page, changes });
+    const errors = Object.fromEntries(results.filter((r) => !r.ok).map((r) => [r.key, r.error]));
+    const failed = Object.keys(errors).length;
+    // Re-read so the form shows what the camera actually has now.
+    S.view = await invoke("camera_settings", { id: S.deviceId, page: S.page });
+    S.original = Object.fromEntries(S.view.fields.map((f) => [f.key, f.value]));
+    S.values = { ...S.original };
+    S.errors = errors;
+    renderSettingsBody();
+    setStatus(failed ? `${failed} setting${failed > 1 ? "s" : ""} not saved; see below.` : "Saved and verified on the camera.", failed > 0);
+  } catch (e) {
+    setStatus(String(e), true);
+  } finally {
+    S.busy = false;
+    updateFooter();
+  }
+}
+
+function setupSettings() {
+  $("#app-settings").onclick = openAppSettings;
+  $("#settings-save").onclick = saveSettings;
+  $("#settings-revert").onclick = () => { S.values = { ...S.original }; S.errors = {}; renderSettingsBody(); setStatus(""); };
+  const close = () => {
+    if (dirty() && !confirm("Discard unsaved changes?")) return;
+    S.view = null;
+    $("#settings-dialog").close();
+  };
+  $("#settings-close").onclick = close;
+  $("#settings-dialog").addEventListener("cancel", (e) => { e.preventDefault(); close(); });
+}
+
 // ---------- LAN discovery ----------
 let scanning = false;
-async function scanLan() {
+async function scanLan(auto = false) {
   if (scanning) return;
+  if (auto) {
+    try { if (!(await invoke("get_prefs")).scan_network) return; } catch { /* default: scan */ }
+  }
   scanning = true;
   $("#rescan").classList.add("spinning");
   try {
@@ -373,9 +624,10 @@ setupPtz();
 setupDialog();
 refresh();
 setInterval(refresh, 800);
-$("#rescan").onclick = scanLan;
-scanLan();
-setInterval(scanLan, 120_000);
+$("#rescan").onclick = () => scanLan();
+setupSettings();
+scanLan(true);
+setInterval(() => scanLan(true), 120_000);
 
 // ---------- demo data when opened outside Tauri (design preview only) ----------
 function demoInvoke(cmd, args) {
@@ -388,7 +640,15 @@ function demoInvoke(cmd, args) {
     ],
     layout: 2, tiles: [1, 2, null, null, ...Array(12).fill(null)], stream_base: "", token: "",
   };
-  if (cmd === "scan_lan") return Promise.resolve([{ uid: "9527000J3E0S1HZE", ip: "192.168.1.254", battery: 99, added: false }]);
+  if (cmd === "get_prefs") return Promise.resolve({ snapshot_dir: "C:\\Users\\you\\Videos\\Reolink-rs", record_dir: "C:\\Users\\you\\Videos\\Reolink-rs", segment_minutes: 30, space_warning_gb: 5, hardware_decode: true, scan_network: true, run_at_startup: false });
+  if (cmd === "camera_pages") return Promise.resolve([{ id: "display", title: "Display" }, { id: "lights", title: "Lights" }]);
+  if (cmd === "camera_settings") return Promise.resolve({ id: args.page, title: "", fields: [
+    { key: "osd_name", label: "Camera name on video", kind: "text", value: "Front door", display: "Front door", max_len: 31, options: [] },
+    { key: "osd_time_on", label: "Show date and time", kind: "toggle", value: "1", display: "1", options: [] },
+    { key: "bright", label: "Brightness", kind: "range", value: "128", display: "128", min: 0, max: 255, options: [] },
+    { key: "daynight", label: "Day / night", kind: "choice", value: "color", display: "Always color", options: [{ value: "auto", label: "Auto" }, { value: "color", label: "Always color" }] },
+    { key: "model", label: "Model", kind: "info", value: "Argus 4 Pro", display: "Argus 4 Pro", options: [] }] });
+  if (cmd === "scan_lan") return Promise.resolve([{ uid: "95270000EXAMPLEA", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;
   return Promise.resolve(cmd === "get_state" ? structuredClone(demo) : null);

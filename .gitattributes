@@ -1,0 +1,6 @@
+# Protocol samples and media are byte-exact test data; never convert line endings.
+*.bin binary
+*.raw binary
+*.pcapng binary
+*.ico binary
+*.png binary

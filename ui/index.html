@@ -35,6 +35,10 @@
     <header class="topbar">
       <div class="layouts" role="radiogroup" aria-label="Layout" id="layouts"></div>
       <div class="topbar-right">
+        <button class="ghost-btn" id="app-settings" title="App settings">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          Settings
+        </button>
         <button class="ghost-btn" id="media-folder">
           <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           Media
@@ -82,6 +86,30 @@
         <button type="submit" class="primary-btn">Save</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <div class="settings-shell">
+      <nav class="settings-nav" id="settings-nav" aria-label="Settings pages"></nav>
+      <section class="settings-main">
+        <header class="settings-head">
+          <div>
+            <p class="settings-kicker" id="settings-kicker"></p>
+            <h3 id="settings-title"></h3>
+          </div>
+          <button class="icon-btn" id="settings-close" aria-label="Close settings">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <div class="settings-body" id="settings-body"></div>
+        <footer class="settings-foot">
+          <div class="settings-actions" id="settings-actions"></div>
+          <span class="settings-status" id="settings-status" role="status"></span>
+          <button type="button" class="ghost-btn" id="settings-revert" disabled>Undo changes</button>
+          <button type="button" class="primary-btn" id="settings-save" disabled>Save</button>
+        </footer>
+      </section>
+    </div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>

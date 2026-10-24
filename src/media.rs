@@ -86,15 +86,16 @@ impl Decoder {
         // Fit the tile's box (never upscaling): JPEG cost scales with pixels, so don't make more than is shown.
         let (w, h) = jpeg_box;
         let scale = format!("scale=w='min(iw,{w})':h='min(ih,{h})':force_original_aspect_ratio=decrease:force_divisible_by=2");
-        let mut child = spawn(
-            &[
-                "-hwaccel", "auto", // GPU decode when available (~3x less CPU), silent software fallback
-                "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-                "-f", format_of(codec), "-i", "pipe:0",
-                "-vf", &scale, "-c:v", "mjpeg", "-q:v", "4", "-f", "mpjpeg", "pipe:1",
-            ],
-            true,
-        )?;
+        let mut args: Vec<&str> = vec![];
+        if crate::prefs::get().hardware_decode {
+            args.extend(["-hwaccel", "auto"]); // GPU decode when available (~3x less CPU), silent software fallback
+        }
+        args.extend([
+            "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
+            "-f", format_of(codec), "-i", "pipe:0",
+            "-vf", &scale, "-c:v", "mjpeg", "-q:v", "4", "-f", "mpjpeg", "pipe:1",
+        ]);
+        let mut child = spawn(&args, true)?;
         let tx = feeder(child.stdin.take().expect("piped stdin"));
         let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
         std::thread::spawn(move || {
@@ -158,17 +159,21 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn new(codec: VideoType, path: &Path) -> std::io::Result<Self> {
-        let out = path.to_string_lossy().into_owned();
+    /// Record into `dir` as `<base>_<YYYY-MM-DD_HH-MM-SS>.mp4`, starting a new file every `segment_minutes`
+    /// (0 = one file). Each segment is a complete MP4, so a crash loses at most the current one.
+    pub fn new(codec: VideoType, dir: &Path, base: &str, segment_minutes: u32) -> std::io::Result<Self> {
+        let template = dir.join(format!("{base}_%Y-%m-%d_%H-%M-%S.mp4")).to_string_lossy().into_owned();
+        let seconds = if segment_minutes == 0 { 360_000 } else { segment_minutes * 60 }.to_string();
         let mut child = spawn(
             &[
                 "-use_wallclock_as_timestamps", "1", "-f", format_of(codec), "-i", "pipe:0",
-                "-c", "copy", "-movflags", "+faststart", "-y", &out,
+                "-c", "copy", "-f", "segment", "-segment_time", &seconds, "-reset_timestamps", "1",
+                "-strftime", "1", "-segment_format", "mp4", "-segment_format_options", "movflags=+faststart", &template,
             ],
             false,
         )?;
         let tx = feeder(child.stdin.take().expect("piped stdin"));
-        Ok(Self { path: path.to_owned(), child: Some(child), tx: Some(tx), started: false })
+        Ok(Self { path: dir.to_owned(), child: Some(child), tx: Some(tx), started: false })
     }
 
     pub fn push(&mut self, data: &[u8], keyframe: bool) {

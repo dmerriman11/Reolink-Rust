@@ -21,6 +21,10 @@ pub enum BcPayloads {
 #[derive(PartialEq, Default, Debug, Deserialize, Serialize)]
 #[serde(rename = "body")]
 pub struct BcXml {
+    /// The payload exactly as received. When set on an outgoing message it is sent verbatim, which lets
+    /// settings be written read-modify-write without dropping fields this model doesn't know about.
+    #[serde(skip)]
+    pub raw: Option<String>,
     /// Encryption xml is received during login and contain the NONCE
     #[serde(rename = "Encryption", skip_serializing_if = "Option::is_none")]
     pub encryption: Option<Encryption>,
@@ -151,6 +155,10 @@ impl BcXml {
         quick_xml::de::from_reader(s)
     }
     pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+        if let Some(raw) = &self.raw {
+            w.write_all(raw.as_bytes()).map_err(|e| quick_xml::de::DeError::Custom(e.to_string()))?;
+            return Ok(w);
+        }
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         writer
             .write_event(quick_xml::events::Event::Decl(

@@ -2,7 +2,10 @@
 
 mod device;
 mod media;
+mod prefs;
+mod xmledit;
 mod scan;
+mod settings;
 mod stream;
 
 use device::{Cmd, Device, DeviceConfig};
@@ -25,6 +28,8 @@ struct Saved {
     /// Device indexes set to the Clear (main) stream.
     #[serde(default)]
     clear: Vec<usize>,
+    #[serde(default)]
+    prefs: prefs::Prefs,
 }
 
 fn config_path() -> PathBuf {
@@ -103,6 +108,7 @@ impl Inner {
             layout: self.layout,
             tiles: self.tiles.iter().map(|t| t.and_then(idx)).collect(),
             clear: self.clear.iter().filter_map(|&id| idx(id)).collect(),
+            prefs: prefs::get(),
         };
         let path = config_path();
         let res = std::fs::create_dir_all(path.parent().unwrap())
@@ -355,9 +361,116 @@ async fn scan_lan(app: State<'_, App>) -> Result<Vec<FoundDto>, String> {
         .collect())
 }
 
+/// The settings engine's view of a device: requests go through its worker, which owns the connection.
+struct DeviceCam(tokio::sync::mpsc::UnboundedSender<Cmd>);
+
+impl DeviceCam {
+    async fn request(&self, msg: settings::Msg, set: Option<String>) -> Result<String, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.0.send(Cmd::Xml { msg, set, reply }).map_err(|_| "device was removed".to_string())?;
+        match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("device restarted; try again".into()),
+            Err(_) => Err("camera didn't answer in time (asleep or out of range?)".into()),
+        }
+    }
+}
+
+impl settings::Camera for DeviceCam {
+    fn get(&self, msg: settings::Msg) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        self.request(msg, None)
+    }
+    async fn set(&self, msg: settings::Msg, xml: String) -> Result<(), String> {
+        self.request(msg, Some(xml)).await.map(|_| ())
+    }
+}
+
+fn device_cam(app: &State<'_, App>, id: u64) -> Result<DeviceCam, String> {
+    let inner = app.inner.lock().unwrap();
+    Ok(DeviceCam(inner.devices[inner.index(id)?].sender()))
+}
+
+#[derive(Serialize)]
+struct PageInfo {
+    id: &'static str,
+    title: &'static str,
+}
+
+#[tauri::command]
+fn camera_pages() -> Vec<PageInfo> {
+    settings::PAGES.iter().map(|p| PageInfo { id: p.id, title: p.title }).collect()
+}
+
+#[tauri::command]
+async fn camera_settings(app: State<'_, App>, id: u64, page: String) -> Result<settings::PageView, String> {
+    let cam = device_cam(&app, id)?;
+    let page = settings::page(&page).ok_or("unknown settings page")?;
+    Ok(settings::read_page(&cam, page).await)
+}
+
+#[tauri::command]
+async fn save_camera_settings(
+    app: State<'_, App>,
+    id: u64,
+    page: String,
+    changes: std::collections::BTreeMap<String, String>,
+) -> Result<Vec<settings::WriteResult>, String> {
+    let cam = device_cam(&app, id)?;
+    let page = settings::page(&page).ok_or("unknown settings page")?;
+    Ok(settings::write_page(&cam, page, &changes).await)
+}
+
+/// Set the camera clock to this PC's time, expressed in the camera's own time zone.
+#[tauri::command]
+async fn sync_camera_time(app: State<'_, App>, id: u64) -> Result<(), String> {
+    use settings::Camera;
+    let cam = device_cam(&app, id)?;
+    let xml = cam.get(settings::SYSTEM_GENERAL).await?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64;
+    cam.set(settings::SYSTEM_GENERAL, settings::with_clock(&xml, now)?).await
+}
+
+#[tauri::command]
+async fn reboot_camera(app: State<'_, App>, id: u64) -> Result<(), String> {
+    let tx = device_cam(&app, id)?.0;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Cmd::Reboot(reply)).map_err(|_| "device was removed".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(20), rx)
+        .await
+        .map_err(|_| "camera didn't answer in time".to_string())?
+        .map_err(|_| "device restarted; try again".to_string())?
+}
+
+#[tauri::command]
+fn get_prefs() -> prefs::Prefs {
+    prefs::get()
+}
+
+#[tauri::command]
+fn save_prefs(app: State<App>, prefs: prefs::Prefs) -> Result<prefs::Prefs, String> {
+    prefs.validate()?;
+    if prefs.run_at_startup != prefs::get().run_at_startup {
+        prefs::apply_run_at_startup(prefs.run_at_startup)?;
+    }
+    prefs::set(prefs);
+    app.inner.lock().unwrap().save();
+    Ok(prefs::get())
+}
+
+/// Native folder picker, starting in `current`.
+#[tauri::command]
+async fn pick_folder(window: tauri::Window, current: String) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window.dialog().file().set_directory(current).set_parent(&window).pick_folder(move |p| {
+        let _ = tx.send(p.and_then(|p| p.into_path().ok()).map(|p| p.display().to_string()));
+    });
+    rx.await.ok().flatten()
+}
+
 #[tauri::command]
 fn open_media_folder() {
-    let dir = device::media_dir();
+    let dir = prefs::get().record_dir;
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::process::Command::new("explorer").arg(dir).spawn();
 }
@@ -370,6 +483,7 @@ fn main() {
     let port = rt.block_on(stream::serve(feeds.clone(), token.clone())).expect("start stream server");
 
     let saved: Saved = std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    prefs::set(saved.prefs.clone());
     let app = App {
         rt,
         inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, boxes: HashMap::new(), next_id: 0 }),
@@ -389,10 +503,13 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(app)
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile,
-            set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes
+            set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
+            camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera,
+            get_prefs, save_prefs, pick_folder
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Resized(_) = event {

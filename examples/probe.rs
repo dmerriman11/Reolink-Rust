@@ -1,9 +1,16 @@
+#![allow(dead_code)] // shares the app's modules but uses only part of them
 //! End-to-end check of the real device worker against a saved camera:
 //! `cargo run --example probe -- "<device name>" [main|sub]`
 //! Streams for a few seconds, records ~8 s, then reports decoded frame sizes and the MP4 ffprobe sees.
 
 #[path = "../src/device.rs"]
 mod device;
+#[path = "../src/settings.rs"]
+mod settings;
+#[path = "../src/xmledit.rs"]
+mod xmledit;
+#[path = "../src/prefs.rs"]
+mod prefs;
 #[path = "../src/media.rs"]
 mod media;
 
@@ -61,7 +68,14 @@ fn main() -> anyhow::Result<()> {
     dev.send(Cmd::Record(false));
     std::thread::sleep(Duration::from_secs(3)); // ffmpeg finalizes the MP4 after stdin closes
     let msg = dev.state.lock().unwrap().message.take();
-    let Some(rec) = rec else { anyhow::bail!("recording did not start: {msg:?}") };
+    let Some(dir) = rec else { anyhow::bail!("recording did not start: {msg:?}") };
+    // Recordings are written as timestamped segments in the folder; check the newest one.
+    let rec = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "mp4"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+        .ok_or_else(|| anyhow::anyhow!("no recording in {}", dir.display()))?;
     let probe = std::process::Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "stream=codec_name,width,height,nb_frames:format=duration", "-of", "compact"])
         .arg(&rec)

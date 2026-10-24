@@ -77,19 +77,6 @@ fn bc_modern_msg<'a>(
     header: &BcHeader,
     buf: &'a [u8],
 ) -> IResult<&'a [u8], ModernMsg> {
-    use nom::{
-        error::{ContextError, ErrorKind, ParseError},
-        Err,
-    };
-
-    fn make_error<I, E>(input: I, ctx: &'static str, kind: ErrorKind) -> E
-    where
-        I: std::marker::Copy,
-        E: ParseError<I> + ContextError<I>,
-    {
-        E::add_context(input, ctx, E::from_error_kind(input, kind))
-    }
-
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
 
@@ -108,6 +95,7 @@ fn bc_modern_msg<'a>(
 
     let mut in_binary = false;
     let mut encrypted_len = None;
+    let mut stray_body: Option<String> = None;
     // Now we'll take the buffer that Nom gave a ref to and parse it.
     let extension = if ext_len > 0 {
         if context.debug {
@@ -118,14 +106,20 @@ fn bc_modern_msg<'a>(
         }
         // Apply the XML parse function, but throw away the reference to decrypted in the Ok and
         // Err case. This error-error-error thing is the same idiom Nom uses internally.
-        let parsed = Extension::try_parse(processed_ext_buf).map_err(|_| {
-            log::error!("Extension buffer: {:?}", processed_ext_buf);
-            Err::Error(make_error(
-                buf,
-                "Unable to parse Extension XML",
-                ErrorKind::MapRes,
-            ))
-        })?;
+        match Extension::try_parse(processed_ext_buf) {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                // Some firmware (e.g. Argus msg 93 LinkType) sends its <body> in the extension slot.
+                // Keep it as the payload instead of failing the message, which would end the connection.
+                debug!("msg_id {}: extension is not <Extension>, treating it as the payload", header.msg_id);
+                stray_body = Some(String::from_utf8_lossy(processed_ext_buf).into_owned());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let extension = if let Some(parsed) = extension {
         if let Extension {
             binary_data: Some(1),
             encrypt_len,
@@ -198,25 +192,25 @@ fn bc_modern_msg<'a>(
                         .unwrap_or("Not Text".to_string())
                 );
             }
-            let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
-                error!("header.msg_id: {}", header.msg_id);
-                error!(
-                    "processed_payload_buf: {:X?}::{:?}",
-                    processed_payload_buf,
-                    std::str::from_utf8(&processed_payload_buf)
-                );
-                log::error!("e: {:?}", e);
-                Err::Error(make_error(
-                    buf,
-                    "Unable to parse Payload XML",
-                    ErrorKind::MapRes,
-                ))
-            })?;
+            let text = String::from_utf8_lossy(&processed_payload_buf).into_owned();
+            // XML the typed model can't represent is kept raw instead of failing the whole message.
+            let mut xml = BcXml::try_parse(processed_payload_buf.as_slice()).unwrap_or_else(|e| {
+                debug!("msg_id {}: payload kept raw, typed parse failed: {:?}", header.msg_id, e);
+                BcXml::default()
+            });
+            xml.raw = Some(text);
             payload = Some(BcPayloads::BcXml(xml));
         }
     } else {
         payload = None;
     }
+    let payload = payload.or_else(|| {
+        stray_body.map(|text| {
+            let mut xml = BcXml::try_parse(text.as_bytes()).unwrap_or_default();
+            xml.raw = Some(text);
+            BcPayloads::BcXml(xml)
+        })
+    });
 
     Ok((buf, ModernMsg { extension, payload }))
 }

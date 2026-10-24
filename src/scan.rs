@@ -91,9 +91,9 @@ mod tests {
     #[test]
     fn parses_search_replies() {
         let ip: IpAddr = "192.168.1.254".parse().unwrap();
-        let battery = "<P2P><D2C_S_R><bat><low>0</low><pct>99</pct><c>2</c><p>1</p></bat><uid>9527000J3E0S1HZE</uid></D2C_S_R></P2P>";
-        assert_eq!(parse_reply(battery, ip), Some(Found { uid: "9527000J3E0S1HZE".into(), ip, battery: Some(99) }));
-        let plain = "<P2P><D2C_S_R><uid>9527000IOPAHRG7I</uid></D2C_S_R></P2P>";
+        let battery = "<P2P><D2C_S_R><bat><low>0</low><pct>99</pct><c>2</c><p>1</p></bat><uid>95270000EXAMPLEA</uid></D2C_S_R></P2P>";
+        assert_eq!(parse_reply(battery, ip), Some(Found { uid: "95270000EXAMPLEA".into(), ip, battery: Some(99) }));
+        let plain = "<P2P><D2C_S_R><uid>95270000EXAMPLEB</uid></D2C_S_R></P2P>";
         assert_eq!(parse_reply(plain, ip).unwrap().battery, None);
         assert_eq!(parse_reply("<P2P><D2C_C_R><uid>X</uid></D2C_C_R></P2P>", ip), None);
         assert_eq!(parse_reply("<P2P><D2C_S_R><uid></uid></D2C_S_R></P2P>", ip), None);
