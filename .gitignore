@@ -1,0 +1,9 @@
+target/
+vendor/
+gen/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Backups of Reolink's proprietary client JS made while patching; not ours to commit.
+/patch/original/

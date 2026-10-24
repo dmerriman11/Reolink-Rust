@@ -1,0 +1,337 @@
+//! One worker task per device: connect, login, stream, PTZ, snapshot, record.
+//!
+//! Unlike the official client there is no idle/battery disconnect: the session is held open
+//! with pings for as long as the app runs, and any drop (battery camera or not) reconnects
+//! automatically and resumes the live view that was showing.
+
+use crate::media::{Decoder, Recorder};
+use anyhow::{Context as _, Result};
+use neolink_core::bc_protocol::{
+    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, Direction,
+    StreamData, StreamKind,
+};
+use neolink_core::bcmedia::model::BcMedia;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
+
+/// Latest decoded JPEG for the live view; None when not streaming.
+pub type Frame = Option<Arc<Vec<u8>>>;
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct DeviceConfig {
+    pub name: String,
+    /// IP or hostname; optional when a UID is given.
+    pub host: String,
+    pub uid: String,
+    pub port: Option<u16>,
+    pub username: String,
+    // shortcut: stored in plain text in %APPDATA%; move to Windows Credential Manager before sharing builds.
+    pub password: String,
+    /// NVR channel, 0 for a standalone camera.
+    pub channel: u8,
+}
+
+pub enum Cmd {
+    Live(Option<StreamKind>),
+    Ptz(Direction),
+    Snapshot,
+    Record(bool),
+}
+
+#[derive(Default)]
+pub struct State {
+    pub status: String,
+    pub online: bool,
+    pub battery: Option<u32>,
+    pub charging: bool,
+    pub live: Option<StreamKind>,
+    pub recording: Option<PathBuf>,
+    pub message: Option<String>,
+}
+
+pub struct Device {
+    /// Runtime-only id; stable while the app runs, unlike the list index.
+    pub id: u64,
+    pub config: DeviceConfig,
+    pub frames: watch::Receiver<Frame>,
+    pub state: Arc<Mutex<State>>,
+    tx: UnboundedSender<Cmd>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Device {
+    pub fn spawn(rt: &tokio::runtime::Handle, id: u64, config: DeviceConfig) -> Self {
+        let state = Arc::new(Mutex::new(State { status: "Connecting".into(), ..Default::default() }));
+        let (tx, rx) = unbounded_channel();
+        let (frame_tx, frames) = watch::channel(None);
+        let task = rt.spawn(run(config.clone(), rx, state.clone(), frame_tx));
+        Self { id, config, frames, state, tx, task }
+    }
+
+    pub fn send(&self, cmd: Cmd) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub fn media_dir() -> PathBuf {
+    let base = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+    base.join("Videos").join("Reolink-rs")
+}
+
+fn stamp() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn safe_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect()
+}
+
+/// Desired state that survives reconnects.
+struct Wanted {
+    live: Option<StreamKind>,
+    record: bool,
+}
+
+async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex<State>>, frames: watch::Sender<Frame>) {
+    let mut wanted = Wanted { live: None, record: false };
+    let mut backoff = 1;
+    loop {
+        let err = match session(&cfg, &mut rx, &state, &frames, &mut wanted).await {
+            Ok(()) => return, // command channel closed: device removed
+            Err(e) => e,
+        };
+        {
+            let mut s = state.lock().unwrap();
+            s.online = false;
+            s.recording = None;
+            s.status = format!("Reconnecting in {backoff}s: {err:#}");
+        }
+        frames.send_replace(None);
+        log::warn!("{}: {err:#}", cfg.name);
+        // Keep commands flowing while offline so the UI's wishes apply on reconnect.
+        let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                cmd = rx.recv() => match cmd {
+                    None => return,
+                    Some(Cmd::Live(k)) => { wanted.live = k; state.lock().unwrap().live = k; }
+                    Some(Cmd::Record(r)) => wanted.record = r,
+                    Some(_) => {}
+                },
+            }
+        }
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+fn camera_opts(cfg: &DeviceConfig) -> Result<BcCameraOpt> {
+    let host = cfg.host.trim();
+    let uid = cfg.uid.trim();
+    let addrs: Vec<IpAddr> = if host.is_empty() {
+        vec![]
+    } else if let Ok(ip) = host.parse() {
+        vec![ip]
+    } else {
+        use std::net::ToSocketAddrs;
+        (host, 0).to_socket_addrs().with_context(|| format!("resolve {host}"))?.map(|a| a.ip()).collect()
+    };
+    anyhow::ensure!(!addrs.is_empty() || !uid.is_empty(), "need an IP/host or a UID");
+    Ok(BcCameraOpt {
+        name: cfg.name.clone(),
+        channel_id: cfg.channel,
+        addrs,
+        uid: (!uid.is_empty()).then(|| uid.to_string()),
+        port: cfg.port,
+        protocol: ConnectionProtocol::TcpUdp,
+        // Same reach as the official client: LAN first, then Reolink's P2P relay for UID devices.
+        discovery: if uid.is_empty() { DiscoveryMethods::Local } else { DiscoveryMethods::Relay },
+        max_discovery_retries: 10,
+        credentials: Credentials {
+            username: cfg.username.clone(),
+            password: (!cfg.password.is_empty()).then(|| cfg.password.clone()),
+        },
+        debug: false,
+    })
+}
+
+struct Live {
+    stream: StreamData,
+    decoder: Option<Decoder>,
+    recorder: Option<Recorder>,
+    /// Recorder starts on the next video frame, once the codec is known.
+    record: bool,
+}
+
+async fn next_media(live: &mut Option<Live>) -> Result<Result<BcMedia, neolink_core::Error>, neolink_core::Error> {
+    match live {
+        Some(l) => l.stream.get_data().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn session(
+    cfg: &DeviceConfig,
+    rx: &mut UnboundedReceiver<Cmd>,
+    state: &Arc<Mutex<State>>,
+    frames: &watch::Sender<Frame>,
+    wanted: &mut Wanted,
+) -> Result<()> {
+    let set = |f: &dyn Fn(&mut State)| f(&mut state.lock().unwrap());
+    set(&|s| s.status = "Connecting".into());
+    let cam = BcCamera::new(&camera_opts(cfg)?).await.context("connect")?;
+    set(&|s| s.status = "Logging in".into());
+    cam.login().await.context("login")?;
+
+    let battery = cam.battery_info().await.ok();
+    set(&|s| {
+        s.online = true;
+        s.status = "Online".into();
+        s.battery = battery.as_ref().map(|b| b.battery_percent);
+        s.charging = battery.as_ref().is_some_and(|b| b.charge_status == "charging");
+    });
+
+    let mut live: Option<Live> = None;
+    let mut ping = tokio::time::interval(Duration::from_secs(5));
+    let mut battery_poll = tokio::time::interval(Duration::from_secs(60));
+    // Resume what was on screen (and recording) before a drop.
+    let mut pending = vec![Cmd::Live(wanted.live)];
+
+    loop {
+        let cmd = if let Some(c) = pending.pop().map(Some) {
+            c
+        } else {
+            tokio::select! {
+                c = rx.recv() => match c { None => return Ok(()), c => c },
+                _ = ping.tick() => { cam.ping().await.context("ping")?; None }
+                _ = battery_poll.tick(), if battery.is_some() => {
+                    if let Ok(b) = cam.battery_info().await {
+                        set(&|s| { s.battery = Some(b.battery_percent); s.charging = b.charge_status == "charging"; });
+                    }
+                    None
+                }
+                m = next_media(&mut live) => {
+                    let media = m.context("stream")?.context("stream data")?;
+                    on_media(live.as_mut().expect("live set"), media, &cfg.name, state, frames);
+                    None
+                }
+            }
+        };
+        let Some(cmd) = cmd else { continue };
+        match cmd {
+            Cmd::Live(kind) => {
+                wanted.live = kind;
+                live = None; // dropping StreamData sends the stop to the camera
+                if let Some(k) = kind {
+                    let stream = cam.start_video(k, 0, false).await.context("start live")?;
+                    live = Some(Live { stream, decoder: None, recorder: None, record: wanted.record });
+                }
+                if kind.is_none() {
+                    frames.send_replace(None);
+                }
+                set(&|s| {
+                    s.live = kind;
+                    if kind.is_none() {
+                        s.recording = None;
+                    }
+                });
+            }
+            Cmd::Record(on) => {
+                wanted.record = on;
+                let Some(l) = live.as_mut() else {
+                    set(&|s| s.message = Some("Start live view before recording".into()));
+                    wanted.record = false;
+                    continue;
+                };
+                l.record = on;
+                if !on {
+                    l.recorder = None;
+                    set(&|s| s.recording = None);
+                }
+            }
+            Cmd::Ptz(dir) => {
+                if let Err(e) = cam.send_ptz(dir, 32.0).await {
+                    set(&|s| s.message = Some(format!("PTZ: {e}")));
+                }
+            }
+            Cmd::Snapshot => {
+                let res = async {
+                    let jpg = cam.get_snapshot().await?;
+                    let dir = media_dir();
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join(format!("{}_{}.jpg", safe_name(&cfg.name), stamp()));
+                    std::fs::write(&path, jpg)?;
+                    anyhow::Ok(path)
+                }
+                .await;
+                let msg = match res {
+                    Ok(p) => format!("Snapshot saved: {}", p.display()),
+                    Err(e) => format!("Snapshot failed: {e:#}"),
+                };
+                set(&|s| s.message = Some(msg.clone()));
+            }
+        }
+    }
+}
+
+fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State>>, frames: &watch::Sender<Frame>) {
+    let (codec, data, key) = match media {
+        BcMedia::Iframe(f) => (f.video_type, f.data, true),
+        BcMedia::Pframe(f) => (f.video_type, f.data, false),
+        _ => return, // shortcut: live audio playback not implemented yet (phase 2)
+    };
+
+    if live.record && live.recorder.is_none() {
+        let dir = media_dir();
+        let path = dir.join(format!("{}_{}.mp4", safe_name(name), stamp()));
+        let res = std::fs::create_dir_all(&dir).and_then(|_| Recorder::new(codec, &path));
+        let mut s = state.lock().unwrap();
+        match res {
+            Ok(r) => {
+                s.recording = Some(r.path.clone());
+                live.recorder = Some(r);
+            }
+            Err(e) => {
+                live.record = false;
+                s.message = Some(format!("Recording failed (is ffmpeg installed?): {e}"));
+            }
+        }
+    }
+    if let Some(r) = live.recorder.as_mut() {
+        r.push(&data, key);
+    }
+
+    let stale = live.decoder.as_ref().is_some_and(|d| std::mem::discriminant(&d.codec) != std::mem::discriminant(&codec));
+    if stale {
+        live.decoder = None;
+    }
+    if live.decoder.is_none() {
+        if !key {
+            return;
+        }
+        let tx = frames.clone();
+        let on_frame = move |jpeg: Vec<u8>| {
+            tx.send_replace(Some(Arc::new(jpeg)));
+        };
+        match Decoder::new(codec, on_frame) {
+            Ok(d) => live.decoder = Some(d),
+            Err(e) => {
+                state.lock().unwrap().message = Some(format!("Decoder failed (is ffmpeg installed?): {e}"));
+                return;
+            }
+        }
+    }
+    live.decoder.as_mut().unwrap().push(data, key);
+}

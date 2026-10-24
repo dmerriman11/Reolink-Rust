@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reolink-rs</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Reolink<em>rs</em></span>
+    </div>
+    <div class="section-head">
+      <h2>Devices</h2>
+      <button class="icon-btn" id="add-device" title="Add device" aria-label="Add device">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+    <ul class="device-list" id="device-list"></ul>
+    <p class="empty-hint" id="empty-hint" hidden>No devices yet. Add a camera by IP or UID.</p>
+  </aside>
+
+  <main class="stage">
+    <header class="topbar">
+      <div class="layouts" role="radiogroup" aria-label="Layout" id="layouts"></div>
+      <div class="topbar-right">
+        <button class="ghost-btn" id="media-folder">
+          <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Media
+        </button>
+      </div>
+    </header>
+    <section class="grid" id="grid"></section>
+  </main>
+
+  <aside class="ptz" id="ptz">
+    <button class="ptz-toggle" id="ptz-toggle" aria-label="Toggle PTZ panel" aria-expanded="true">
+      <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+    </button>
+    <div class="ptz-body">
+      <h2>PTZ</h2>
+      <p class="ptz-target" id="ptz-target">Select a live tile</p>
+      <div class="dpad" id="dpad">
+        <button data-dir="up" class="d-up" aria-label="Tilt up"><svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg></button>
+        <button data-dir="left" class="d-left" aria-label="Pan left"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+        <span class="d-hub" aria-hidden="true"></span>
+        <button data-dir="right" class="d-right" aria-label="Pan right"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+        <button data-dir="down" class="d-down" aria-label="Tilt down"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+      </div>
+      <p class="ptz-hint">Press and hold to move.</p>
+    </div>
+  </aside>
+
+  <dialog id="device-dialog">
+    <form method="dialog" id="device-form">
+      <h3 id="dialog-title">Add device</h3>
+      <label>Name<input name="name" required autocomplete="off"></label>
+      <div class="row">
+        <label>IP / Host<input name="host" autocomplete="off" placeholder="192.168.1.10"></label>
+        <label class="narrow">Port<input name="port" inputmode="numeric" placeholder="9000"></label>
+      </div>
+      <label>UID<input name="uid" autocomplete="off" placeholder="Needed for battery & remote cameras"></label>
+      <div class="row">
+        <label>Username<input name="username" autocomplete="off" value="admin"></label>
+        <label>Password<input name="password" type="password" autocomplete="new-password"></label>
+      </div>
+      <label class="narrow">Channel<input name="channel" type="number" min="0" max="63" value="0"></label>
+      <p class="form-error" id="form-error" role="alert"></p>
+      <div class="actions">
+        <button type="button" class="ghost-btn" id="dialog-cancel">Cancel</button>
+        <button type="submit" class="primary-btn">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
