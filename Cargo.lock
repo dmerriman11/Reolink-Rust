@@ -2780,6 +2780,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "get_if_addrs",
  "log",
  "neolink_core",
  "serde",

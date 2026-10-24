@@ -2,6 +2,7 @@
 
 mod device;
 mod media;
+mod scan;
 mod stream;
 
 use device::{Cmd, Device, DeviceConfig};
@@ -285,6 +286,28 @@ fn record(app: State<App>, id: u64, on: bool) -> Result<(), String> {
     send(&app, id, Cmd::Record(on))
 }
 
+#[derive(Serialize)]
+struct FoundDto {
+    #[serde(flatten)]
+    found: scan::Found,
+    /// Already in the device list (matched by UID or IP).
+    added: bool,
+}
+
+#[tauri::command]
+async fn scan_lan(app: State<'_, App>) -> Result<Vec<FoundDto>, String> {
+    let found = app.rt.spawn(scan::scan(std::time::Duration::from_secs(3))).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let inner = app.inner.lock().unwrap();
+    Ok(found
+        .into_iter()
+        .map(|f| {
+            let ip = f.ip.to_string();
+            let added = inner.devices.iter().any(|d| d.config.uid.eq_ignore_ascii_case(&f.uid) || d.config.host == ip);
+            FoundDto { found: f, added }
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn open_media_folder() {
     let dir = device::media_dir();
@@ -322,7 +345,7 @@ fn main() {
         .manage(app)
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile,
-            set_clear, ptz, snapshot, record, open_media_folder
+            set_clear, ptz, snapshot, record, open_media_folder, scan_lan
         ])
         .run(tauri::generate_context!())
         .expect("run tauri app");

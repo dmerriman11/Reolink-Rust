@@ -20,6 +20,15 @@
     </div>
     <ul class="device-list" id="device-list"></ul>
     <p class="empty-hint" id="empty-hint" hidden>No devices yet. Add a camera by IP or UID.</p>
+    <section class="nearby" id="nearby" hidden>
+      <div class="section-head">
+        <h2>Found nearby</h2>
+        <button class="icon-btn" id="rescan" title="Scan network again" aria-label="Scan network again">
+          <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></svg>
+        </button>
+      </div>
+      <ul class="nearby-list" id="nearby-list"></ul>
+    </section>
   </aside>
 
   <main class="stage">

@@ -238,9 +238,40 @@ function setupPtz() {
   }
 }
 
+// ---------- LAN discovery ----------
+let scanning = false;
+async function scanLan() {
+  if (scanning) return;
+  scanning = true;
+  $("#rescan").classList.add("spinning");
+  try {
+    const found = (await invoke("scan_lan")).filter((f) => !f.added);
+    $("#nearby").hidden = found.length === 0;
+    $("#nearby-list").replaceChildren(...found.map((f) => {
+      const li = el("li", "nearby-item");
+      li.tabIndex = 0;
+      li.title = "Add this camera";
+      li.append(
+        Object.assign(el("span", "nearby-ip"), { textContent: f.ip + (f.battery != null ? `  ·  ${f.battery}%` : "") }),
+        Object.assign(el("span", "nearby-add"), { textContent: "Add" }),
+        Object.assign(el("span", "nearby-uid"), { textContent: f.uid }),
+      );
+      const add = () => openDialog(null, { name: `Camera ${f.ip.split(".").pop()}`, host: f.ip, uid: f.uid });
+      li.onclick = add;
+      li.onkeydown = (e) => { if (e.key === "Enter") add(); };
+      return li;
+    }));
+  } catch (e) {
+    console.warn("LAN scan failed", e);
+  } finally {
+    scanning = false;
+    $("#rescan").classList.remove("spinning");
+  }
+}
+
 // ---------- add / edit dialog ----------
 let editing = null;
-async function openDialog(id = null) {
+async function openDialog(id = null, prefill = null) {
   editing = id;
   const form = $("#device-form");
   form.reset();
@@ -252,8 +283,9 @@ async function openDialog(id = null) {
     for (const k of ["name", "host", "uid", "username", "channel"]) form[k].value = cfg[k] ?? "";
     form.port.value = cfg.port ?? "";
   }
+  if (prefill) for (const [k, v] of Object.entries(prefill)) form[k].value = v;
   $("#device-dialog").showModal();
-  form.name.focus();
+  (prefill ? form.password : form.name).focus();
 }
 
 function setupDialog() {
@@ -276,6 +308,7 @@ function setupDialog() {
       await invoke("save_device", { id: editing, config });
       $("#device-dialog").close();
       refresh();
+      scanLan(); // drop the newly added camera from "Found nearby"
     } catch (err) {
       $("#form-error").textContent = String(err);
     }
@@ -308,6 +341,9 @@ setupPtz();
 setupDialog();
 refresh();
 setInterval(refresh, 800);
+$("#rescan").onclick = scanLan;
+scanLan();
+setInterval(scanLan, 120_000);
 
 // ---------- demo data when opened outside Tauri (design preview only) ----------
 function demoInvoke(cmd, args) {
@@ -320,6 +356,7 @@ function demoInvoke(cmd, args) {
     ],
     layout: 2, tiles: [1, 2, null, null, ...Array(12).fill(null)], stream_base: "", token: "",
   };
+  if (cmd === "scan_lan") return Promise.resolve([{ uid: "9527000J3E0S1HZE", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;
   return Promise.resolve(cmd === "get_state" ? structuredClone(demo) : null);
