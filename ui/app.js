@@ -21,7 +21,7 @@ const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html) e.innerHTML = html; return e; };
 
 let state = { devices: [], layout: 4, tiles: [], stream_base: "", token: "" };
-let selected = 0;
+let selected = null; // tile index, or null when no tile is highlighted
 let solo = null;
 let ptzActive = null;
 const tiles = [];
@@ -115,8 +115,7 @@ function renderDevices() {
     li.append(menu);
     const show = () => {
       const free = state.tiles.slice(0, state.layout).findIndex((t) => t == null);
-      const tile = free >= 0 ? free : selected;
-      selected = tile;
+      const tile = free >= 0 ? free : (selected ?? 0);
       call("assign_tile", { tile, id: d.id }).then(refresh);
     };
     li.onclick = show;
@@ -249,6 +248,8 @@ function setupView() {
     toggle.title = collapsed ? "Show device panel" : "Hide device panel";
   };
   try { apply(localStorage.getItem("sidebarCollapsed") === "1"); } catch { /* storage unavailable */ }
+  // Clicking anywhere in the device panel (device rows included) drops the tile highlight.
+  $(".sidebar").addEventListener("click", () => { selected = null; renderTiles(); renderPtz(); });
   toggle.onclick = () => {
     const collapsed = !document.body.classList.contains("sidebar-collapsed");
     apply(collapsed);

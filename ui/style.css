@@ -155,7 +155,7 @@ h2 { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .14em; text-tra
   transition: border-color .2s, box-shadow .2s;
 }
 .tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 0 32px rgba(244, 177, 62, .08); }
-.tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; visibility: hidden; }
+.tile img { position: absolute; inset: 3px; width: calc(100% - 6px); height: calc(100% - 6px); /* clear of the 2px motion ring */ object-fit: contain; visibility: hidden; }
 .tile img.ok { visibility: visible; }
 .tile-empty {
   position: absolute; inset: 0; display: grid; place-items: center; align-content: center; gap: 8px;
