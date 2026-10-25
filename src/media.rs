@@ -168,6 +168,59 @@ fn read_mpjpeg(r: &mut impl std::io::BufRead) -> Option<Vec<u8>> {
     Some(jpeg)
 }
 
+/// One encoded video frame (an Annex-B access unit) for tiles that decode in the WebView with WebCodecs.
+pub struct Raw {
+    pub hevc: bool,
+    pub key: bool,
+    pub data: Vec<u8>,
+}
+
+/// Frames a WebCodecs viewer falls this far behind on are dropped; it resyncs on the next keyframe.
+const RAW_QUEUE: usize = 64;
+/// Longest group of pictures kept for new viewers; beyond this, caching waits for the next keyframe.
+const GOP_MAX: usize = 600;
+
+/// A camera's encoded frames for any number of WebCodecs viewers.
+pub struct RawFeed {
+    tx: tokio::sync::broadcast::Sender<std::sync::Arc<Raw>>,
+    /// Frames since the last keyframe, so a new viewer shows a picture at once instead of at the next keyframe.
+    gop: std::sync::Mutex<Vec<std::sync::Arc<Raw>>>,
+}
+
+impl Default for RawFeed {
+    fn default() -> Self {
+        Self { tx: tokio::sync::broadcast::channel(RAW_QUEUE).0, gop: Default::default() }
+    }
+}
+
+impl RawFeed {
+    pub fn push(&self, frame: Raw) {
+        let frame = std::sync::Arc::new(frame);
+        let mut gop = self.gop.lock().unwrap();
+        if frame.key {
+            gop.clear();
+        }
+        if (frame.key || !gop.is_empty()) && gop.len() < GOP_MAX {
+            gop.push(frame.clone());
+        } else {
+            gop.clear();
+        }
+        // Sent under the lock, so a viewer joining in `subscribe` gets each frame exactly once.
+        let _ = self.tx.send(frame);
+    }
+
+    /// The stream stopped: new viewers mustn't start from a stale picture.
+    pub fn clear(&self) {
+        self.gop.lock().unwrap().clear();
+    }
+
+    /// The current group of pictures, and every frame after it.
+    pub fn subscribe(&self) -> (Vec<std::sync::Arc<Raw>>, tokio::sync::broadcast::Receiver<std::sync::Arc<Raw>>) {
+        let gop = self.gop.lock().unwrap();
+        (gop.clone(), self.tx.subscribe())
+    }
+}
+
 pub struct Recorder {
     pub path: PathBuf,
     child: Option<Child>,
@@ -267,6 +320,24 @@ mod tests {
         assert!(gone, "push kept succeeding after ffmpeg exited");
         drop(rec);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn raw_viewers_start_at_the_last_keyframe() {
+        let feed = RawFeed::default();
+        let f = |key, n: u8| Raw { hevc: true, key, data: vec![n] };
+        feed.push(f(false, 0)); // before any keyframe: nothing to start from
+        assert!(feed.subscribe().0.is_empty());
+        feed.push(f(true, 1));
+        feed.push(f(false, 2));
+        feed.push(f(true, 3));
+        feed.push(f(false, 4));
+        let (gop, mut rx) = feed.subscribe();
+        assert_eq!(gop.iter().map(|r| r.data[0]).collect::<Vec<_>>(), [3, 4]);
+        feed.push(f(false, 5));
+        assert_eq!(rx.try_recv().unwrap().data, [5], "live frames follow the cached ones without a gap");
+        feed.clear();
+        assert!(feed.subscribe().0.is_empty());
     }
 
     #[test]

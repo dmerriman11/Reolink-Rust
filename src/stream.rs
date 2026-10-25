@@ -1,14 +1,24 @@
-//! Localhost MJPEG server feeding the WebView's <img> tags: GET /live/<device id>?t=<token>.
-//! Bound to 127.0.0.1 with a per-run random token so other local users/pages can't watch the cameras.
+//! Localhost server for the live view, bound to 127.0.0.1 with a per-run random token so other local users/pages
+//! can't watch the cameras:
+//! - GET /live/<device id>?t=<token>: MJPEG for <img> tiles (decoded by ffmpeg).
+//! - GET /raw/<device id>?t=<token>: the camera's own H.264/H.265 for tiles that decode with WebCodecs. Each frame is
+//!   a 1-byte flag (bit 0 keyframe, bit 1 H.265), a 4-byte big-endian length and an Annex-B access unit.
 
-use crate::device::Frame;
+use crate::device::Views;
+use crate::media::Raw;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::broadcast::{self, error::RecvError};
 
-pub type Feeds = Arc<Mutex<HashMap<u64, watch::Receiver<Frame>>>>;
+pub type Feeds = Arc<Mutex<HashMap<u64, Arc<Views>>>>;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Route {
+    Mjpeg(u64),
+    Raw(u64),
+}
 
 pub fn token() -> String {
     use std::hash::{BuildHasher, Hasher};
@@ -35,12 +45,16 @@ pub async fn serve(feeds: Feeds, token: String) -> std::io::Result<u16> {
     Ok(port)
 }
 
-/// Parses "GET /live/<id>?t=<token> HTTP/1.1" and returns the id if the token matches.
-fn route(request: &str, token: &str) -> Option<u64> {
+/// Parses "GET /live/<id>?t=<token> HTTP/1.1" (or /raw/) and returns the route if the token matches.
+fn route(request: &str, token: &str) -> Option<Route> {
     let path = request.lines().next()?.strip_prefix("GET ")?.split(' ').next()?;
     let (path, query) = path.split_once('?')?;
-    let id = path.strip_prefix("/live/")?.parse().ok()?;
-    query.split('&').any(|kv| kv == format!("t={token}")).then_some(id)
+    let route = match path.strip_prefix('/')?.split_once('/')? {
+        ("live", id) => Route::Mjpeg(id.parse().ok()?),
+        ("raw", id) => Route::Raw(id.parse().ok()?),
+        _ => return None,
+    };
+    query.split('&').any(|kv| kv == format!("t={token}")).then_some(route)
 }
 
 async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Result<()> {
@@ -57,10 +71,21 @@ async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Resu
         n += r;
     }
     let req = String::from_utf8_lossy(&buf[..n]);
-    let rx = route(&req, token).and_then(|id| feeds.lock().unwrap().get(&id).cloned());
-    let Some(mut rx) = rx else {
+    let found = route(&req, token).and_then(|r| {
+        let (Route::Mjpeg(id) | Route::Raw(id)) = r;
+        feeds.lock().unwrap().get(&id).cloned().map(|v| (r, v))
+    });
+    let Some((route, views)) = found else {
         return sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
     };
+    // Hold the receivers only: the device owns the feed, so removing it ends the response.
+    if let Route::Raw(_) = route {
+        let (gop, rx) = views.raw.subscribe();
+        drop(views);
+        return raw(sock, gop, rx).await;
+    }
+    let mut rx = views.jpeg.subscribe();
+    drop(views);
     sock.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\
           Cache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -80,14 +105,50 @@ async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Resu
     }
 }
 
+async fn write_raw(sock: &mut TcpStream, f: &Raw) -> std::io::Result<()> {
+    let mut head = [f.key as u8 | (f.hevc as u8) << 1, 0, 0, 0, 0];
+    head[1..].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
+    sock.write_all(&head).await?;
+    sock.write_all(&f.data).await
+}
+
+async fn raw(mut sock: TcpStream, gop: Vec<Arc<Raw>>, mut rx: broadcast::Receiver<Arc<Raw>>) -> std::io::Result<()> {
+    sock.set_nodelay(true)?;
+    // Fetched cross-origin from the app's page (a plain GET, so no preflight); the token is what guards it.
+    sock.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\
+          Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+    )
+    .await?;
+    for f in &gop {
+        write_raw(&mut sock, f).await?;
+    }
+    let mut resync = false; // fell behind: skip to the next keyframe so the decoder never sees a gap
+    loop {
+        match rx.recv().await {
+            Ok(f) => {
+                resync &= !f.key;
+                if !resync {
+                    write_raw(&mut sock, &f).await?;
+                }
+            }
+            Err(RecvError::Lagged(_)) => resync = true,
+            Err(RecvError::Closed) => return Ok(()), // device removed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::route;
+    use super::{Route, route};
 
     #[test]
     fn routes_only_with_token() {
-        assert_eq!(route("GET /live/7?t=abc HTTP/1.1\r\n", "abc"), Some(7));
-        assert_eq!(route("GET /live/7?x=1&t=abc HTTP/1.1\r\n", "abc"), Some(7));
+        assert_eq!(route("GET /live/7?t=abc HTTP/1.1\r\n", "abc"), Some(Route::Mjpeg(7)));
+        assert_eq!(route("GET /live/7?x=1&t=abc HTTP/1.1\r\n", "abc"), Some(Route::Mjpeg(7)));
+        assert_eq!(route("GET /raw/7?t=abc HTTP/1.1\r\n", "abc"), Some(Route::Raw(7)));
+        assert_eq!(route("GET /raw/7?t=nope HTTP/1.1\r\n", "abc"), None);
+        assert_eq!(route("GET /other/7?t=abc HTTP/1.1\r\n", "abc"), None);
         assert_eq!(route("GET /live/7?t=abcd HTTP/1.1\r\n", "abc"), None);
         assert_eq!(route("GET /live/7 HTTP/1.1\r\n", "abc"), None);
         assert_eq!(route("POST /live/7?t=abc HTTP/1.1\r\n", "abc"), None);

@@ -96,7 +96,7 @@ impl App {
     fn spawn(&self, inner: &mut Inner, cfg: DeviceConfig) -> u64 {
         inner.next_id += 1;
         let dev = Device::spawn(self.rt.handle(), inner.next_id, cfg);
-        self.feeds.lock().unwrap().insert(dev.id, dev.frames.clone());
+        self.feeds.lock().unwrap().insert(dev.id, dev.views.clone());
         inner.devices.push(dev);
         inner.next_id
     }
@@ -180,6 +180,8 @@ struct StateDto {
     stream_base: String,
     token: String,
     recording_paused: bool,
+    /// Tiles may decode with WebCodecs; WebKitGTK's support is too patchy, so Linux keeps MJPEG.
+    webcodecs: bool,
 }
 
 #[tauri::command]
@@ -216,6 +218,7 @@ fn get_state(app: State<App>) -> StateDto {
         stream_base: format!("http://127.0.0.1:{}", app.port),
         token: app.token.clone(),
         recording_paused: device::RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed),
+        webcodecs: !cfg!(target_os = "linux"),
     }
 }
 
@@ -228,7 +231,8 @@ fn device_config(app: State<App>, id: u64) -> Result<DeviceConfig, String> {
     Ok(cfg)
 }
 
-#[tauri::command]
+// (async): off the main thread, which also runs the window; disk writes and child processes there stutter it.
+#[tauri::command(async)]
 fn save_device(app: State<App>, id: Option<u64>, mut config: DeviceConfig) -> Result<(), String> {
     config.name = config.name.trim().to_string();
     config.host = config.host.trim().to_string();
@@ -267,7 +271,7 @@ fn save_device(app: State<App>, id: Option<u64>, mut config: DeviceConfig) -> Re
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_device(app: State<App>, id: u64) -> Result<(), String> {
     let mut inner = app.inner.lock().unwrap();
     let i = inner.index(id)?;
@@ -285,7 +289,7 @@ fn remove_device(app: State<App>, id: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_layout(app: State<App>, layout: usize) -> Result<(), String> {
     if !LAYOUTS.contains(&layout) {
         return Err("unsupported layout".into());
@@ -298,7 +302,7 @@ fn set_layout(app: State<App>, layout: usize) -> Result<(), String> {
 }
 
 /// Show a device in a tile (moving it if it's already shown elsewhere), or clear the tile with id = None.
-#[tauri::command]
+#[tauri::command(async)]
 fn assign_tile(app: State<App>, tile: usize, id: Option<u64>) -> Result<(), String> {
     let mut inner = app.inner.lock().unwrap();
     if tile >= MAX_TILES {
@@ -337,7 +341,7 @@ fn set_view_sizes(app: State<App>, sizes: Vec<(u64, u32, u32)>) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clear(app: State<App>, id: u64, clear: bool) -> Result<(), String> {
     let mut inner = app.inner.lock().unwrap();
     inner.index(id)?;
@@ -562,7 +566,7 @@ fn get_prefs() -> prefs::Prefs {
     prefs::get()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_prefs(app: State<App>, prefs: prefs::Prefs) -> Result<prefs::Prefs, String> {
     prefs.validate()?;
     if prefs.run_at_startup != prefs::get().run_at_startup {
@@ -611,7 +615,7 @@ fn reveal(path: &Path, select: bool) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_media_folder() {
     let dir = prefs::get().record_dir;
     let _ = std::fs::create_dir_all(&dir);
@@ -625,7 +629,7 @@ fn set_live_paused(app: State<App>, paused: bool) {
     inner.sync_live();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
     let dir = prefs::get().record_dir;
     // The folder is a setting, so the player's file access follows it.
@@ -637,7 +641,7 @@ fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
     recordings::list(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_recording(name: String) -> Result<(), String> {
     let dir = prefs::get().record_dir;
     let path = recordings::resolve(&dir, &name)?;
@@ -653,7 +657,7 @@ async fn recording_thumb(name: String) -> Result<String, String> {
     recordings::thumb(&src, &dir).await.map(|p| p.display().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_recording(name: String) -> Result<(), String> {
     let path = recordings::resolve(&prefs::get().record_dir, &name)?;
     reveal(&path, true);

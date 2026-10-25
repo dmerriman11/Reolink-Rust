@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let dev = Device::spawn(rt.handle(), 1, cfg);
-    let mut frames = dev.frames.clone();
+    let mut frames = dev.views.jpeg.subscribe();
     dev.send(Cmd::Live(Some(kind)));
 
     // Wait for the first decoded frame.

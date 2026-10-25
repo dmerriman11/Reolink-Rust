@@ -1,6 +1,6 @@
 [package]
 name = "reolink-rs"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -35,3 +35,9 @@ members = [".", "neolink_core"]
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
+
+[profile.release]
+# Smaller, slightly faster binary; release builds are slower to link.
+lto = true
+codegen-units = 1
+strip = true

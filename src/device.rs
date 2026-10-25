@@ -4,7 +4,8 @@
 //! with pings for as long as the app runs, and any drop (battery camera or not) reconnects
 //! automatically and resumes the live view that was showing.
 
-use crate::media::{Decoder, Recorder};
+use crate::media::{Decoder, Raw, Recorder};
+use neolink_core::bcmedia::model::VideoType;
 use anyhow::{Context as _, Result};
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, Direction, MotionData,
@@ -24,6 +25,20 @@ pub static RECORDING_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::
 
 /// Latest decoded JPEG for the live view; None when not streaming.
 pub type Frame = Option<Arc<Vec<u8>>>;
+
+/// Where a camera's live view goes: JPEGs for MJPEG <img> tiles, encoded frames for WebCodecs tiles.
+#[derive(Default)]
+pub struct Views {
+    pub jpeg: watch::Sender<Frame>,
+    pub raw: crate::media::RawFeed,
+}
+
+impl Views {
+    fn stop(&self) {
+        self.jpeg.send_replace(None);
+        self.raw.clear();
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DeviceConfig {
@@ -79,7 +94,7 @@ pub struct Device {
     /// Runtime-only id; stable while the app runs, unlike the list index.
     pub id: u64,
     pub config: DeviceConfig,
-    pub frames: watch::Receiver<Frame>,
+    pub views: Arc<Views>,
     /// Settings messages this camera refused to write; see settings::Camera::writable.
     pub read_only: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub state: Arc<Mutex<State>>,
@@ -91,9 +106,9 @@ impl Device {
     pub fn spawn(rt: &tokio::runtime::Handle, id: u64, config: DeviceConfig) -> Self {
         let state = Arc::new(Mutex::new(State { status: "Connecting".into(), ..Default::default() }));
         let (tx, rx) = unbounded_channel();
-        let (frame_tx, frames) = watch::channel(None);
-        let task = rt.spawn(run(config.clone(), rx, state.clone(), frame_tx));
-        Self { id, config, frames, read_only: Default::default(), state, tx, task }
+        let views = Arc::new(Views::default());
+        let task = rt.spawn(run(config.clone(), rx, state.clone(), views.clone()));
+        Self { id, config, views, read_only: Default::default(), state, tx, task }
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -152,11 +167,11 @@ struct Wanted {
     jpeg_box: (u32, u32),
 }
 
-async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex<State>>, frames: watch::Sender<Frame>) {
+async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex<State>>, views: Arc<Views>) {
     let mut wanted = Wanted { live: None, record: false, jpeg_box: crate::media::DEFAULT_BOX };
     let mut backoff = 1;
     loop {
-        let err = match session(&cfg, &mut rx, &state, &frames, &mut wanted).await {
+        let err = match session(&cfg, &mut rx, &state, &views, &mut wanted).await {
             Ok(()) => return, // command channel closed: device removed
             Err(e) => e,
         };
@@ -166,7 +181,7 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
             s.recording = None;
             s.status = format!("Reconnecting in {backoff}s: {err:#}");
         }
-        frames.send_replace(None);
+        views.stop();
         log::warn!("{}: {err:#}", cfg.name);
         // Keep commands flowing while offline so the UI's wishes apply on reconnect.
         let sleep = tokio::time::sleep(Duration::from_secs(backoff));
@@ -259,7 +274,7 @@ async fn draining<T>(
     live: &mut Option<Live>,
     name: &str,
     state: &Arc<Mutex<State>>,
-    frames: &watch::Sender<Frame>,
+    views: &Views,
 ) -> Result<T> {
     tokio::pin!(fut);
     loop {
@@ -267,7 +282,7 @@ async fn draining<T>(
             r = &mut fut => return Ok(r),
             m = next_media(live) => {
                 let media = m.context("stream")?.context("stream data")?;
-                on_media(live.as_mut().expect("live set"), media, name, state, frames);
+                on_media(live.as_mut().expect("live set"), media, name, state, views);
             }
         }
     }
@@ -295,7 +310,7 @@ async fn session(
     cfg: &DeviceConfig,
     rx: &mut UnboundedReceiver<Cmd>,
     state: &Arc<Mutex<State>>,
-    frames: &watch::Sender<Frame>,
+    views: &Views,
     wanted: &mut Wanted,
 ) -> Result<()> {
     let set = |f: &dyn Fn(&mut State)| f(&mut state.lock().unwrap());
@@ -340,12 +355,12 @@ async fn session(
             tokio::select! {
                 c = rx.recv() => match c { None => return Ok(()), c => c },
                 _ = ping.tick() => {
-                    let r = tokio::time::timeout(PING_TIMEOUT, draining(cam.ping(), &mut live, &cfg.name, state, frames)).await;
+                    let r = tokio::time::timeout(PING_TIMEOUT, draining(cam.ping(), &mut live, &cfg.name, state, views)).await;
                     r.context("ping: no answer")??.context("ping")?;
                     None
                 }
                 _ = battery_poll.tick(), if battery.is_some() => {
-                    if let Ok(b) = draining(cam.battery_info(), &mut live, &cfg.name, state, frames).await? {
+                    if let Ok(b) = draining(cam.battery_info(), &mut live, &cfg.name, state, views).await? {
                         set(&|s| { s.battery = Some(b.battery_percent); s.charging = b.charge_status == "charging"; });
                     }
                     None
@@ -357,7 +372,7 @@ async fn session(
                     None
                 }
                 _ = wifi_poll.tick(), if wifi_supported => {
-                    match draining(cam.wifi_signal(), &mut live, &cfg.name, state, frames).await? {
+                    match draining(cam.wifi_signal(), &mut live, &cfg.name, state, views).await? {
                         // Not measured yet right after connecting: try again shortly instead of showing it.
                         Ok(Some(d)) if !real_rssi(d) => wifi_poll.reset_after(Duration::from_secs(5)),
                         Ok(dbm) => set(&|s| s.wifi_dbm = dbm),
@@ -396,7 +411,7 @@ async fn session(
                 }
                 m = next_media(&mut live) => {
                     let media = m.context("stream")?.context("stream data")?;
-                    on_media(live.as_mut().expect("live set"), media, &cfg.name, state, frames);
+                    on_media(live.as_mut().expect("live set"), media, &cfg.name, state, views);
                     None
                 }
             }
@@ -413,7 +428,11 @@ async fn session(
                     if kind.is_none() && live.is_some() {
                         log::info!("{}: live stopped", cfg.name);
                     }
-                    live = None; // dropping StreamData sends the stop to the camera
+                    // Wait for the camera to confirm the stop: dropping StreamData stops it in the background, and on an
+                    // Argus a stop still in flight left the stream started next sending nothing (main, sub, main in 1 s).
+                    if let Some(mut old) = live.take() {
+                        let _ = old.stream.shutdown().await;
+                    }
                     if let Some(k) = want {
                         log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
                         let stream = cam.start_video(k, 0, false).await.context("start live")?;
@@ -427,7 +446,7 @@ async fn session(
                     }
                 }
                 if kind.is_none() {
-                    frames.send_replace(None);
+                    views.stop();
                 }
                 set(&|s| {
                     s.live = live.as_ref().filter(|l| l.show).map(|l| l.kind);
@@ -442,6 +461,7 @@ async fn session(
                     continue;
                 }
                 wanted.record = on;
+                log::info!("{}: record {}", cfg.name, if on { "on" } else { "off" });
                 let Some(l) = live.as_mut() else {
                     set(&|s| s.message = Some("Start live view before recording".into()));
                     wanted.record = false;
@@ -473,7 +493,7 @@ async fn session(
                 }
             }
             Cmd::Ptz(dir) => {
-                if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, frames).await? {
+                if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, views).await? {
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
             }
@@ -497,11 +517,11 @@ async fn session(
                 });
             }
             Cmd::Reboot(reply) => {
-                let res = draining(cam.reboot(), &mut live, &cfg.name, state, frames).await?.map_err(|e| e.to_string());
+                let res = draining(cam.reboot(), &mut live, &cfg.name, state, views).await?.map_err(|e| e.to_string());
                 let _ = reply.send(res);
             }
             Cmd::Snapshot => {
-                let res = draining(cam.get_snapshot(), &mut live, &cfg.name, state, frames).await?.map_err(anyhow::Error::from).and_then(|jpg| {
+                let res = draining(cam.get_snapshot(), &mut live, &cfg.name, state, views).await?.map_err(anyhow::Error::from).and_then(|jpg| {
                     let dir = crate::prefs::get().snapshot_dir;
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("{}_{}.jpg", safe_name(&cfg.name), stamp()));
@@ -518,7 +538,7 @@ async fn session(
     }
 }
 
-fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State>>, frames: &watch::Sender<Frame>) {
+fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State>>, views: &Views) {
     let (codec, data, key) = match media {
         BcMedia::Iframe(f) => (f.video_type, f.data, true),
         BcMedia::Pframe(f) => (f.video_type, f.data, false),
@@ -556,6 +576,14 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     if !live.show {
         return;
     }
+    // WebCodecs tiles decode the camera's own frames; ffmpeg runs only while an MJPEG <img> is watching.
+    let hevc = matches!(codec, VideoType::H265);
+    if views.jpeg.receiver_count() == 0 {
+        live.decoder = None;
+        views.raw.push(Raw { hevc, key, data });
+        return;
+    }
+    views.raw.push(Raw { hevc, key, data: data.clone() });
 
     // Swap decoders only at a keyframe so the new one starts clean; the old one keeps the tile live until then.
     let stale = live.decoder.as_ref().is_some_and(|d| {
@@ -568,7 +596,7 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         if !key {
             return;
         }
-        let tx = frames.clone();
+        let tx = views.jpeg.clone();
         let on_frame = move |jpeg: Vec<u8>| {
             tx.send_replace(Some(Arc::new(jpeg)));
         };

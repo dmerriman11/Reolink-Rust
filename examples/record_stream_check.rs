@@ -40,9 +40,10 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(t.elapsed().as_secs_f32())
     };
-    // Frames shown in the next `secs` seconds.
+    // An MJPEG viewer for the whole run (ffmpeg decodes only while one watches); frames shown in the next `secs` seconds.
+    let rx = std::cell::RefCell::new(dev.views.jpeg.subscribe());
     let frames = |secs: u64| {
-        let mut rx = dev.frames.clone();
+        let mut rx = rx.borrow_mut();
         let (t, mut n) = (Instant::now(), 0);
         while t.elapsed() < Duration::from_secs(secs) {
             if rx.has_changed().unwrap_or(false) && rx.borrow_and_update().is_some() {

@@ -149,9 +149,197 @@ function reportSizes() {
     if (sizes.length) invoke("set_view_sizes", { sizes }).catch(() => {});
   }, 250);
 }
-new ResizeObserver(reportSizes).observe(document.querySelector("#grid"));
+// Per tile, so layout and single-view changes count too, not just window resizes.
+const sizeObserver = new ResizeObserver(reportSizes);
+
+// ---------- live video: WebCodecs ----------
+// Tiles decode the camera's own H.264/H.265 here (on the GPU where it can) instead of ffmpeg turning every frame
+// into a JPEG. A camera whose codec the WebView can't decode falls back to the MJPEG <img> for the session.
+const mjpegOnly = new Set();
+
+// Annex-B NAL units (start codes stripped).
+function nalUnits(b) {
+  const out = [];
+  let start = -1;
+  for (let i = 0; i + 2 < b.length; i++) {
+    if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) {
+      if (start >= 0) out.push(b.subarray(start, i - (i > 0 && b[i - 1] === 0 ? 1 : 0)));
+      start = i + 3;
+      i += 2;
+    }
+  }
+  if (start >= 0) out.push(b.subarray(start));
+  return out;
+}
+
+const hex = (v, n = 2) => v.toString(16).toUpperCase().padStart(n, "0");
+
+// A NAL unit's payload without emulation-prevention bytes (00 00 03 -> 00 00).
+function rbsp(n, from) {
+  const r = [];
+  for (let i = from; i < n.length; i++) {
+    if (n[i] === 3 && r.length >= 2 && r[r.length - 1] === 0 && r[r.length - 2] === 0) continue;
+    r.push(n[i]);
+  }
+  return r;
+}
+
+// Fixed-width and Exp-Golomb reads over an RBSP.
+function bitReader(r) {
+  let p = 0;
+  const u = (n) => { let v = 0; for (let i = 0; i < n; i++, p++) v = v * 2 + ((r[p >> 3] >> (7 - (p & 7))) & 1); return v; };
+  const ue = () => { let z = 0; while (u(1) === 0 && z < 32) z++; return 2 ** z - 1 + u(z); };
+  return { u, ue };
+}
+
+// HEVC picture size from the SPS, after the conformance-window crop.
+function hevcSize(r) {
+  const b = bitReader(r);
+  b.u(4);
+  const subLayers = b.u(3);
+  b.u(1);
+  b.u(88 + 8); // general profile_tier_level and level
+  const present = [];
+  for (let i = 0; i < subLayers; i++) present.push([b.u(1), b.u(1)]);
+  if (subLayers > 0) for (let i = subLayers; i < 8; i++) b.u(2);
+  for (const [profile, level] of present) b.u((profile ? 88 : 0) + (level ? 8 : 0));
+  b.ue(); // sps id
+  const chroma = b.ue();
+  if (chroma === 3) b.u(1);
+  let width = b.ue(), height = b.ue();
+  if (b.u(1)) {
+    const [sx, sy] = [chroma === 1 || chroma === 2 ? 2 : 1, chroma === 1 ? 2 : 1];
+    const [l, rt, t, bt] = [b.ue(), b.ue(), b.ue(), b.ue()];
+    width -= sx * (l + rt);
+    height -= sy * (t + bt);
+  }
+  return { width, height };
+}
+
+// The WebCodecs codec string for a keyframe, read from its SPS (ISO/IEC 14496-15 Annex E for HEVC), plus the HEVC
+// picture size; null if it has no SPS.
+function streamInfo(frame, hevc) {
+  for (const n of nalUnits(frame)) {
+    if (!hevc && (n[0] & 0x1f) === 7 && n.length > 3) return { codec: `avc1.${hex(n[1])}${hex(n[2])}${hex(n[3])}` };
+    if (hevc && ((n[0] >> 1) & 0x3f) === 33) {
+      const r = rbsp(n, 2);
+      if (r.length < 14) return null;
+      // r[0]: VPS id, sub-layers; then profile_tier_level: space/tier/profile, 32 compat bits, 48 constraint bits, level.
+      const space = ["", "A", "B", "C"][r[1] >> 6], tier = r[1] & 0x20 ? "H" : "L", profile = r[1] & 0x1f;
+      let compat = ((r[2] << 24) | (r[3] << 16) | (r[4] << 8) | r[5]) >>> 0, rev = 0;
+      for (let i = 0; i < 32; i++) { rev = ((rev << 1) | (compat & 1)) >>> 0; compat >>>= 1; }
+      const cons = r.slice(6, 12);
+      while (cons.length && cons[cons.length - 1] === 0) cons.pop();
+      const codec = [`hvc1.${space}${profile}`, rev.toString(16).toUpperCase(), `${tier}${r[12]}`, ...cons.map((c) => hex(c))].join(".");
+      return { codec, ...hevcSize(r) };
+    }
+  }
+  return null;
+}
+
+// Play GET /raw/<id> (see stream.rs: 1-byte flags, 4-byte length, access unit) into `canvas`.
+function rawPlayer(canvas, url, onFirst, onFail) {
+  const ctx = canvas.getContext("2d");
+  const abort = new AbortController();
+  let dec = null, sig = null, waitKey = true, ts = 0, shown = false, size = null;
+  const stop = () => { abort.abort(); try { dec?.close(); } catch { /* already closed */ } dec = null; };
+  const fail = (why) => { if (abort.signal.aborted) return; console.warn("WebCodecs, using MJPEG:", why); stop(); onFail(); };
+  const draw = (frame) => {
+    // WebView2's hardware HEVC decoder can report Chromium's default 1280x720 as the visible area of a larger
+    // picture; crop to the size the SPS gives instead, so the tile isn't just the top-left corner.
+    if (size && frame.displayWidth !== size.width && size.width <= frame.codedWidth && size.height <= frame.codedHeight) {
+      const fixed = new VideoFrame(frame, { visibleRect: { x: 0, y: 0, ...size } });
+      frame.close();
+      frame = fixed;
+    }
+    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+    }
+    ctx.drawImage(frame, 0, 0);
+    frame.close();
+    if (!shown) { shown = true; onFirst(); }
+  };
+  async function onFrame(flags, data) {
+    const key = (flags & 1) !== 0;
+    if (key) {
+      const hevc = (flags & 2) !== 0;
+      const info = streamInfo(data, hevc);
+      const codec = info?.codec;
+      // Reconfigure when the stream changes (main/sub switch, new resolution): its parameter sets (VPS/SPS/PPS) do.
+      const params = nalUnits(data).filter((n) => (hevc ? [32, 33, 34].includes((n[0] >> 1) & 0x3f) : [7, 8].includes(n[0] & 0x1f)));
+      const s = codec && codec + params.map((n) => n.join()).join("|");
+      if (codec && s !== sig) {
+        size = info.width ? { width: info.width, height: info.height } : null;
+        // No description: Annex B with in-band parameter sets. The size hint keeps hardware decoders from guessing.
+        const config = { codec, optimizeForLatency: true, ...(size && { codedWidth: size.width, codedHeight: size.height }) };
+        const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+        if (!supported) return fail(`${codec} not supported`);
+        dec ||= new VideoDecoder({ output: draw, error: fail });
+        dec.configure(config);
+        sig = s;
+        waitKey = true;
+      }
+    }
+    if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
+    if (dec.decodeQueueSize > 8) { waitKey = true; return; } // falling behind: drop to the next keyframe
+    waitKey = false;
+    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 1000), data }));
+  }
+  (async () => {
+    const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return; // device removed or edited: the tile gets a new stream
+      const next = new Uint8Array(buf.length + value.length);
+      next.set(buf);
+      next.set(value, buf.length);
+      buf = next;
+      let at = 0;
+      while (buf.length - at >= 5) {
+        const len = new DataView(buf.buffer, at + 1, 4).getUint32(0);
+        if (buf.length - at - 5 < len) break;
+        await onFrame(buf[at], buf.subarray(at + 5, at + 5 + len));
+        at += 5 + len;
+      }
+      buf = buf.subarray(at);
+    }
+  })().catch((e) => { if (!abort.signal.aborted) console.warn("live stream:", e); });
+  return { stop };
+}
+
+// Point a tile at a camera's video, keeping its connection while it shows the same camera.
+function showVideo(t, d) {
+  const raw = state.webcodecs && "VideoDecoder" in window && !mjpegOnly.has(d.id);
+  const src = `${state.stream_base}/${raw ? "raw" : "live"}/${d.id}?t=${state.token}`;
+  if (t.src === src) return raw ? t.canvas : t.img;
+  stopVideo(t);
+  t.src = src;
+  if (raw) {
+    const ready = () => { t.canvas.classList.add("ok"); t.loading?.remove(); };
+    const fallback = () => { mjpegOnly.add(d.id); t.key = null; renderTiles(); };
+    t.player = rawPlayer(t.canvas, src, ready, fallback);
+    return t.canvas;
+  }
+  t.img.onload = () => { t.img.classList.add("ok"); t.loading?.remove(); };
+  t.img.onerror = () => t.img.classList.remove("ok");
+  t.img.src = src;
+  return t.img;
+}
+
+function stopVideo(t) {
+  t.player?.stop();
+  t.player = null;
+  t.src = "";
+  t.img.removeAttribute("src");
+  t.img.classList.remove("ok");
+  t.canvas.classList.remove("ok");
+}
+
 function makeTile(idx) {
-  const t = { root: el("div", "tile"), img: el("img"), key: null };
+  const t = { root: el("div", "tile"), img: el("img"), canvas: el("canvas"), key: null, src: "", player: null, loading: null };
+  sizeObserver.observe(t.root);
   t.img.alt = "";
   t.img.draggable = false;
   t.root.onclick = () => { selected = idx; renderTiles(); renderPtz(); };
@@ -184,20 +372,20 @@ function renderTiles() {
     const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.live ? "" : d.status].join("|") : "empty";
     if (key === t.key) return;
     t.key = key;
+    reportSizes(); // the tile may now show another camera
     t.root.replaceChildren();
 
     if (!d) {
-      t.img.removeAttribute("src");
+      stopVideo(t);
       t.root.append(el("div", "tile-empty", `${ICON.plus}<span>Pick a device</span>`));
       return;
     }
-    const src = `${state.stream_base}/live/${d.id}?t=${state.token}`;
-    if (t.img.dataset.src !== src) { t.img.classList.remove("ok"); t.img.src = src; t.img.dataset.src = src; }
     const loading = el("div", "tile-msg", d.online ? '<div><div class="spinner"></div>Starting stream…</div>' : "");
     if (!d.online) loading.textContent = d.status;
-    t.img.onload = () => { t.img.classList.add("ok"); loading.remove(); };
-    t.img.onerror = () => t.img.classList.remove("ok");
-    t.root.append(loading, t.img);
+    t.loading = loading;
+    const view = showVideo(t, d);
+    // A picture already showing needs no spinner; an offline status always shows.
+    t.root.append(...(d.online && view.classList.contains("ok") ? [] : [loading]), view);
 
     const head = el("div", "tile-head");
     head.append(Object.assign(el("span"), { textContent: d.name }));
@@ -230,7 +418,7 @@ function renderTiles() {
     t.root.append(bar);
   });
   // Drop streams for tiles hidden by a smaller layout.
-  tiles.slice(l.n).forEach((t) => { t.img.removeAttribute("src"); t.img.dataset.src = ""; t.key = null; });
+  tiles.slice(l.n).forEach((t) => { stopVideo(t); t.key = null; });
 }
 
 // ---------- PTZ ----------
@@ -1388,7 +1576,6 @@ async function refresh() {
   renderDevices();
   renderTiles();
   renderPtz();
-  reportSizes();
 }
 
 document.addEventListener("keydown", (e) => {
