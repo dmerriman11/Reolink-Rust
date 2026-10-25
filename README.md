@@ -1,5 +1,7 @@
 # Reolink-rs
 
+![Reolink-rs: live grid, a camera reconnecting on its own, single view, and painting a motion zone over the live picture](docs/demo.webp)
+
 Rust rewrite of the Reolink desktop client (reference: Reolink 8.21.31, Electron), built on
 [`neolink_core`](https://github.com/QuantumEntangledAndy/neolink) for the Baichuan protocol and a Tauri 2 UI
 (plain HTML/CSS/JS in `ui/`, no Node build). Video reaches the WebView as MJPEG from a token-protected
@@ -13,6 +15,8 @@ connected (pinged every 5 s) and reconnects automatically, resuming its live vie
 - Stream and connection task errors are surfaced/logged instead of a bare `StreamFinished`.
 - Unparseable frames, stray extension payloads and bad UDP datagrams are skipped instead of dropping the connection.
 - `get_xml`/`set_xml` raw settings access (read-modify-write keeps fields the typed model doesn't know).
+
+Re-record the demo above (Playwright + ffmpeg, synthetic feeds): `node docs/demo/record.cjs`.
 
 Test a saved camera end to end (stream, decode, ~8 s recording): `cargo run --example probe -- "<device name>" [main|sub]`.
 Measure each saved camera's video/audio bitrate per stream: `cargo run --release --example bitrate`.
