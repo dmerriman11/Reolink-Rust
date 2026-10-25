@@ -4,8 +4,9 @@
 
 Rust rewrite of the Reolink desktop client (reference: Reolink 8.21.31, Electron), built on
 [`neolink_core`](https://github.com/QuantumEntangledAndy/neolink) for the Baichuan protocol and a Tauri 2 UI
-(plain HTML/CSS/JS in `ui/`, no Node build). Video reaches the WebView as MJPEG from a token-protected
-127.0.0.1 server (`src/stream.rs`); recordings are stream copies at full camera resolution.
+(plain HTML/CSS/JS in `ui/`, no Node build). Video reaches the WebView from a token-protected 127.0.0.1 server
+(`src/stream.rs`): the camera's own H.264/H.265, decoded in the page with WebCodecs, or MJPEG made by ffmpeg on
+Linux and wherever the WebView can't decode the codec. Recordings are fragmented-MP4 stream copies of the main stream.
 
 **Deliberate difference from the official client:** no battery/idle disconnect. Every device stays
 connected (pinged every 5 s) and reconnects automatically, resuming its live view and recording.
@@ -25,13 +26,15 @@ connected (pinged every 5 s) and reconnects automatically, resuming its live vie
 Re-record the demo above (Playwright + ffmpeg, synthetic feeds): `node docs/demo/record.cjs`; retake the screenshots: `node docs/demo/screenshots.cjs`.
 
 Test a saved camera end to end (stream, decode, ~8 s recording): `cargo run --example probe -- "<device name>" [main|sub]`.
+Check that recording takes the main stream and a snapshot doesn't stall it: `cargo run --example record_stream_check -- "<device name>"`.
+Serve one camera's stream for trying the WebCodecs player in a browser: `cargo run --example raw_check -- "<device name>" [main|sub] [secs]`.
 Measure each saved camera's video/audio bitrate per stream: `cargo run --release --example bitrate`.
 Validate camera settings (add `--write` for reversible write checks): `cargo run --release --example settings_check`.
 Dump every readable settings message as XML (passwords redacted): `cargo run --release --example settings_dump -- <dir>`.
 
 ## Run
 
-Requires `ffmpeg.exe` on PATH or next to the exe (used to decode H.264/H.265 and write MP4s).
+Requires `ffmpeg.exe` on PATH or next to the exe (used to write MP4s, and to decode where WebCodecs can't).
 
 ```bash
 cargo run --release
