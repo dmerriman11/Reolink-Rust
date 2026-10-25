@@ -706,6 +706,8 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // Must be first: a second launch shows this instance's window and exits before setting anything up.
+        .plugin(tauri_plugin_single_instance::init(|handle, _, _| show_window(handle)))
         .plugin(tauri_plugin_dialog::init())
         .manage(app)
         .invoke_handler(tauri::generate_handler![
