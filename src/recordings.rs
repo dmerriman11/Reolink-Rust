@@ -83,6 +83,29 @@ pub async fn still(src: &Path, dir: &Path, at: f64) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Thumbnails are cached here, one `<recording>.jpg` each.
+pub fn thumb_dir(dir: &Path) -> PathBuf {
+    dir.join(".thumbs")
+}
+
+/// A small JPEG from about a second into `src`, made once and cached in thumb_dir.
+pub async fn thumb(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let thumbs = thumb_dir(dir);
+    let out = thumbs.join(format!("{}.jpg", stem(src)));
+    if std::fs::metadata(&out).is_ok_and(|m| m.len() > 0) {
+        return Ok(out);
+    }
+    std::fs::create_dir_all(&thumbs).map_err(|e| format!("can't create {}: {e}", thumbs.display()))?;
+    let o = OsStr::new;
+    let res = crate::media::run(&[o("-y"), o("-ss"), o("1"), o("-i"), src.as_os_str(), o("-frames:v"), o("1"), o("-vf"), o("scale=320:-2"), o("-q:v"), o("5"), out.as_os_str()]).await;
+    if res.is_err() || !out.is_file() {
+        // Still recording or cut off: no cache entry, so a later call can try again.
+        let _ = std::fs::remove_file(&out);
+        return Err(res.err().unwrap_or_else(|| "no frame to show".into()));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +121,27 @@ mod tests {
         }
         let names: Vec<_> = list(&dir).files.into_iter().map(|f| f.name).collect();
         assert_eq!(names, ["Cam_2026-10-25_10-23-49.mp4"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn thumbnails_are_made_once_and_cached() {
+        let dir = std::env::temp_dir().join("reolink-rs-thumb-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("Cam_2026-10-25_10-00-00.mp4");
+        let o = OsStr::new;
+        crate::media::run(&[o("-f"), o("lavfi"), o("-i"), o("testsrc=size=640x360:rate=10:duration=3"), src.as_os_str()]).await.unwrap();
+        let t = thumb(&src, &dir).await.unwrap();
+        assert_eq!(t, thumb_dir(&dir).join("Cam_2026-10-25_10-00-00.jpg"));
+        let made = std::fs::metadata(&t).unwrap().modified().unwrap();
+        assert_eq!(thumb(&src, &dir).await.unwrap(), t);
+        assert_eq!(std::fs::metadata(&t).unwrap().modified().unwrap(), made, "second call reuses the cache");
+        // A file with no frames (like one still being written) gives an error and leaves no cache entry behind.
+        let broken = dir.join("Cam_2026-10-25_11-00-00.mp4");
+        std::fs::write(&broken, b"not a video").unwrap();
+        assert!(thumb(&broken, &dir).await.is_err());
+        assert!(!thumb_dir(&dir).join("Cam_2026-10-25_11-00-00.jpg").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

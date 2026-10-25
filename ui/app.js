@@ -989,8 +989,82 @@ function renderPlayback() {
   $("#pb-cam").textContent = PB.cur ? camLabel(PB.cur.cam) : "";
   $("#pb-export").disabled = !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
   renderFiles();
+  renderGrid();
   renderTimeline();
   tick();
+}
+
+// ---------- playback: thumbnail grid ----------
+// Thumbnails are made by ffmpeg on demand (cached on disk by the backend), a few at a time as cards scroll into view.
+const thumbs = new Map(); // "<name>|<size>" -> image src, or null when the file has no frame yet
+const thumbQueue = [];
+let thumbsBusy = 0;
+const thumbKey = (f) => `${f.name}|${f.size}`; // a growing file gets another try once it changes
+const thumbObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    thumbObserver.unobserve(e.target);
+    thumbQueue.push(e.target);
+  }
+  pumpThumbs();
+}, { rootMargin: "200px" });
+
+function pumpThumbs() {
+  while (thumbsBusy < 3 && thumbQueue.length) {
+    const card = thumbQueue.shift();
+    const f = card._file;
+    thumbsBusy++;
+    invoke("recording_thumb", { name: f.name })
+      .then((path) => path && window.__TAURI__ ? window.__TAURI__.core.convertFileSrc(path) : null, () => null)
+      .then((src) => { thumbs.set(thumbKey(f), src); showThumb(card, src); })
+      .finally(() => { thumbsBusy--; pumpThumbs(); });
+  }
+}
+
+function showThumb(card, src) {
+  const box = card.querySelector(".pb-thumb");
+  if (src) {
+    const img = Object.assign(el("img"), { src, alt: "", draggable: false });
+    img.onload = () => box.classList.add("ok");
+    box.replaceChildren(img);
+  } else {
+    box.textContent = "No preview";
+  }
+}
+
+let gridKey = null;
+function renderGrid() {
+  const grid = $("#pb-grid");
+  if (grid.hidden) return;
+  const files = PB.cams.flatMap(dayFiles).sort((a, b) => a.start - b.start);
+  // Rebuild only when the day's files change; the 10 s refresh would otherwise reload every image.
+  const key = JSON.stringify([PB.day, files.map(thumbKey), PB.cur?.name]);
+  if (key === gridKey) return;
+  gridKey = key;
+  thumbQueue.length = 0;
+  thumbObserver.disconnect();
+  if (!files.length) { grid.replaceChildren(el("p", "pb-grid-empty", "No recordings this day.")); return; }
+  grid.replaceChildren(...files.map((f) => {
+    const card = el("button", "pb-card" + (f === PB.cur ? " current" : ""));
+    card._file = f;
+    card.title = `Play ${camLabel(f.cam)} from ${fmtTime(f.start)}`;
+    card.append(el("span", "pb-thumb"));
+    const meta = el("span", "pb-card-meta");
+    meta.append(Object.assign(el("strong"), { textContent: camLabel(f.cam) }), Object.assign(el("span"), { textContent: `${fmtTime(f.start)} · ${fmtDur(f.end - f.start)}` }));
+    card.append(meta);
+    card.onclick = () => { setGridMode(false); openFile(f, 0, true); };
+    if (thumbs.has(thumbKey(f))) showThumb(card, thumbs.get(thumbKey(f)));
+    else thumbObserver.observe(card);
+    return card;
+  }));
+}
+
+function setGridMode(on) {
+  $("#pb-grid").hidden = !on;
+  $("#pb-player").hidden = on;
+  $("#pb-mode-player").setAttribute("aria-pressed", String(!on));
+  $("#pb-mode-grid").setAttribute("aria-pressed", String(on));
+  if (on) { video.pause(); gridKey = null; renderGrid(); }
 }
 
 function renderFiles() {
@@ -1160,6 +1234,7 @@ function setSpeed(s) {
 }
 
 function act(a) {
+  if (!$("#pb-grid").hidden) setGridMode(false); // transport controls act on the player, so show it
   const f = PB.cur;
   if (!f) {
     const last = PB.cam && camFiles(PB.cam).at(-1);
@@ -1266,6 +1341,8 @@ function setupPlayback() {
   $("#view-live").onclick = (e) => { e.stopPropagation(); setView(false); };
   $("#view-playback").onclick = (e) => { e.stopPropagation(); setView(true); };
   $("#pb-media").onclick = () => call("open_media_folder");
+  $("#pb-mode-player").onclick = () => setGridMode(false);
+  $("#pb-mode-grid").onclick = () => setGridMode(true);
   $("#pb-speed").append(...SPEEDS.map((s) => Object.assign(el("option"), { value: String(s), textContent: `${s}×` })));
   $("#pb-speed").value = "1";
   $("#pb-speed").onchange = (e) => setSpeed(+e.target.value);
@@ -1322,6 +1399,7 @@ $("#media-folder").onclick = () => call("open_media_folder");
 
 buildLayouts();
 setupView();
+window.__TAURI__?.app?.getVersion().then((v) => { $("#app-version").textContent = `v${v}`; }).catch(() => {});
 setupPtz();
 setupDialog();
 refresh();

@@ -39,6 +39,7 @@
       </div>
       <ul class="nearby-list" id="nearby-list"></ul>
     </section>
+    <p class="app-version" id="app-version"></p>
   </aside>
 
   <main class="stage">
@@ -83,6 +84,10 @@
         <span class="pb-summary" id="pb-summary"></span>
       </div>
       <div class="topbar-right">
+        <div class="seg pb-mode" role="group" aria-label="Playback layout">
+          <button id="pb-mode-player" aria-pressed="true">Player</button>
+          <button id="pb-mode-grid" aria-pressed="false">Thumbnails</button>
+        </div>
         <button class="ghost-btn" id="pb-media">
           <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           Media
@@ -99,6 +104,7 @@
         </div>
         <div class="pb-msg" id="pb-msg">Pick a recording on the timeline.</div>
       </section>
+      <section class="pb-grid" id="pb-grid" hidden aria-label="Recordings as thumbnails"></section>
 
       <aside class="pb-files">
         <div class="section-head"><h2 id="pb-files-title">Recordings</h2></div>

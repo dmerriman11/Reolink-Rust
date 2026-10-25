@@ -580,16 +580,28 @@ fn set_live_paused(app: State<App>, paused: bool) {
 fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
     let dir = prefs::get().record_dir;
     // The folder is a setting, so the player's file access follows it.
-    if let Err(e) = handle.asset_protocol_scope().allow_directory(&dir, false) {
-        log::error!("asset scope {}: {e}", dir.display());
+    for d in [dir.clone(), recordings::thumb_dir(&dir)] {
+        if let Err(e) = handle.asset_protocol_scope().allow_directory(&d, false) {
+            log::error!("asset scope {}: {e}", d.display());
+        }
     }
     recordings::list(&dir)
 }
 
 #[tauri::command]
 fn delete_recording(name: String) -> Result<(), String> {
-    let path = recordings::resolve(&prefs::get().record_dir, &name)?;
-    std::fs::remove_file(&path).map_err(|e| format!("can't delete {name}: {e}"))
+    let dir = prefs::get().record_dir;
+    let path = recordings::resolve(&dir, &name)?;
+    std::fs::remove_file(&path).map_err(|e| format!("can't delete {name}: {e}"))?;
+    let _ = std::fs::remove_file(recordings::thumb_dir(&dir).join(name).with_extension("jpg"));
+    Ok(())
+}
+
+#[tauri::command]
+async fn recording_thumb(name: String) -> Result<String, String> {
+    let dir = prefs::get().record_dir;
+    let src = recordings::resolve(&dir, &name)?;
+    recordings::thumb(&src, &dir).await.map(|p| p.display().to_string())
 }
 
 #[tauri::command]
@@ -716,7 +728,7 @@ fn main() {
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
             get_prefs, save_prefs, pick_folder, add_found,
-            set_live_paused, list_recordings, delete_recording, reveal_recording, export_clip, recording_still
+            set_live_paused, list_recordings, delete_recording, reveal_recording, export_clip, recording_still, recording_thumb
         ])
         .setup(|app| Ok(tray(app)?))
         // Minimizing or closing tucks the window into the tray; Quit is in the tray menu.

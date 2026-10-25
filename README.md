@@ -55,7 +55,8 @@ network scan, run at startup. LAN auto-detect of cameras. Inventory, SDK command
 Playback (done for local recordings): Playback in the left sidebar opens an NVR view of the recording
 folder: day picker, one timeline row per camera (click to play, scroll to zoom, drag to pan), segments play back
 to back across gaps, 0.25-16x speed, frame step, ±10 s, clip export (In/Out, no re-encode, into `Clips\`),
-still frame to the snapshot folder, show in folder, delete. Live streams pause while it's open.
+still frame to the snapshot folder, show in folder, delete, and a Thumbnails view of the day's recordings
+(preview frames cached in `.thumbs\`). Live streams pause while it's open.
 Keys: Space, ← →, , . (frame), [ ] (speed), I / O, F.
 
 Tray (0.4.1): minimizing or closing hides the window to the tray (left-click to show it again). The tray's
