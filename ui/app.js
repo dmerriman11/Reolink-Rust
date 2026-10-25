@@ -1303,6 +1303,7 @@ async function refresh() {
     return;
   }
   checkMotion();
+  $("#rec-paused").hidden = !state.recording_paused;
   for (const d of state.devices) if (d.message) toast(d.message);
   for (const b of document.querySelectorAll(".layout-btn")) {
     b.setAttribute("aria-checked", String(+b.dataset.n === state.layout));

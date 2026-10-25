@@ -354,6 +354,9 @@ input[type="password"] { max-width: 320px; }
   background: var(--accent); color: var(--accent-ink); font-weight: 700; line-height: 1; cursor: pointer;
 }
 
+.paused-pill { padding: 5px 10px; border-radius: 999px; background: rgba(255, 74, 74, .14); color: var(--rec); font: 600 11px/1 var(--display); letter-spacing: .06em; }
+.paused-pill[hidden] { display: none; }
+
 /* ---------- view switch (sidebar) ---------- */
 .views { display: grid; gap: 2px; margin: 0 0 18px; padding: 3px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
 .view-btn {

@@ -58,6 +58,9 @@ to back across gaps, 0.25-16x speed, frame step, ±10 s, clip export (In/Out, no
 still frame to the snapshot folder, show in folder, delete. Live streams pause while it's open.
 Keys: Space, ← →, , . (frame), [ ] (speed), I / O, F.
 
+Tray (0.4.1): minimizing or closing hides the window to the tray (left-click to show it again). The tray's
+right-click menu has Show, Pause recording (stops manual and scheduled recording until unchecked) and Quit.
+
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
 Next phases toward parity with the official client:

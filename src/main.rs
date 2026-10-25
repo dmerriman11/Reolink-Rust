@@ -157,6 +157,7 @@ struct StateDto {
     tiles: Vec<Option<u64>>,
     stream_base: String,
     token: String,
+    recording_paused: bool,
 }
 
 #[tauri::command]
@@ -192,6 +193,7 @@ fn get_state(app: State<App>) -> StateDto {
         tiles: inner.tiles.clone(),
         stream_base: format!("http://127.0.0.1:{}", app.port),
         token: app.token.clone(),
+        recording_paused: device::RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -611,6 +613,71 @@ async fn recording_still(name: String, at: f64) -> Result<String, String> {
     recordings::still(&src, &prefs.snapshot_dir, at).await.map(|p| p.display().to_string())
 }
 
+/// Track whether the window can be seen (minimized or tucked in the tray), so hidden windows don't stream.
+fn sync_hidden(window: &tauri::Window) {
+    let hidden = window.is_minimized().unwrap_or(false) || !window.is_visible().unwrap_or(true);
+    set_hidden(&window.state::<App>(), hidden);
+}
+
+fn set_hidden(app: &App, hidden: bool) {
+    let mut inner = app.inner.lock().unwrap();
+    if inner.hidden != hidden {
+        inner.hidden = hidden;
+        inner.sync_live();
+    }
+}
+
+fn show_window(handle: &tauri::AppHandle) {
+    if let Some(w) = handle.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        set_hidden(&handle.state::<App>(), false);
+    }
+}
+
+fn set_recording_paused(handle: &tauri::AppHandle, paused: bool) {
+    device::RECORDING_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+    if paused {
+        // Scheduled recording stops on its next check; manual ones stop here.
+        for d in &handle.state::<App>().inner.lock().unwrap().devices {
+            d.send(Cmd::Record(false));
+        }
+    }
+}
+
+fn tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let show = MenuItem::with_id(app, "show", "Show Reolink-rs", true, None::<&str>)?;
+    let pause = CheckMenuItem::with_id(app, "pause", "Pause recording", true, false, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &pause, &PredefinedMenuItem::separator(app)?, &quit])?;
+    TrayIconBuilder::with_id("main")
+        .icon(app.default_window_icon().expect("bundle icon").clone())
+        .tooltip("Reolink-rs")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |handle, e| match e.id().as_ref() {
+            "show" => show_window(handle),
+            "pause" => set_recording_paused(handle, pause.is_checked().unwrap_or(false)),
+            "quit" => {
+                // Stop every device first: closing the recorders lets ffmpeg finish their MP4s.
+                handle.state::<App>().inner.lock().unwrap().devices.clear();
+                std::thread::sleep(std::time::Duration::from_millis(500)); // shortcut: fixed grace for the aborted tasks to drop; wait on them if files still come out cut
+                handle.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                show_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 fn main() {
     env_logger::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -649,16 +716,21 @@ fn main() {
             get_prefs, save_prefs, pick_folder, add_found,
             set_live_paused, list_recordings, delete_recording, reveal_recording, export_clip, recording_still
         ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Resized(_) = event {
-                let hidden = window.is_minimized().unwrap_or(false);
-                let app = window.state::<App>();
-                let mut inner = app.inner.lock().unwrap();
-                if inner.hidden != hidden {
-                    inner.hidden = hidden;
-                    inner.sync_live();
-                }
+        .setup(|app| Ok(tray(app)?))
+        // Minimizing or closing tucks the window into the tray; Quit is in the tray menu.
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+                sync_hidden(window);
             }
+            tauri::WindowEvent::Resized(_) => {
+                if window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
+                }
+                sync_hidden(window);
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("run tauri app");

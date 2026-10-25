@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
+/// Tray "Pause recording": no manual or scheduled recording starts while set.
+pub static RECORDING_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Latest decoded JPEG for the live view; None when not streaming.
 pub type Frame = Option<Arc<Vec<u8>>>;
 
@@ -259,7 +262,8 @@ async fn next_motion(m: &mut Option<MotionData>) -> Result<MotionStatus, neolink
 /// Whether the local recording schedule wants this camera recorded right now.
 fn auto_record_wanted(p: &crate::prefs::Prefs, moving: bool) -> bool {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    p.scheduled(now.weekday().number_days_from_sunday(), now.hour()) && (p.local_record == "continuous" || moving)
+    !RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+        && p.scheduled(now.weekday().number_days_from_sunday(), now.hour()) && (p.local_record == "continuous" || moving)
 }
 
 async fn session(
@@ -394,6 +398,10 @@ async fn session(
                 });
             }
             Cmd::Record(on) => {
+                if on && RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+                    set(&|s| s.message = Some("Recording is paused (tray menu)".into()));
+                    continue;
+                }
                 wanted.record = on;
                 let Some(l) = live.as_mut() else {
                     set(&|s| s.message = Some("Start live view before recording".into()));
