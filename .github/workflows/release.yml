@@ -31,7 +31,7 @@ jobs:
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev
       - uses: Swatinem/rust-cache@v2
       - run: npx --yes @tauri-apps/cli@2.12.4 build ${{ matrix.args }}
       - run: gh release upload "${{ inputs.tag }}" ${{ matrix.out }} --clobber
