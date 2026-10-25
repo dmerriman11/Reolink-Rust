@@ -3073,10 +3073,12 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reolink-rs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
+ "dirs",
  "env_logger",
  "futures",
  "get_if_addrs",

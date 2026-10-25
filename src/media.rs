@@ -177,7 +177,8 @@ pub struct Recorder {
 
 impl Recorder {
     /// Record into `dir` as `<base>_<YYYY-MM-DD_HH-MM-SS>.mp4`, starting a new file every `segment_minutes`
-    /// (0 = one file). Each segment is a complete MP4, so a crash loses at most the current one.
+    /// (0 = one file). Fragmented MP4 (a fragment per keyframe): a crash loses only the last fragment, and closing
+    /// a segment never rewrites it the way faststart did. WebView2 plays and seeks these over the asset protocol.
     pub fn new(codec: VideoType, dir: &Path, base: &str, segment_minutes: u32) -> std::io::Result<Self> {
         let template = dir.join(format!("{base}_%Y-%m-%d_%H-%M-%S.mp4")).to_string_lossy().into_owned();
         let seconds = if segment_minutes == 0 { 360_000 } else { segment_minutes * 60 }.to_string();
@@ -185,7 +186,7 @@ impl Recorder {
             &[
                 "-use_wallclock_as_timestamps", "1", "-f", format_of(codec), "-i", "pipe:0",
                 "-c", "copy", "-f", "segment", "-segment_time", &seconds, "-reset_timestamps", "1",
-                "-strftime", "1", "-segment_format", "mp4", "-segment_format_options", "movflags=+faststart", &template,
+                "-strftime", "1", "-segment_format", "mp4", "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof", &template,
             ],
             false,
         )?;
@@ -193,11 +194,13 @@ impl Recorder {
         Ok(Self { path: dir.to_owned(), child: Some(child), tx: Some(tx), started: false })
     }
 
-    pub fn push(&mut self, data: &[u8], keyframe: bool) {
+    /// False once ffmpeg has gone (disk full, crashed): nothing more is being written.
+    pub fn push(&mut self, data: &[u8], keyframe: bool) -> bool {
         self.started |= keyframe;
-        if self.started && let Some(tx) = &self.tx {
-            // Blocking send: a recording must not silently lose frames.
-            let _ = tx.send(data.to_vec());
+        match &self.tx {
+            // Blocking send: a recording must not silently lose frames. Fails only when the feeder has stopped.
+            Some(tx) if self.started => tx.send(data.to_vec()).is_ok(),
+            _ => true,
         }
     }
 }
@@ -244,6 +247,26 @@ mod tests {
     #[test]
     fn decodes_h265() {
         roundtrip(VideoType::H265, "libx265");
+    }
+
+    #[test]
+    fn recorder_reports_when_ffmpeg_is_gone() {
+        let dir = std::env::temp_dir().join("reolink-rs-rec-gone");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0).unwrap();
+        assert!(rec.push(b"\0\0\0\x01", true));
+        let mut child = rec.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The feeder notices on its next write; from then on every push fails.
+        let gone = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            !rec.push(&[0u8; 4096], false)
+        });
+        assert!(gone, "push kept succeeding after ffmpeg exited");
+        drop(rec);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

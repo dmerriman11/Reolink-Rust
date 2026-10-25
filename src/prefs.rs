@@ -37,7 +37,8 @@ pub const MOTION_POST_SECS: u64 = 30;
 
 impl Default for Prefs {
     fn default() -> Self {
-        let media = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default().join("Videos").join("Reolink-rs");
+        let videos = dirs::video_dir().or_else(|| dirs::home_dir().map(|h| h.join("Videos"))).unwrap_or_default();
+        let media = videos.join("Reolink-rs");
         Prefs {
             snapshot_dir: media.clone(),
             record_dir: media,

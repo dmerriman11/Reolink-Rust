@@ -13,7 +13,7 @@ use device::{Cmd, Device, DeviceConfig};
 use neolink_core::bc_protocol::{Direction, StreamKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
@@ -36,9 +36,33 @@ struct Saved {
     removed: Vec<DeviceConfig>,
 }
 
+/// %APPDATA% on Windows, ~/.config on Linux, ~/Library/Application Support on macOS.
 fn config_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
-    base.join("Reolink-rs").join("devices.json")
+    dirs::config_dir().unwrap_or_default().join("Reolink-rs").join("devices.json")
+}
+
+/// The saved config, or defaults when there is none. An unreadable file is moved aside rather than left for the
+/// next save to overwrite with an empty device list.
+fn load_saved(path: &Path) -> Saved {
+    let Ok(bytes) = std::fs::read(path) else { return Saved::default() };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        let keep = path.with_extension("unreadable.json");
+        log::error!("{} is unreadable ({e}); kept as {}", path.display(), keep.display());
+        let _ = std::fs::rename(path, &keep);
+        Saved::default()
+    })
+}
+
+/// Replace `path` with `bytes` so a crash or power cut leaves either the old file or the new one, never half of one.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 struct Inner {
@@ -119,9 +143,7 @@ impl Inner {
             removed: self.removed.clone(),
         };
         let path = config_path();
-        let res = std::fs::create_dir_all(path.parent().unwrap())
-            .and_then(|_| std::fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()));
-        if let Err(e) = res {
+        if let Err(e) = write_atomic(&path, &serde_json::to_vec_pretty(&saved).unwrap()) {
             log::error!("save {}: {e}", path.display());
         }
     }
@@ -562,11 +584,38 @@ async fn pick_folder(window: tauri::Window, current: String) -> Option<String> {
     rx.await.ok().flatten()
 }
 
+/// Open the system file manager at `path`; with `select`, at its folder with it highlighted where the platform can.
+fn reveal(path: &Path, select: bool) {
+    use std::process::Command;
+    let mut cmd;
+    if cfg!(windows) {
+        cmd = Command::new("explorer");
+        if select {
+            cmd.arg(format!("/select,{}", path.display()));
+        } else {
+            cmd.arg(path);
+        }
+    } else if cfg!(target_os = "macos") {
+        cmd = Command::new("open");
+        if select {
+            cmd.arg("-R");
+        }
+        cmd.arg(path);
+    } else {
+        // xdg-open can't highlight a file, so open its folder.
+        cmd = Command::new("xdg-open");
+        cmd.arg(if select { path.parent().unwrap_or(path) } else { path });
+    }
+    if let Err(e) = cmd.spawn() {
+        log::error!("open {}: {e}", path.display());
+    }
+}
+
 #[tauri::command]
 fn open_media_folder() {
     let dir = prefs::get().record_dir;
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    reveal(&dir, false);
 }
 
 #[tauri::command]
@@ -607,7 +656,7 @@ async fn recording_thumb(name: String) -> Result<String, String> {
 #[tauri::command]
 fn reveal_recording(name: String) -> Result<(), String> {
     let path = recordings::resolve(&prefs::get().record_dir, &name)?;
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    reveal(&path, true);
     Ok(())
 }
 
@@ -697,7 +746,7 @@ fn main() {
     let token = stream::token();
     let port = rt.block_on(stream::serve(feeds.clone(), token.clone())).expect("start stream server");
 
-    let saved: Saved = std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let saved = load_saved(&config_path());
     prefs::set(saved.prefs.clone());
     let app = App {
         rt,
@@ -748,4 +797,31 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("run tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_saves_atomically_and_unreadable_files_are_kept() {
+        let dir = std::env::temp_dir().join("reolink-rs-config-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        assert!(load_saved(&path).devices.is_empty(), "no file: defaults");
+
+        let cam = DeviceConfig { name: "Front".into(), host: "192.168.1.9".into(), ..Default::default() };
+        let saved = Saved { devices: vec![cam], layout: 4, ..Default::default() };
+        write_atomic(&path, &serde_json::to_vec(&saved).unwrap()).unwrap();
+        write_atomic(&path, &serde_json::to_vec(&saved).unwrap()).unwrap(); // replaces an existing file
+        assert_eq!(load_saved(&path).devices[0].name, "Front");
+        assert!(!path.with_extension("tmp").exists());
+
+        // A half-written file loads as defaults but is moved aside, so the next save can't erase the cameras in it.
+        std::fs::write(&path, br#"{"devices":[{"name":"Fro"#).unwrap();
+        assert!(load_saved(&path).devices.is_empty());
+        assert!(!path.exists());
+        assert!(std::fs::read_to_string(dir.join("devices.unreadable.json")).unwrap().contains("Fro"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

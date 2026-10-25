@@ -37,7 +37,7 @@ Requires `ffmpeg.exe` on PATH or next to the exe (used to decode H.264/H.265 and
 cargo run --release
 ```
 
-Devices are saved to `%APPDATA%\Reolink-rs\devices.json`. Snapshots and recordings go to `%USERPROFILE%\Videos\Reolink-rs`.
+Devices are saved to `%APPDATA%\Reolink-rs\devices.json` (`~/.config/Reolink-rs` on Linux, `~/Library/Application Support/Reolink-rs` on macOS). Snapshots and recordings go to `Videos\Reolink-rs` in your user folder.
 
 ## Status
 

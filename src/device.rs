@@ -126,11 +126,10 @@ pub fn wifi_level(dbm: i32) -> u8 {
     }
 }
 
-/// Local time as YYYY-MM-DD_HH-MM-SS for file names (UTC if the local offset can't be determined).
+/// Local time as YYYY-MM-DD_HH-MM-SS for file names.
+// chrono, not time: time's now_local() refuses (falls back to UTC) on Linux/macOS once tokio has started threads.
 fn stamp() -> String {
-    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let f = time::macros::format_description!("[year]-[month]-[day]_[hour]-[minute]-[second]");
-    now.format(&f).unwrap_or_else(|_| now.unix_timestamp().to_string())
+    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }
 
 /// A warning when the recording drive is below the configured free-space threshold.
@@ -234,6 +233,7 @@ fn camera_opts(cfg: &DeviceConfig) -> Result<BcCameraOpt> {
 }
 
 struct Live {
+    kind: StreamKind,
     stream: StreamData,
     decoder: Option<Decoder>,
     recorder: Option<Recorder>,
@@ -252,6 +252,30 @@ async fn next_media(live: &mut Option<Live>) -> Result<Result<BcMedia, neolink_c
     }
 }
 
+/// Await a camera request while still taking media off the live stream. neolink's poller blocks once a stream's
+/// buffers are full, and then no reply gets through, including the one `fut` is waiting for.
+async fn draining<T>(
+    fut: impl std::future::Future<Output = T>,
+    live: &mut Option<Live>,
+    name: &str,
+    state: &Arc<Mutex<State>>,
+    frames: &watch::Sender<Frame>,
+) -> Result<T> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            r = &mut fut => return Ok(r),
+            m = next_media(live) => {
+                let media = m.context("stream")?.context("stream data")?;
+                on_media(live.as_mut().expect("live set"), media, name, state, frames);
+            }
+        }
+    }
+}
+
+/// A camera that doesn't answer a ping in this long is gone; reconnect instead of waiting forever.
+const PING_TIMEOUT: Duration = Duration::from_secs(20);
+
 async fn next_motion(m: &mut Option<MotionData>) -> Result<MotionStatus, neolink_core::Error> {
     match m {
         Some(m) => m.next_motion().await,
@@ -261,9 +285,10 @@ async fn next_motion(m: &mut Option<MotionData>) -> Result<MotionStatus, neolink
 
 /// Whether the local recording schedule wants this camera recorded right now.
 fn auto_record_wanted(p: &crate::prefs::Prefs, moving: bool) -> bool {
-    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    use chrono::{Datelike as _, Timelike as _};
+    let now = chrono::Local::now();
     !RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
-        && p.scheduled(now.weekday().number_days_from_sunday(), now.hour()) && (p.local_record == "continuous" || moving)
+        && p.scheduled(now.weekday().num_days_from_sunday() as u8, now.hour() as u8) && (p.local_record == "continuous" || moving)
 }
 
 async fn session(
@@ -314,9 +339,13 @@ async fn session(
         } else {
             tokio::select! {
                 c = rx.recv() => match c { None => return Ok(()), c => c },
-                _ = ping.tick() => { cam.ping().await.context("ping")?; None }
+                _ = ping.tick() => {
+                    let r = tokio::time::timeout(PING_TIMEOUT, draining(cam.ping(), &mut live, &cfg.name, state, frames)).await;
+                    r.context("ping: no answer")??.context("ping")?;
+                    None
+                }
                 _ = battery_poll.tick(), if battery.is_some() => {
-                    if let Ok(b) = cam.battery_info().await {
+                    if let Ok(b) = draining(cam.battery_info(), &mut live, &cfg.name, state, frames).await? {
                         set(&|s| { s.battery = Some(b.battery_percent); s.charging = b.charge_status == "charging"; });
                     }
                     None
@@ -328,7 +357,7 @@ async fn session(
                     None
                 }
                 _ = wifi_poll.tick(), if wifi_supported => {
-                    match cam.wifi_signal().await {
+                    match draining(cam.wifi_signal(), &mut live, &cfg.name, state, frames).await? {
                         // Not measured yet right after connecting: try again shortly instead of showing it.
                         Ok(Some(d)) if !real_rssi(d) => wifi_poll.reset_after(Duration::from_secs(5)),
                         Ok(dbm) => set(&|s| s.wifi_dbm = dbm),
@@ -376,22 +405,32 @@ async fn session(
         match cmd {
             Cmd::Live(kind) => {
                 wanted.live = kind;
-                if kind.is_none() && live.is_some() {
-                    log::info!("{}: live stopped", cfg.name);
+                let record = wanted.record || auto;
+                // Off screen while the schedule records: keep a stream for the recording only. Recordings always
+                // take the main stream, so they never drop to the sub stream when the tile is small.
+                let want = kind.or(auto.then_some(StreamKind::Main)).map(|k| if record { StreamKind::Main } else { k });
+                if live.as_ref().map(|l| l.kind) != want {
+                    if kind.is_none() && live.is_some() {
+                        log::info!("{}: live stopped", cfg.name);
+                    }
+                    live = None; // dropping StreamData sends the stop to the camera
+                    if let Some(k) = want {
+                        log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
+                        let stream = cam.start_video(k, 0, false).await.context("start live")?;
+                        live = Some(Live { kind: k, stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
+                    }
                 }
-                live = None; // dropping StreamData sends the stop to the camera
-                // Off screen while the schedule records: keep a stream for the recording only.
-                if let Some(k) = kind.or(auto.then_some(StreamKind::Main)) {
-                    log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
-                    let stream = cam.start_video(k, 0, false).await.context("start live")?;
-                    let record = wanted.record || auto;
-                    live = Some(Live { stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: kind.is_some() });
+                if let Some(l) = live.as_mut() {
+                    l.show = kind.is_some();
+                    if !l.show {
+                        l.decoder = None;
+                    }
                 }
                 if kind.is_none() {
                     frames.send_replace(None);
                 }
                 set(&|s| {
-                    s.live = kind;
+                    s.live = live.as_ref().filter(|l| l.show).map(|l| l.kind);
                     if live.is_none() {
                         s.recording = None;
                     }
@@ -413,22 +452,19 @@ async fn session(
                     l.recorder = None;
                     set(&|s| s.recording = None);
                 }
+                pending.push(Cmd::Live(wanted.live)); // to the main stream for recording, or back when it ends
             }
             Cmd::Auto => {
                 log::info!("{}: scheduled recording {}", cfg.name, if auto { "starts" } else { "ends" });
-                match live.as_mut() {
-                    // Nothing streaming: start (or, when the schedule ends, stop) a recording-only stream.
-                    None if auto => pending.push(Cmd::Live(wanted.live)),
-                    Some(l) if !l.show && !auto && !wanted.record => pending.push(Cmd::Live(wanted.live)),
-                    Some(l) => {
-                        l.record = wanted.record || auto;
-                        if !l.record {
-                            l.recorder = None;
-                            set(&|s| s.recording = None);
-                        }
+                if let Some(l) = live.as_mut() {
+                    l.record = wanted.record || auto;
+                    if !l.record {
+                        l.recorder = None;
+                        set(&|s| s.recording = None);
                     }
-                    None => {}
                 }
+                // Starts (or, when the schedule ends, stops) a recording-only stream, and picks the stream to use.
+                pending.push(Cmd::Live(wanted.live));
             }
             Cmd::View(b) => {
                 wanted.jpeg_box = b;
@@ -437,7 +473,7 @@ async fn session(
                 }
             }
             Cmd::Ptz(dir) => {
-                if let Err(e) = cam.send_ptz(dir, 32.0).await {
+                if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, frames).await? {
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
             }
@@ -461,19 +497,17 @@ async fn session(
                 });
             }
             Cmd::Reboot(reply) => {
-                let res = cam.reboot().await.map_err(|e| e.to_string());
+                let res = draining(cam.reboot(), &mut live, &cfg.name, state, frames).await?.map_err(|e| e.to_string());
                 let _ = reply.send(res);
             }
             Cmd::Snapshot => {
-                let res = async {
-                    let jpg = cam.get_snapshot().await?;
+                let res = draining(cam.get_snapshot(), &mut live, &cfg.name, state, frames).await?.map_err(anyhow::Error::from).and_then(|jpg| {
                     let dir = crate::prefs::get().snapshot_dir;
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("{}_{}.jpg", safe_name(&cfg.name), stamp()));
                     std::fs::write(&path, jpg)?;
                     anyhow::Ok(path)
-                }
-                .await;
+                });
                 let msg = match res {
                     Ok(p) => format!("Snapshot saved: {}", p.display()),
                     Err(e) => format!("Snapshot failed: {e:#}"),
@@ -510,8 +544,14 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
             }
         }
     }
-    if let Some(r) = live.recorder.as_mut() {
-        r.push(&data, key);
+    if let Some(r) = live.recorder.as_mut()
+        && !r.push(&data, key)
+    {
+        live.recorder = None;
+        live.record = false;
+        let mut s = state.lock().unwrap();
+        s.recording = None;
+        s.message = Some("Recording stopped: ffmpeg quit writing (disk full or removed?)".into());
     }
     if !live.show {
         return;
