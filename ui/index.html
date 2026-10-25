@@ -12,6 +12,16 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <span class="brand-name">Reolink<em>rs</em></span>
     </div>
+    <nav class="views" aria-label="View">
+      <button class="view-btn" id="view-live" aria-pressed="true">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><rect x="13" y="13" width="8" height="7" rx="1.5"/></svg>
+        Live view
+      </button>
+      <button class="view-btn" id="view-playback" aria-pressed="false">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l5.5-3.5z"/></svg>
+        Playback
+      </button>
+    </nav>
     <div class="section-head">
       <h2>Devices</h2>
       <button class="icon-btn" id="add-device" title="Add device" aria-label="Add device">
@@ -58,6 +68,79 @@
     <button class="fs-exit" id="fs-exit" title="Exit full screen (Esc)" aria-label="Exit full screen">
       <svg viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
     </button>
+  </main>
+
+  <main class="nvr" id="nvr" hidden>
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="day-nav">
+          <button class="icon-btn" id="pb-prev-day" title="Previous day" aria-label="Previous day"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <input type="date" id="pb-day" aria-label="Day">
+          <button class="icon-btn" id="pb-next-day" title="Next day" aria-label="Next day"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+          <button class="ghost-btn" id="pb-latest" title="Jump to the latest recording">Latest</button>
+        </div>
+        <span class="pb-summary" id="pb-summary"></span>
+      </div>
+      <div class="topbar-right">
+        <button class="ghost-btn" id="pb-media">
+          <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Media
+        </button>
+      </div>
+    </header>
+
+    <div class="pb-body">
+      <section class="pb-player" id="pb-player">
+        <video id="pb-video" preload="auto" playsinline></video>
+        <div class="pb-overlay">
+          <span class="pb-cam" id="pb-cam"></span>
+          <span class="pb-clock" id="pb-clock"></span>
+        </div>
+        <div class="pb-msg" id="pb-msg">Pick a recording on the timeline.</div>
+      </section>
+
+      <aside class="pb-files">
+        <div class="section-head"><h2 id="pb-files-title">Recordings</h2></div>
+        <ul class="pb-file-list" id="pb-file-list"></ul>
+      </aside>
+    </div>
+
+    <div class="pb-transport" id="pb-transport">
+      <div class="pb-group">
+        <button class="tbtn" data-act="prev" title="Previous recording" aria-label="Previous recording"><svg viewBox="0 0 24 24"><path d="M6 5v14M18 6l-9 6 9 6z"/></svg></button>
+        <button class="tbtn" data-act="back" title="Back 10 s (←)" aria-label="Back 10 seconds"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6M19 6l-6 6 6 6"/></svg></button>
+        <button class="tbtn" data-act="frame-back" title="Previous frame (,)" aria-label="Previous frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+        <button class="tbtn play" data-act="play" id="pb-play" title="Play (Space)" aria-label="Play"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
+        <button class="tbtn" data-act="frame-fwd" title="Next frame (.)" aria-label="Next frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+        <button class="tbtn" data-act="fwd" title="Forward 10 s (→)" aria-label="Forward 10 seconds"><svg viewBox="0 0 24 24"><path d="M13 6l6 6-6 6M5 6l6 6-6 6"/></svg></button>
+        <button class="tbtn" data-act="next" title="Next recording" aria-label="Next recording"><svg viewBox="0 0 24 24"><path d="M18 5v14M6 6l9 6-9 6z"/></svg></button>
+        <label class="pb-speed" title="Playback speed ([ and ])">
+          <select id="pb-speed" aria-label="Playback speed"></select>
+        </label>
+      </div>
+      <div class="pb-group">
+        <button class="ghost-btn" data-act="in" title="Mark clip start (I)">In</button>
+        <button class="ghost-btn" data-act="out" title="Mark clip end (O)">Out</button>
+        <button class="ghost-btn" data-act="export" id="pb-export" disabled>Export clip</button>
+        <button class="ghost-btn" data-act="still" title="Save this frame to the snapshot folder">
+          <svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+          Snapshot
+        </button>
+        <button class="tbtn" data-act="full" title="Full screen (F)" aria-label="Full screen"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+      </div>
+    </div>
+
+    <section class="timeline" id="timeline">
+      <div class="tl-zoom" role="group" aria-label="Timeline zoom">
+        <button data-span="86400" aria-pressed="true">24h</button>
+        <button data-span="21600">6h</button>
+        <button data-span="3600">1h</button>
+        <button data-span="600">10m</button>
+      </div>
+      <div class="tl-ruler" id="tl-ruler"></div>
+      <div class="tl-rows" id="tl-rows"></div>
+      <p class="tl-hint">Click to play · scroll to zoom · drag to pan</p>
+    </section>
   </main>
 
   <aside class="ptz" id="ptz">

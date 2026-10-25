@@ -3,6 +3,7 @@
 mod device;
 mod media;
 mod prefs;
+mod recordings;
 mod xmledit;
 mod scan;
 mod settings;
@@ -51,6 +52,8 @@ struct Inner {
     solo: Option<usize>,
     /// Window minimized: stop streams nobody can see (recordings keep theirs).
     hidden: bool,
+    /// Playback view open: the live grid is off screen, so it shouldn't stream either.
+    paused: bool,
     /// Last JPEG box sent to each device.
     boxes: HashMap<u64, (u32, u32)>,
     next_id: u64,
@@ -83,7 +86,7 @@ impl Inner {
     /// Stream only what's on screen. Clear (main) is honored only where a tile is big enough to show it
     /// (single view or 1/2 layouts); smaller tiles get the sub stream, ~5x less camera Wi-Fi airtime.
     fn sync_live(&mut self) {
-        let visible: Vec<u64> = match (self.hidden, self.solo) {
+        let visible: Vec<u64> = match (self.hidden || self.paused, self.solo) {
             (true, _) => vec![],
             (false, Some(t)) => self.tiles.get(t).copied().flatten().into_iter().collect(),
             (false, None) => self.tiles[..self.layout].iter().flatten().copied().collect(),
@@ -564,6 +567,50 @@ fn open_media_folder() {
     let _ = std::process::Command::new("explorer").arg(dir).spawn();
 }
 
+#[tauri::command]
+fn set_live_paused(app: State<App>, paused: bool) {
+    let mut inner = app.inner.lock().unwrap();
+    inner.paused = paused;
+    inner.sync_live();
+}
+
+#[tauri::command]
+fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
+    let dir = prefs::get().record_dir;
+    // The folder is a setting, so the player's file access follows it.
+    if let Err(e) = handle.asset_protocol_scope().allow_directory(&dir, false) {
+        log::error!("asset scope {}: {e}", dir.display());
+    }
+    recordings::list(&dir)
+}
+
+#[tauri::command]
+fn delete_recording(name: String) -> Result<(), String> {
+    let path = recordings::resolve(&prefs::get().record_dir, &name)?;
+    std::fs::remove_file(&path).map_err(|e| format!("can't delete {name}: {e}"))
+}
+
+#[tauri::command]
+fn reveal_recording(name: String) -> Result<(), String> {
+    let path = recordings::resolve(&prefs::get().record_dir, &name)?;
+    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    Ok(())
+}
+
+#[tauri::command]
+async fn export_clip(name: String, from: f64, to: f64) -> Result<String, String> {
+    let dir = prefs::get().record_dir;
+    let src = recordings::resolve(&dir, &name)?;
+    recordings::export_clip(&src, &dir, from, to).await.map(|p| p.display().to_string())
+}
+
+#[tauri::command]
+async fn recording_still(name: String, at: f64) -> Result<String, String> {
+    let prefs = prefs::get();
+    let src = recordings::resolve(&prefs.record_dir, &name)?;
+    recordings::still(&src, &prefs.snapshot_dir, at).await.map(|p| p.display().to_string())
+}
+
 fn main() {
     env_logger::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -575,7 +622,7 @@ fn main() {
     prefs::set(saved.prefs.clone());
     let app = App {
         rt,
-        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, boxes: HashMap::new(), next_id: 0, removed: saved.removed.clone() }),
+        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, paused: false, boxes: HashMap::new(), next_id: 0, removed: saved.removed.clone() }),
         feeds,
         port,
         token,
@@ -599,7 +646,8 @@ fn main() {
             set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
-            get_prefs, save_prefs, pick_folder, add_found
+            get_prefs, save_prefs, pick_folder, add_found,
+            set_live_paused, list_recordings, delete_recording, reveal_recording, export_clip, recording_still
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Resized(_) = event {

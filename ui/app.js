@@ -114,6 +114,7 @@ function renderDevices() {
     menu.append(gear, edit, del);
     li.append(menu);
     const show = () => {
+      if (PB.on) { PB.cam = safeName(d.name); renderPlayback(); return; } // in playback, a device row picks its timeline
       const free = state.tiles.slice(0, state.layout).findIndex((t) => t == null);
       const tile = free >= 0 ? free : (selected ?? 0);
       call("assign_tile", { tile, id: d.id }).then(refresh);
@@ -903,6 +904,397 @@ async function checkMotion() {
   if (appPrefs.alarm_beep && appPrefs.alarm_volume > 0) beep(appPrefs.alarm_volume);
 }
 
+// ---------- playback (NVR) ----------
+// Recordings are the MP4 segments in the recording folder, named <camera>_<YYYY-MM-DD_HH-MM-SS>.mp4 (local time).
+const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16];
+const FRAME = 1 / 15; // shortcut: assumes Reolink's usual 15 fps; read the stream's real rate if steps feel off
+const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
+const TICKS = [10 * SEC, 30 * SEC, MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR];
+const NAME_RE = /^(.*)_(\d{4})-(\d\d)-(\d\d)_(\d\d)-(\d\d)-(\d\d)\.mp4$/i;
+const PB = { on: false, opened: false, dir: "", files: [], cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [] };
+const video = $("#pb-video");
+
+const safeName = (n) => n.replace(/[^\p{L}\p{N}-]/gu, "_"); // as device.rs names the files
+const camLabel = (cam) => state.devices.find((d) => safeName(d.name) === cam)?.name ?? cam.replace(/_/g, " ");
+const dayOf = (t) => new Date(t).setHours(0, 0, 0, 0);
+const addDays = (t, n) => { const d = new Date(t); d.setDate(d.getDate() + n); return d.getTime(); };
+const fmtTime = (t, secs = true) => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: secs ? "2-digit" : undefined, hourCycle: "h23" });
+const fmtDay = (t) => new Date(t).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.max(0.1, b / 1e6).toFixed(1)} MB`;
+const fmtDur = (ms) => { const s = Math.round(ms / SEC); return s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.floor(s % 3600 / 60)} min` : s >= 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s} s`; };
+const isoDay = (t) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+const playTime = () => PB.cur ? PB.cur.start + video.currentTime * SEC : null;
+const camFiles = (cam) => PB.files.filter((f) => f.cam === cam);
+const dayFiles = (cam) => camFiles(cam).filter((f) => f.end > PB.day && f.start < addDays(PB.day, 1));
+
+function fileSrc(name) {
+  const sep = PB.dir.includes("\\") ? "\\" : "/";
+  const path = PB.dir ? PB.dir.replace(/[\\/]$/, "") + sep + name : name;
+  return window.__TAURI__ ? window.__TAURI__.core.convertFileSrc(path) : "demo.mp4"; // design preview: one sample clip
+}
+
+function parseFile(f) {
+  const m = NAME_RE.exec(f.name);
+  if (!m) return null;
+  const [, cam, y, mo, d, h, mi, s] = m;
+  const start = new Date(+y, mo - 1, +d, +h, +mi, +s).getTime();
+  // A finished segment was last written when it closed; the player corrects this once the file loads.
+  return { name: f.name, cam, start, end: Math.max(start + SEC, f.modified), size: f.size };
+}
+
+async function loadRecordings() {
+  let res;
+  try { res = await invoke("list_recordings"); } catch { return; }
+  PB.dir = res.dir;
+  const old = new Map(PB.files.map((f) => [f.name, f]));
+  PB.files = res.files.map(parseFile).filter(Boolean).map((f) => {
+    const o = old.get(f.name);
+    return o && o.size === f.size ? o : f; // keep the object (and its measured length) while the file is unchanged
+  }).sort((a, b) => a.start - b.start);
+  PB.cams = [...new Set(PB.files.map((f) => f.cam))].sort((a, b) => camLabel(a).localeCompare(camLabel(b)));
+  if (PB.cur) PB.cur = PB.files.find((f) => f.name === PB.cur.name) || PB.cur;
+  if (!PB.opened) {
+    PB.opened = true;
+    const last = PB.files.at(-1);
+    PB.cam = last?.cam ?? null;
+    setDay(dayOf(last ? last.start : Date.now()));
+    if (last) openFile(last, 0, false);
+    else showMsg("No recordings yet. Press Record on a live tile, or turn on Local recording in Settings.");
+  }
+  renderPlayback();
+}
+
+function setDay(day, center = null) {
+  PB.day = day;
+  const span = PB.v1 - PB.v0 || Infinity;
+  setViewWindow(center == null ? day : center - Math.min(span, addDays(day, 1) - day) / 2, span);
+}
+
+function setViewWindow(v0, span) {
+  const end = addDays(PB.day, 1);
+  span = Math.max(MIN, Math.min(span, end - PB.day));
+  PB.v0 = Math.max(PB.day, Math.min(v0, end - span));
+  PB.v1 = PB.v0 + span;
+  for (const b of document.querySelectorAll(".tl-zoom button")) b.setAttribute("aria-pressed", String(Math.abs(+b.dataset.span * SEC - span) < SEC));
+}
+
+function showMsg(text) { $("#pb-msg").textContent = text; $("#pb-msg").hidden = !text; }
+
+// ---------- playback: rendering ----------
+function renderPlayback() {
+  if (!PB.on) return;
+  $("#pb-day").value = isoDay(PB.day);
+  const today = PB.cams.flatMap(dayFiles);
+  $("#pb-summary").textContent = today.length ? `${today.length} recording${today.length > 1 ? "s" : ""} · ${fmtBytes(today.reduce((n, f) => n + f.size, 0))}` : "No recordings this day";
+  $("#pb-cam").textContent = PB.cur ? camLabel(PB.cur.cam) : "";
+  $("#pb-export").disabled = !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
+  renderFiles();
+  renderTimeline();
+  tick();
+}
+
+function renderFiles() {
+  $("#pb-files-title").textContent = PB.cam ? `${camLabel(PB.cam)} · ${fmtDay(PB.day)}` : "Recordings";
+  const files = PB.cam ? dayFiles(PB.cam) : [];
+  const list = $("#pb-file-list");
+  if (!files.length) { list.replaceChildren(el("li", "pb-empty", "Nothing recorded this day.")); return; }
+  list.replaceChildren(...files.map((f) => {
+    const li = el("li", "pb-file" + (f === PB.cur ? " current" : ""));
+    li.tabIndex = 0;
+    li.append(Object.assign(el("span", "pb-file-time"), { textContent: `${fmtTime(f.start)} – ${fmtTime(f.end)}` }));
+    li.append(Object.assign(el("span", "pb-file-meta"), { textContent: `${fmtDur(f.end - f.start)} · ${fmtBytes(f.size)}` }));
+    const menu = el("span", "device-menu");
+    const reveal = Object.assign(el("button"), { textContent: "Show in folder" });
+    reveal.onclick = (e) => { e.stopPropagation(); call("reveal_recording", { name: f.name }); };
+    const del = Object.assign(el("button", "danger"), { textContent: "Delete" });
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete the ${camLabel(f.cam)} recording from ${fmtDay(f.start)} ${fmtTime(f.start)}? This can't be undone.`)) return;
+      if (f === PB.cur) { video.removeAttribute("src"); video.load(); PB.cur = null; showMsg("Recording deleted."); }
+      call("delete_recording", { name: f.name }).finally(loadRecordings);
+    };
+    menu.append(reveal, del);
+    li.append(menu);
+    li.onclick = () => openFile(f, 0, true);
+    li.onkeydown = (e) => { if (e.key === "Enter") openFile(f, 0, true); };
+    return li;
+  }));
+  list.querySelector(".current")?.scrollIntoView({ block: "nearest" });
+}
+
+function renderTimeline() {
+  const { v0, v1 } = PB, span = v1 - v0;
+  const x = (t) => `${((t - v0) / span) * 100}%`;
+  const width = (a, b) => `max(2px, ${((b - a) / span) * 100}%)`;
+  const step = TICKS.find((s) => span / s <= 12) ?? TICKS.at(-1);
+  const scale = el("div", "tl-scale");
+  for (let t = PB.day + Math.ceil((v0 - PB.day) / step) * step; t <= v1; t += step) {
+    if ((t - v0) / span < 0.03 || (v1 - t) / span < 0.03) continue; // edge labels would be cut off
+    const tick = Object.assign(el("span", "tl-tick"), { textContent: fmtTime(t, step < MIN) });
+    tick.style.left = x(t);
+    scale.append(tick);
+  }
+  const cursor = el("span", "tl-cursor");
+  cursor.hidden = true;
+  scale.append(cursor);
+  $("#tl-ruler").replaceChildren(scale);
+  PB.heads = [];
+
+  const now = Date.now();
+  const rows = PB.cams.length ? PB.cams : [null];
+  $("#tl-rows").replaceChildren(...rows.map((cam) => {
+    const row = el("div", "tl-row" + (cam && cam === PB.cam ? " selected" : ""));
+    const label = Object.assign(el("button", "tl-label"), { textContent: cam ? camLabel(cam) : "No recordings" });
+    label.disabled = !cam;
+    label.onclick = () => { PB.cam = cam; renderPlayback(); };
+    const track = el("div", "tl-track");
+    track.dataset.cam = cam ?? "";
+    for (const f of cam ? camFiles(cam) : []) {
+      if (f.end <= v0 || f.start >= v1) continue;
+      const seg = el("span", "tl-seg" + (f === PB.cur ? " current" : ""));
+      seg.style.left = x(Math.max(f.start, v0));
+      seg.style.width = width(Math.max(f.start, v0), Math.min(f.end, v1));
+      track.append(seg);
+    }
+    if (cam && PB.cur?.cam === cam && PB.mark[0] != null) {
+      const a = PB.cur.start + PB.mark[0] * SEC, b = PB.mark[1] != null ? PB.cur.start + PB.mark[1] * SEC : a;
+      const m = el("span", "tl-mark");
+      m.style.left = x(a);
+      m.style.width = width(a, b);
+      track.append(m);
+    }
+    if (now > v0 && now < v1) { const n = el("span", "tl-now"); n.style.left = x(now); track.append(n); }
+    const head = el("span", "tl-head");
+    track.append(head);
+    PB.heads.push(head);
+    row.append(label, track);
+    return row;
+  }));
+}
+
+// Cheap updates that rebuild nothing: clock, play button, playhead.
+function tick() {
+  const t = playTime();
+  $("#pb-clock").textContent = t == null ? "" : `${fmtDay(t)}  ${fmtTime(t)}`;
+  const play = $("#pb-play"), paused = video.paused;
+  if (play.dataset.paused !== String(paused)) {
+    play.dataset.paused = String(paused);
+    play.innerHTML = paused ? '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>' : '<svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>';
+    play.title = paused ? "Play (Space)" : "Pause (Space)";
+    play.setAttribute("aria-label", paused ? "Play" : "Pause");
+  }
+  if (t == null) { for (const h of PB.heads) h.hidden = true; return; }
+  // Keep the playhead on screen while playing: page the view forward (into the next day if need be).
+  if (!paused && (t > PB.v1 || t < PB.v0)) {
+    PB.day = dayOf(t);
+    setViewWindow(t - (PB.v1 - PB.v0) * 0.1, PB.v1 - PB.v0);
+    renderPlayback();
+    return;
+  }
+  const left = `${((t - PB.v0) / (PB.v1 - PB.v0)) * 100}%`;
+  for (const h of PB.heads) { h.hidden = t < PB.v0 || t > PB.v1; h.style.left = left; }
+}
+
+// ---------- playback: control ----------
+const fileAt = (cam, t) => PB.files.find((f) => f.cam === cam && f.start <= t && t < f.end);
+const nextFile = (f) => PB.files.find((g) => g.cam === f.cam && g.start > f.start);
+const prevFile = (f) => PB.files.findLast((g) => g.cam === f.cam && g.start < f.start);
+
+// Play `cam` at wall time `t`, skipping ahead to its next recording when `t` falls in a gap.
+function playAt(cam, t, play = true) {
+  PB.cam = cam;
+  const f = fileAt(cam, t) || PB.files.find((g) => g.cam === cam && g.start >= t);
+  if (!f) { toast(`No ${camLabel(cam)} recording after ${fmtTime(t)}`); renderPlayback(); return; }
+  openFile(f, Math.max(0, (t - f.start) / SEC), play);
+}
+
+function openFile(f, offset, play) {
+  PB.cam = f.cam;
+  const at = f.start + offset * SEC;
+  if (dayOf(at) !== PB.day) setDay(dayOf(at), at);
+  if (PB.cur === f && video.readyState > 0) {
+    video.currentTime = offset;
+    if (play) video.play().catch(() => {});
+  } else {
+    PB.cur = f;
+    PB.mark = [null, null];
+    PB.seek = offset;
+    PB.autoplay = play;
+    showMsg("");
+    video.src = fileSrc(f.name);
+  }
+  renderPlayback();
+}
+
+video.onloadedmetadata = () => {
+  const f = PB.cur;
+  if (f && Number.isFinite(video.duration) && video.duration > 0) f.end = f.start + video.duration * SEC;
+  video.currentTime = Math.min(PB.seek, video.duration || 0);
+  if (PB.autoplay) video.play().catch(() => {});
+  renderPlayback();
+};
+video.onerror = () => {
+  if (!video.getAttribute("src")) return;
+  showMsg(video.error?.code === 4
+    ? "Can't play this file. It may still be recording, have been cut off, or use a codec this PC can't decode. Use Show in folder to open it in another player."
+    : "Couldn't load this recording.");
+};
+// Segments play back to back, so a long recording plays through.
+video.onended = () => { const n = PB.cur && nextFile(PB.cur); if (n) openFile(n, 0, true); else tick(); };
+video.ontimeupdate = tick;
+video.onplay = video.onpause = tick;
+video.onclick = () => act("play");
+
+function seekBy(secs) {
+  const t = playTime();
+  if (t == null) return;
+  const to = video.currentTime + secs;
+  if (to >= 0 && to < (video.duration || 0)) video.currentTime = to;
+  else playAt(PB.cur.cam, t + secs * SEC, !video.paused);
+}
+
+function setSpeed(s) {
+  PB.speed = s;
+  video.defaultPlaybackRate = video.playbackRate = s; // the default survives loading the next segment
+  $("#pb-speed").value = String(s);
+}
+
+function act(a) {
+  const f = PB.cur;
+  if (!f) {
+    const last = PB.cam && camFiles(PB.cam).at(-1);
+    if (a === "play" && last) openFile(last, 0, true);
+    return;
+  }
+  switch (a) {
+    case "play": if (video.paused) video.play().catch(() => {}); else video.pause(); break;
+    case "back": seekBy(-10); break;
+    case "fwd": seekBy(10); break;
+    case "frame-back": video.pause(); video.currentTime = Math.max(0, video.currentTime - FRAME); break;
+    case "frame-fwd": video.pause(); video.currentTime += FRAME; break;
+    case "prev": { const p = prevFile(f); if (p) openFile(p, 0, !video.paused); else video.currentTime = 0; break; }
+    case "next": { const n = nextFile(f); if (n) openFile(n, 0, !video.paused); break; }
+    case "in": PB.mark = [video.currentTime, PB.mark[1] > video.currentTime ? PB.mark[1] : null]; renderPlayback(); break;
+    case "out": PB.mark = [PB.mark[0] != null && PB.mark[0] < video.currentTime ? PB.mark[0] : 0, video.currentTime]; renderPlayback(); break;
+    case "export":
+      toast("Exporting clip…");
+      call("export_clip", { name: f.name, from: PB.mark[0], to: PB.mark[1] }).then((p) => toast(`Clip saved: ${p}`));
+      break;
+    case "still": call("recording_still", { name: f.name, at: video.currentTime }).then((p) => toast(`Snapshot saved: ${p}`)); break;
+    case "full":
+      if (document.fullscreenElement) document.exitFullscreen();
+      else $("#pb-player").requestFullscreen?.().catch(() => {});
+      break;
+  }
+}
+
+function setupTimeline() {
+  const rows = $("#tl-rows");
+  let drag = null;
+  const timeAt = (track, clientX) => { const r = track.getBoundingClientRect(); return PB.v0 + ((clientX - r.left) / r.width) * (PB.v1 - PB.v0); };
+  const redraw = () => { renderTimeline(); tick(); };
+  rows.addEventListener("pointerdown", (e) => {
+    const track = e.target.closest(".tl-track");
+    if (!track || e.button !== 0) return;
+    track.setPointerCapture(e.pointerId);
+    drag = { track, x: e.clientX, v0: PB.v0, moved: false };
+  });
+  rows.addEventListener("pointermove", (e) => {
+    const track = drag?.track || e.target.closest(".tl-track");
+    const cursor = $(".tl-cursor");
+    if (track && cursor) {
+      const t = timeAt(track, e.clientX);
+      cursor.textContent = fmtTime(t);
+      cursor.style.left = `${((t - PB.v0) / (PB.v1 - PB.v0)) * 100}%`;
+      cursor.hidden = t < PB.v0 || t > PB.v1;
+    }
+    if (!drag) return;
+    const dx = e.clientX - drag.x;
+    if (Math.abs(dx) > 4) drag.moved = true;
+    if (drag.moved) {
+      const span = PB.v1 - PB.v0;
+      setViewWindow(drag.v0 - (dx / drag.track.getBoundingClientRect().width) * span, span);
+      redraw();
+    }
+  });
+  rows.addEventListener("pointerleave", () => { const c = $(".tl-cursor"); if (c) c.hidden = true; });
+  rows.addEventListener("pointerup", (e) => {
+    if (!drag) return;
+    const { track, moved } = drag;
+    drag = null;
+    if (!moved && track.dataset.cam) playAt(track.dataset.cam, timeAt(track, e.clientX), true);
+  });
+  rows.addEventListener("wheel", (e) => {
+    const track = e.target.closest(".tl-track") || rows.querySelector(".tl-track");
+    if (!track) return;
+    e.preventDefault();
+    const t = timeAt(track, e.clientX), span = PB.v1 - PB.v0;
+    const next = Math.max(MIN, Math.min(span * (e.deltaY > 0 ? 1.25 : 0.8), addDays(PB.day, 1) - PB.day));
+    setViewWindow(t - (t - PB.v0) * (next / span), next);
+    redraw();
+  }, { passive: false });
+  for (const b of document.querySelectorAll(".tl-zoom button")) {
+    b.onclick = () => {
+      const span = +b.dataset.span * SEC, t = playTime();
+      const center = t != null && dayOf(t) === PB.day ? t : (PB.v0 + PB.v1) / 2;
+      setViewWindow(center - span / 2, span);
+      redraw();
+    };
+  }
+}
+
+function setView(playback) {
+  PB.on = playback;
+  document.body.classList.toggle("playback", playback);
+  $("#nvr").hidden = !playback;
+  $("#view-live").setAttribute("aria-pressed", String(!playback));
+  $("#view-playback").setAttribute("aria-pressed", String(playback));
+  // The live grid is off screen during playback, so stop its streams (scheduled recording carries on).
+  invoke("set_live_paused", { paused: playback }).catch(() => {});
+  clearInterval(PB.timer);
+  if (playback) {
+    loadRecordings();
+    PB.timer = setInterval(loadRecordings, 10_000); // new segments show up while cameras record
+  } else {
+    video.pause();
+    if (document.fullscreenElement) document.exitFullscreen();
+  }
+  try { localStorage.setItem("view", playback ? "playback" : "live"); } catch { /* ignore */ }
+}
+
+function setupPlayback() {
+  $("#view-live").onclick = (e) => { e.stopPropagation(); setView(false); };
+  $("#view-playback").onclick = (e) => { e.stopPropagation(); setView(true); };
+  $("#pb-media").onclick = () => call("open_media_folder");
+  $("#pb-speed").append(...SPEEDS.map((s) => Object.assign(el("option"), { value: String(s), textContent: `${s}×` })));
+  $("#pb-speed").value = "1";
+  $("#pb-speed").onchange = (e) => setSpeed(+e.target.value);
+  for (const b of document.querySelectorAll("#pb-transport [data-act]")) b.onclick = () => act(b.dataset.act);
+  $("#pb-day").onchange = (e) => {
+    if (!e.target.value) return;
+    const [y, m, d] = e.target.value.split("-");
+    setDay(new Date(+y, m - 1, +d).getTime());
+    renderPlayback();
+  };
+  $("#pb-prev-day").onclick = () => { setDay(addDays(PB.day, -1)); renderPlayback(); };
+  $("#pb-next-day").onclick = () => { setDay(addDays(PB.day, 1)); renderPlayback(); };
+  $("#pb-latest").onclick = () => {
+    const last = (PB.cam && camFiles(PB.cam).at(-1)) || PB.files.at(-1);
+    if (last) openFile(last, 0, true);
+  };
+  setupTimeline();
+  document.addEventListener("keydown", (e) => {
+    if (!PB.on || document.querySelector("dialog[open]") || e.target.closest?.("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
+    const keys = { " ": "play", ArrowLeft: "back", ArrowRight: "fwd", ",": "frame-back", ".": "frame-fwd", i: "in", o: "out", f: "full" };
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (keys[k]) { e.preventDefault(); act(keys[k]); }
+    else if (k === "[" || k === "]") setSpeed(SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, SPEEDS.indexOf(PB.speed) + (k === "]" ? 1 : -1)))]);
+  });
+  let resume = false;
+  try { resume = localStorage.getItem("view") === "playback"; } catch { /* storage unavailable */ }
+  if (resume) setView(true);
+}
+
 // ---------- refresh loop ----------
 async function refresh() {
   try {
@@ -935,6 +1327,7 @@ refresh();
 setInterval(refresh, 800);
 $("#rescan").onclick = () => scanLan();
 setupSettings();
+setupPlayback();
 scanLan(true);
 setInterval(() => scanLan(true), 30_000);
 
@@ -969,6 +1362,14 @@ function demoInvoke(cmd, args) {
     { key: "bright", label: "Brightness", kind: "range", value: "128", display: "128", min: 0, max: 255, options: [] },
     { key: "daynight", label: "Day / night", kind: "choice", value: "color", display: "Always color", options: [{ value: "auto", label: "Auto" }, { value: "color", label: "Always color" }] },
     { key: "model", label: "Model", kind: "info", value: "Argus 4 Pro", display: "Argus 4 Pro", options: [] }] });
+  if (cmd === "list_recordings") {
+    // A day of motion clips plus one continuous camera, all named after demo.mp4 next to the page.
+    const day = new Date().setHours(0, 0, 0, 0), files = [];
+    const name = (cam, t) => { const d = new Date(t), p = (n) => String(n).padStart(2, "0"); return `${cam}_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.mp4`; };
+    for (let h = 6; h < 22; h += 1.7) files.push({ name: name("Front_Yard", day + h * 3600e3), size: 38e6, modified: day + h * 3600e3 + 9 * 60e3 });
+    for (let h = 0; h < 12; h += 0.5) files.push({ name: name("Driveway", day + h * 3600e3), size: 410e6, modified: day + (h + 0.5) * 3600e3 });
+    return Promise.resolve({ dir: "", files });
+  }
   if (cmd === "scan_lan") return Promise.resolve([{ uid: "95270000EXAMPLEA", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;

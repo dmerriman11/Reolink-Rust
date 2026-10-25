@@ -57,6 +57,20 @@ fn spawn(args: &[&str], stdout: bool) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+/// Run ffmpeg to completion (clip export, stills), returning its error output on failure.
+pub async fn run(args: &[&std::ffi::OsStr]) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new(ffmpeg());
+    cmd.args(["-hide_banner", "-loglevel", "error"]).args(args).stdin(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = cmd.output().await.map_err(|e| format!("couldn't run ffmpeg: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("ffmpeg: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 /// Feeds Annex-B NAL units to a writer thread so a slow ffmpeg never stalls the network task.
 fn feeder(mut stdin: ChildStdin) -> SyncSender<Vec<u8>> {
     let (tx, rx) = sync_channel::<Vec<u8>>(64);
