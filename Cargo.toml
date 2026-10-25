@@ -1,6 +1,6 @@
 [package]
 name = "reolink-rs"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -29,3 +29,6 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [workspace]
 members = [".", "neolink_core"]
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full", "test-util"] }

@@ -62,14 +62,18 @@ v3.0.0.4978 answers 400 to the full document read back from 46 (it carries an em
   `<AlarmArea version="1.1"><chn>N</chn><mdArea|personArea|vehicleArea|…><width/><height/><area>base64</area>`
   with a raw width×height bitmap.
 
-The app now sends exactly that partial document (`settings::outgoing`): channelId plus the changed groups.
-Sensitivity is the `sensInfoNew` default (1–50); changing it also sets every period, like the official control.
-If a camera still refuses a write, its fields turn read-only for that camera with an explanation
-(`settings::Camera::writable`).
+What the app sends, as established on Frontyard (owner-approved write tests):
+- **Sensitivity**: the partial `<MD>` with only `sensInfoNew` on 47 (`settings::outgoing`). The camera applies it
+  but never answers; it drops the connection after 40–50 s and shows the new value after the reconnect. The engine
+  treats an unanswered (not refused) write as pending and re-reads until the value shows, up to 180 s
+  (`settings::settled`); the UI says a motion save takes 1–3 minutes. Changing it also sets every period, like the
+  official control.
+- **Detection area**: AlarmArea on 345 (`settings::alarm_area`), acknowledged in ~2 s with no reconnect. A `<scope>`
+  sent on 47 is accepted silently and ignored.
+- **Motion on/off**: shown, not edited. An enable-only `<MD>` on 47 is never answered or applied (twice: Backyard
+  went unreachable ~20 min; Frontyard stayed `enable=1`).
 
-An earlier hand-made enable-only `<MD>` probe made one camera drop off Baichuan for ~20 minutes (it answered
-ping, came back on its own, config unchanged). Live-camera validation of the new partial writes therefore waits
-for the owner's go-ahead (`examples/settings_check.rs --write` covers motion).
+If a camera refuses a write (400/405), its fields turn read-only for that camera (`settings::Camera::writable`).
 
 Intentionally read-only: Wi-Fi network switching (116/117: a wrong value strands a battery camera), users
 (58 rejected), AI detection config (342/344 rejected without a request payload).
@@ -82,7 +86,7 @@ Intentionally read-only: Wi-Fi network switching (116/117: a wrong value strands
 | Display | camera name on video, show name, show date/time, watermark, brightness, contrast, saturation, hue, sharpness, day/night, anti-flicker | 44/45, 26/25 |
 | Stream | Clear/Fluent resolution (read-only), frame rate and bitrate (options from StreamInfoList), audio per stream | 56/57, 146 |
 | Detection & recording | PIR on, PIR sensitivity, reduce false alarms, push on, email on, SD retention, post-motion record time | 212/213, 219/218, 217/216, 54/55 |
-| Motion detection | on, detection area (painted grid over a live snapshot), sensitivity | 46/47 (partial documents, see above) |
+| Motion detection | on (read-only), detection area (painted grid over a live snapshot), sensitivity | 46 read; 47 sensitivity, 345 area (see above) |
 | Privacy masks | on, up to 8 rectangles drawn over a live snapshot | 52/53 |
 | Schedules | record on + schedule, push / email / FTP schedules, siren on + schedule (7×24 paint grid per alarm type) | 81/82, 219/218, 217/216, 70/71, 232/231 |
 | Email | SMTP server/port/SSL, user, password (write-only), sender name, 3 recipients, attachment; "Send test email" | 42/43, 141 |

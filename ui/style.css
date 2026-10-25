@@ -91,12 +91,16 @@ h2 { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .14em; text-tra
 .battery i::before { content: ""; position: absolute; inset: 1px; right: auto; width: calc(var(--pct) * 1%); max-width: calc(100% - 2px); background: currentColor; border-radius: 1px; }
 .battery i::after { content: ""; position: absolute; right: -4px; top: 1.5px; width: 2px; height: 3px; background: currentColor; border-radius: 0 1px 1px 0; }
 .battery.low { color: var(--rec); }
+/* Actions slide down from the card's top edge; the card grows to make room, so nothing on it is covered. */
+.device { transition: background .18s, border-color .18s, padding-top .2s var(--ease); }
+.device:hover, .device:focus-within { padding-top: 30px; }
 .device-menu {
-  position: absolute; right: 6px; top: 6px; display: none; gap: 2px;
-  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 8px; padding: 2px;
+  position: absolute; left: 6px; right: 6px; top: 4px; display: flex; justify-content: flex-end; gap: 2px;
+  opacity: 0; transform: translateY(-8px); pointer-events: none;
+  transition: opacity .16s, transform .2s var(--ease);
 }
-.device:hover .device-menu, .device:focus-within .device-menu { display: flex; }
-.device-menu button { border: 0; background: transparent; padding: 4px 8px; border-radius: 6px; font-size: 11.5px; color: var(--muted); }
+.device:hover .device-menu, .device:focus-within .device-menu { opacity: 1; transform: none; pointer-events: auto; }
+.device-menu button { border: 0; background: transparent; padding: 3px 8px; border-radius: 6px; font-size: 11px; line-height: 1.3; color: var(--muted); }
 .device-menu button:hover { background: var(--panel); color: var(--text); }
 .device-menu button.danger:hover { color: var(--rec); }
 .empty-hint { color: var(--faint); padding: 8px 6px; }
@@ -108,6 +112,7 @@ h2 { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .14em; text-tra
   border-radius: 9px; border: 1px dashed var(--line-strong); cursor: pointer;
   transition: border-color .18s, background .18s; animation: rise .4s var(--ease) both;
 }
+.nearby-item.busy { opacity: .55; pointer-events: none; }
 .nearby-item:hover { border-color: var(--accent); background: rgba(244, 177, 62, .05); }
 .nearby-ip { font: 600 12.5px/1.2 var(--display); font-variant-numeric: tabular-nums; }
 .nearby-uid { grid-column: 1; color: var(--faint); font: 11px/1.2 var(--display); letter-spacing: .03em; }

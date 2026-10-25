@@ -30,6 +30,9 @@ struct Saved {
     clear: Vec<usize>,
     #[serde(default)]
     prefs: prefs::Prefs,
+    /// Cameras the user removed, kept so they can be re-added from "Found nearby" without retyping the login.
+    #[serde(default)]
+    removed: Vec<DeviceConfig>,
 }
 
 fn config_path() -> PathBuf {
@@ -51,6 +54,7 @@ struct Inner {
     /// Last JPEG box sent to each device.
     boxes: HashMap<u64, (u32, u32)>,
     next_id: u64,
+    removed: Vec<DeviceConfig>,
 }
 
 struct App {
@@ -109,6 +113,7 @@ impl Inner {
             tiles: self.tiles.iter().map(|t| t.and_then(idx)).collect(),
             clear: self.clear.iter().filter_map(|&id| idx(id)).collect(),
             prefs: prefs::get(),
+            removed: self.removed.clone(),
         };
         let path = config_path();
         let res = std::fs::create_dir_all(path.parent().unwrap())
@@ -239,7 +244,10 @@ fn save_device(app: State<App>, id: Option<u64>, mut config: DeviceConfig) -> Re
 fn remove_device(app: State<App>, id: u64) -> Result<(), String> {
     let mut inner = app.inner.lock().unwrap();
     let i = inner.index(id)?;
-    inner.devices.remove(i); // Drop aborts its worker
+    let old = inner.devices.remove(i); // Drop aborts its worker
+    let cfg = old.config.clone();
+    inner.removed.retain(|d| !(d.uid.eq_ignore_ascii_case(&cfg.uid) && d.host == cfg.host));
+    inner.removed.push(cfg);
     app.feeds.lock().unwrap().remove(&id);
     inner.sent.remove(&id);
     inner.clear.retain(|&c| c != id);
@@ -365,6 +373,46 @@ async fn scan_lan(app: State<'_, App>) -> Result<Vec<FoundDto>, String> {
         .collect())
 }
 
+/// Add a camera found on the LAN without asking for its login when one is known: its own login if it was removed
+/// earlier, else the login the user's other cameras use, else the factory default (admin, no password). Tries at most
+/// three logins so the camera's lock-out after repeated failures isn't reached. Ok(false): ask the user.
+#[tauri::command]
+async fn add_found(app: State<'_, App>, uid: String, ip: String) -> Result<bool, String> {
+    let candidates: Vec<DeviceConfig> = {
+        let inner = app.inner.lock().unwrap();
+        let fresh = |username: &str, password: &str| DeviceConfig {
+            name: String::new(), host: ip.clone(), uid: uid.clone(), port: None,
+            username: username.into(), password: password.into(), channel: 0,
+        };
+        let mut c: Vec<DeviceConfig> = inner.removed.iter()
+            .filter(|d| d.uid.eq_ignore_ascii_case(&uid) || d.host == ip)
+            .map(|d| DeviceConfig { host: ip.clone(), uid: uid.clone(), ..d.clone() })
+            .collect();
+        c.extend(inner.devices.iter().map(|d| fresh(&d.config.username, &d.config.password)));
+        c.push(fresh("admin", ""));
+        let mut seen = std::collections::HashSet::new();
+        c.retain(|d| seen.insert((d.username.clone(), d.password.clone())));
+        c.truncate(3);
+        c
+    };
+    for mut cfg in candidates {
+        let probe = { let cfg = cfg.clone(); app.rt.spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(15), device::probe_login(&cfg)).await }) };
+        let Ok(Ok(Ok(name))) = probe.await else { continue };
+        if cfg.name.is_empty() {
+            cfg.name = if name.is_empty() { format!("Camera {}", ip.rsplit('.').next().unwrap_or(&ip)) } else { name };
+        }
+        let mut inner = app.inner.lock().unwrap();
+        if inner.devices.iter().any(|d| d.config.uid.eq_ignore_ascii_case(&uid)) {
+            return Ok(true); // added meanwhile
+        }
+        inner.removed.retain(|d| !d.uid.eq_ignore_ascii_case(&uid));
+        app.spawn(&mut inner, cfg);
+        inner.changed();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// The settings engine's view of a device: requests go through its worker, which owns the connection.
 /// `.1` holds messages this camera refused to write (400/405), shared for as long as the device exists.
 struct DeviceCam(tokio::sync::mpsc::UnboundedSender<Cmd>, std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u32>>>);
@@ -390,12 +438,12 @@ impl settings::Camera for DeviceCam {
         if let Err(e) = &r
             && settings::is_refusal(e)
         {
-            self.1.lock().unwrap().insert(msg.get);
+            self.1.lock().unwrap().insert(msg.set.unwrap_or(msg.get));
         }
         r
     }
     fn writable(&self, msg: settings::Msg) -> bool {
-        !self.1.lock().unwrap().contains(&msg.get)
+        !self.1.lock().unwrap().contains(&msg.set.unwrap_or(msg.get))
     }
 }
 
@@ -527,7 +575,7 @@ fn main() {
     prefs::set(saved.prefs.clone());
     let app = App {
         rt,
-        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, boxes: HashMap::new(), next_id: 0 }),
+        inner: Mutex::new(Inner { devices: vec![], tiles: vec![None; MAX_TILES], layout: 4, clear: vec![], sent: HashMap::new(), solo: None, hidden: false, boxes: HashMap::new(), next_id: 0, removed: saved.removed.clone() }),
         feeds,
         port,
         token,
@@ -551,7 +599,7 @@ fn main() {
             set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
-            get_prefs, save_prefs, pick_folder
+            get_prefs, save_prefs, pick_folder, add_found
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Resized(_) = event {

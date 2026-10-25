@@ -1,6 +1,6 @@
 #![allow(dead_code)] // shares the app's modules but uses only part of them
 //! Validate camera settings end to end on saved cameras, through the same worker and engine the app uses:
-//! `cargo run --example settings_check -- [--write]`
+//! `cargo run --example settings_check -- [--write] [--only <camera name>]`
 //! Reads every settings page. With --write: (1) writes every writable field back with its current value, which
 //! proves each write id and format is accepted without changing anything; (2) makes small reversible changes,
 //! verifies the camera applied them, restores the originals and verifies again.
@@ -57,6 +57,16 @@ fn flip(s: &str, i: usize) -> String {
 fn tweak(key: &str, cur: &str) -> Option<String> {
     Some(match key {
         "md_sens" => (if cur == "50" { 49 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
+        "dn_level" | "spk_volume" | "stitch_x" => (if cur == "100" { 99 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
+        "push_interval" => (if cur == "20" { 30 } else { 20 }).to_string(),
+        "ai_denoise" | "rich_push" | "pre_alarm" => (if cur == "1" { "0" } else { "1" }).to_string(),
+        "ps_sched" => {
+            let mut m: BTreeMap<String, String> = serde_json::from_str(cur).ok()?;
+            let k = m.keys().next()?.clone();
+            let t = flip(&m[&k], 3);
+            m.insert(k, t);
+            serde_json::to_string(&m).ok()?
+        }
         "ir_bright" => (if cur == "100" { 99 } else { cur.parse::<i64>().ok()? + 1 }).to_string(),
         "tl_overwrite" => (if cur == "1" { "0" } else { "1" }).to_string(),
         "ftp_port" => (if cur == "2121" { "2122" } else { "2121" }).to_string(),
@@ -90,7 +100,21 @@ fn tweak(key: &str, cur: &str) -> Option<String> {
 const REVERSIBLE: &[(&str, &str)] = &[
     ("motion", "md_sens"), ("motion", "md_zone"), ("schedules", "push_sched"), ("privacy", "masks"),
     ("smart", "tl_overwrite"), ("ftp", "ftp_port"), ("email", "smtp_nick"), ("lights", "ir_bright"),
+    ("display", "dn_level"), ("display", "ai_denoise"), ("display", "stitch_x"), ("detection", "push_interval"),
+    ("detection", "rich_push"), ("audio", "spk_volume"), ("audio", "pre_alarm"), ("power", "ps_sched"),
 ];
+
+/// The page once the camera answers it with `key` (motion writes make Argus cameras reconnect for up to ~2 min).
+async fn read_with(cam: &Cam, page: &settings::Page, key: &str) -> settings::PageView {
+    let t = Instant::now();
+    loop {
+        let v = settings::read_page(cam, page).await;
+        if v.fields.iter().any(|f| f.key == key) || t.elapsed() > Duration::from_secs(180) {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
 
 async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
     // The worker connects in the background; wait until a settings read succeeds.
@@ -121,8 +145,10 @@ async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
         return Ok(all_ok);
     }
 
+    // CHECK_KEYS=a,b limits the run to those reversible changes (no no-op pass).
+    let keys: Option<Vec<String>> = std::env::var("CHECK_KEYS").ok().map(|k| k.split(',').map(str::to_string).collect());
     // (1) No-op writes: every writable field back with its current value.
-    for page in settings::PAGES {
+    for page in settings::PAGES.iter().filter(|_| keys.is_none()) {
         let view = settings::read_page(cam, page).await;
         let same: BTreeMap<String, String> = view
             .fields
@@ -144,9 +170,9 @@ async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
     }
 
     // (2) Reversible changes.
-    for (page_id, key) in REVERSIBLE {
+    for (page_id, key) in REVERSIBLE.iter().filter(|(_, k)| keys.as_ref().is_none_or(|ks| ks.iter().any(|x| x == k))) {
         let page = settings::page(page_id).unwrap();
-        let before = settings::read_page(cam, page).await;
+        let before = read_with(cam, page, key).await;
         let Some(field) = before.fields.iter().find(|f| f.key == *key) else {
             println!("{name:10} skip {key}: not offered by this camera");
             continue;
@@ -162,7 +188,7 @@ async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
             continue;
         }
         let r2 = settings::write_page(cam, page, &one(key, original.clone())).await;
-        let after = settings::read_page(cam, page).await;
+        let after = read_with(cam, page, key).await;
         let restored = after.fields.iter().find(|f| f.key == *key).map(|f| f.value.clone());
         let ok = r1[0].ok && r2[0].ok && restored.as_deref() == Some(original.as_str());
         all_ok &= ok;
@@ -178,7 +204,9 @@ async fn check(cam: &Cam, name: &str, write: bool) -> anyhow::Result<bool> {
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let write = std::env::args().any(|a| a == "--write");
+    let args: Vec<String> = std::env::args().collect();
+    let write = args.iter().any(|a| a == "--write");
+    let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).cloned();
     let path = std::path::PathBuf::from(std::env::var("APPDATA")?).join("Reolink-rs/devices.json");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -186,6 +214,9 @@ fn main() -> anyhow::Result<()> {
     for (i, d) in saved["devices"].as_array().unwrap().iter().enumerate() {
         let cfg: DeviceConfig = serde_json::from_value(d.clone())?;
         let name = cfg.name.clone();
+        if only.as_ref().is_some_and(|o| *o != name) {
+            continue;
+        }
         let dev = Device::spawn(rt.handle(), i as u64, cfg);
         all_ok &= rt.block_on(check(&Cam(dev.sender()), &name, write))?;
     }

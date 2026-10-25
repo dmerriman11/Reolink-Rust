@@ -46,6 +46,12 @@ const DST: Msg = m(106, Some(107), false);
 // The SDK table labels 100 as GET, but on the camera 101 returns the config and 100 only acknowledges.
 const AUTO_REBOOT: Msg = m(101, Some(100), false);
 const MOTION: Msg = m(46, Some(47), true);
+/// The detection area is read from 46 but written with AlarmArea (345): Argus 4 Pro acknowledges it at once, while a
+/// `<scope>` sent on 47 is dropped silently (verified on the camera; official client: setAlarmAreas).
+const MOTION_AREA: Msg = m(46, Some(345), true);
+/// Motion on/off: an enable-only `<MD>` on 47 is never answered or applied by Argus 4 Pro (the camera drops the
+/// connection; verified twice), so it is shown, not edited.
+const MOTION_STATE: Msg = m(46, None, true);
 const MASKS: Msg = m(52, Some(53), true);
 const REC_SCHEDULE: Msg = m(81, Some(82), true);
 const FTP_TASK: Msg = m(70, Some(71), true);
@@ -258,8 +264,8 @@ pub static PAGES: &[Page] = &[
         id: "motion",
         title: "Motion detection",
         fields: &[
-            f("md_on", "Motion detection", MOTION, "MD/enable", Kind::Toggle),
-            f("md_zone", "Detection area", MOTION, "MD", Kind::Zone),
+            f("md_on", "Motion detection", MOTION_STATE, "MD/enable", Kind::Info(Fmt::Plain)),
+            f("md_zone", "Detection area", MOTION_AREA, "MD", Kind::Zone),
             // The official client edits sensInfoNew whenever the camera reports it (iSensVerion != 0);
             // shortcut: older cameras with only the legacy sensitivityInfoList don't show this field.
             f("md_sens", "Sensitivity", MOTION, MD_SENS_DEFAULT, MD_SENS),
@@ -721,6 +727,10 @@ fn apply(field: &Field, xml: &str, value: &str) -> Result<String, String> {
 fn applied(field: &Field, after: &str, value: &str) -> bool {
     match field.kind {
         Kind::Masks => read_masks(after, field.path).is_some_and(|got| masks_close(&got, value)),
+        // Compare the grid itself; key order in the JSON doesn't matter.
+        Kind::Zone => read_zone(after, field.path).is_some_and(|got| {
+            serde_json::from_str::<ZoneValue>(&got).ok() == serde_json::from_str::<ZoneValue>(value).ok()
+        }),
         Kind::Password { .. } => xmledit::get(after, field.path).as_deref() == Some(value),
         _ => extract(field, after).as_deref() == Some(value),
     }
@@ -741,6 +751,9 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 /// partial `<MD>` (FUN_18014e120): channelId plus only the groups being changed. Argus cameras answer 400 to the
 /// whole document read back from 46 (its empty timeBlockList/handleException aren't accepted as input).
 fn outgoing(msg: Msg, xml: String, edits: &[(&Field, &String)]) -> Result<String, String> {
+    if msg == MOTION_AREA {
+        return alarm_area(&xml);
+    }
     if msg != MOTION {
         return Ok(xml);
     }
@@ -771,6 +784,23 @@ fn outgoing(msg: Msg, xml: String, edits: &[(&Field, &String)]) -> Result<String
 ",
         groups.join("
 ")
+    ))
+}
+
+/// The SDK's AlarmArea document (FUN_1801bcbd0) for the edited MD grid: the raw width x height bitmap, row-major,
+/// first cell in the high bit, base64 (no 96x64 canvas, unlike MD's scope).
+fn alarm_area(md_xml: &str) -> Result<String, String> {
+    let (w, h, cols, _, bytes) = zone_geometry(md_xml, "MD").ok_or("camera's detection area couldn't be read")?;
+    let mut area = vec![0u8; (w * h).div_ceil(8)];
+    for i in 0..w * h {
+        if bit(&bytes, (i / w) * cols + i % w) {
+            area[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    let channel = xmledit::get(md_xml, "MD/channelId").unwrap_or_else(|| "0".into());
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AlarmArea version=\"1.1\">\n<chn>{channel}</chn>\n<mdArea>\n<width>{w}</width>\n<height>{h}</height>\n<area>{}</area>\n</mdArea>\n</AlarmArea>\n</body>\n",
+        base64::engine::general_purpose::STANDARD.encode(&area)
     ))
 }
 
@@ -988,7 +1018,7 @@ pub struct WriteResult {
 pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<String, String>) -> Vec<WriteResult> {
     let mut results = vec![];
     let mut cache = HashMap::new();
-    let mut by_msg: BTreeMap<u32, (Msg, Edits)> = BTreeMap::new();
+    let mut by_msg: BTreeMap<(u32, Option<u32>), (Msg, Edits)> = BTreeMap::new();
     // Blank passwords mean "keep the current one".
     let changes: BTreeMap<&String, &String> = changes
         .iter()
@@ -1026,7 +1056,7 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
         let current = fetch(cam, field.msg, &mut cache).await.and_then(|x| extract(field, &x));
         let ok = validate(field, value, &opts).or_else(|e| if current.as_deref() == Some(value.as_str()) { Ok(()) } else { Err(e) });
         match ok {
-            Ok(()) => by_msg.entry(field.msg.get).or_insert((field.msg, vec![])).1.push((field, value)),
+            Ok(()) => by_msg.entry((field.msg.get, field.msg.set)).or_insert((field.msg, vec![])).1.push((field, value)),
             Err(e) => results.push(WriteResult { key: key.clone(), ok: false, error: Some(e) }),
         }
     }
@@ -1062,16 +1092,26 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
                 continue;
             }
         };
-        if let Err(e) = cam.set(msg, xml).await {
-            let why = if is_refusal(&e) {
-                "this camera doesn't allow changing this setting (it refused the write)".to_string()
-            } else {
-                format!("camera rejected the change: {e}")
-            };
-            fail(&mut results, &edits, why);
-            continue;
-        }
-        let after = cam.get(msg).await.ok();
+        let after = match cam.set(msg, xml).await {
+            // Some changes show up a few seconds after the acknowledgement (AlarmArea 345).
+            Ok(()) => match cam.get(msg).await.ok() {
+                Some(x) if edits.iter().all(|(f, v)| applied(f, &x, v)) => Some(x),
+                read => settled(cam, msg, &edits, ACK_SETTLE_SECS).await.or(read),
+            },
+            Err(e) if is_refusal(&e) => {
+                fail(&mut results, &edits, "this camera doesn't allow changing this setting (it refused the write)".into());
+                continue;
+            }
+            // No answer is not a refusal: Argus cameras apply motion (47) and then drop the connection instead of
+            // replying (measured: drop after 40-50 s, value read back after the reconnect). Judge by what sticks.
+            Err(e) => match settled(cam, msg, &edits, SETTLE_SECS).await {
+                Some(x) => Some(x),
+                None => {
+                    fail(&mut results, &edits, format!("camera didn't confirm the change: {e}"));
+                    continue;
+                }
+            },
+        };
         for (f, v) in edits {
             let ok = after.as_deref().is_some_and(|x| applied(f, x, v));
             let error = (!ok).then(|| match f.kind {
@@ -1086,6 +1126,25 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
     }
     results
 }
+
+/// After an unanswered write: re-read until the camera is back and shows every edit, for up to SETTLE_SECS.
+async fn settled<C: Camera>(cam: &C, msg: Msg, edits: &[(&Field, &String)], secs: u64) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Ok(x) = cam.get(msg).await
+            && edits.iter().all(|(f, v)| applied(f, &x, v))
+        {
+            return Some(x);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+const SETTLE_SECS: u64 = 180;
+const ACK_SETTLE_SECS: u64 = 20;
 
 /// Send the camera's current Email/Ftp settings to its test command (141/194); the camera reports success.
 pub async fn run_test<C: Camera>(cam: &C, test: Msg) -> Result<(), String> {
@@ -1128,6 +1187,8 @@ mod tests {
         /// Refuse writes to this get-id with 400, like Argus cameras do for motion (47).
         refuse_msg: Option<u32>,
         refused: Mutex<Vec<u32>>,
+        /// Apply writes but answer like a dropped connection, as Argus cameras do for motion.
+        drop_after_set: bool,
     }
 
     impl Fake {
@@ -1139,6 +1200,7 @@ mod tests {
                 masks_echo: false,
                 refuse_msg: None,
                 refused: Mutex::new(vec![]),
+                drop_after_set: false,
             }
         }
 
@@ -1154,7 +1216,13 @@ mod tests {
                 let old = xmledit::get(&map[&msg.get], path).unwrap();
                 new = xmledit::set(&new, path, &old).unwrap();
             }
-            if msg == MOTION {
+            if msg == MOTION_AREA {
+                let (w, h) = (xmledit::get(&new, "AlarmArea/mdArea/width").unwrap().parse::<usize>().unwrap(),
+                    xmledit::get(&new, "AlarmArea/mdArea/height").unwrap().parse::<usize>().unwrap());
+                let area = base64::engine::general_purpose::STANDARD.decode(xmledit::get(&new, "AlarmArea/mdArea/area").unwrap()).unwrap();
+                let cells: String = (0..w * h).map(|i| if bit(&area, i) { '1' } else { '0' }).collect();
+                new = write_zone(&map[&msg.get], "MD", &serde_json::to_string(&ZoneValue { w, h, cells }).unwrap()).unwrap();
+            } else if msg == MOTION {
                 // Cameras refuse the whole document read back from 46 and merge the partial one.
                 if new.contains("<timeBlockList") || new.contains("<handleException") || new.contains("<sensitivityInfoList") {
                     return Err("Msg of type 47 returned code 400".into());
@@ -1181,7 +1249,7 @@ mod tests {
             async move { r }
         }
         fn set(&self, msg: Msg, xml: String) -> impl std::future::Future<Output = Result<(), String>> + Send {
-            let r = self.apply(msg, xml);
+            let r = self.apply(msg, xml).and_then(|()| if self.drop_after_set { Err("BcUDP reciver dropped".into()) } else { Ok(()) });
             async move { r }
         }
         fn writable(&self, msg: Msg) -> bool {
@@ -1221,7 +1289,8 @@ mod tests {
     }
 
     fn run<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+        // Paused clock: settle waits after writes run instantly.
+        tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap().block_on(f)
     }
 
     fn changes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1342,6 +1411,14 @@ mod tests {
     }
 
     #[test]
+    fn unanswered_writes_count_once_the_camera_shows_them() {
+        let mut cam = Fake::new(&[(46, &md_xml())]);
+        cam.drop_after_set = true;
+        let r = run(write_page(&cam, page("motion").unwrap(), &changes(&[("md_sens", "30")])));
+        assert!(r[0].ok, "{r:?}");
+    }
+
+    #[test]
     fn motion_writes_send_only_the_changed_groups() {
         let edited = md_xml();
         let field = |k: &str| page("motion").unwrap().fields.iter().find(|f| f.key == k).unwrap();
@@ -1351,9 +1428,11 @@ mod tests {
         for absent in ["<enable>", "<scope>", "<timeBlockList", "<handleException>", "<sensitivityInfoList>"] {
             assert!(!doc.contains(absent), "{absent} in {doc}");
         }
-        let doc = outgoing(MOTION, edited, &[(field("md_zone"), &v), (field("md_on"), &v)]).unwrap();
-        assert!(["<enable>1</enable>", "<width>80</width>", "<height>22</height>", "<valueTable>"].iter().all(|t| doc.contains(t)), "{doc}");
-        assert!(!doc.contains("sensInfoNew"));
+        // The area goes out as AlarmArea: raw 80x22 bits (all on in md_xml) = 220 bytes of 0xff.
+        let doc = outgoing(MOTION_AREA, edited, &[(field("md_zone"), &v)]).unwrap();
+        let area = base64::engine::general_purpose::STANDARD.decode(xmledit::get(&doc, "AlarmArea/mdArea/area").unwrap()).unwrap();
+        assert_eq!(area, vec![0xff; 220]);
+        assert_eq!(xmledit::get(&doc, "AlarmArea/chn").as_deref(), Some("0"));
     }
 
     #[test]

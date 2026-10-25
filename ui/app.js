@@ -108,7 +108,8 @@ function renderDevices() {
     const del = Object.assign(el("button", "danger"), { textContent: "Remove" });
     del.onclick = (e) => {
       e.stopPropagation();
-      if (confirm(`Remove ${d.name}?`)) call("remove_device", { id: d.id }).then(refresh);
+      // Rescan once the camera has dropped our session, so it shows up again under "Found nearby".
+      if (confirm(`Remove ${d.name}?`)) call("remove_device", { id: d.id }).then(() => { refresh(); setTimeout(() => scanLan(), 1500); });
     };
     menu.append(gear, edit, del);
     li.append(menu);
@@ -516,7 +517,8 @@ async function saveSettings() {
   const changes = Object.fromEntries(Object.keys(S.values).filter((k) => S.values[k] !== S.original[k]).map((k) => [k, S.values[k]]));
   S.busy = true;
   updateFooter();
-  setStatus("Saving…");
+  // Argus cameras apply motion changes and then drop the connection; the save waits for the reconnect to verify.
+  setStatus(S.page === "motion" ? "Saving… motion changes take 1–3 minutes while the camera reconnects." : "Saving…");
   try {
     if (S.mode === "app") {
       const p = await invoke("save_prefs", { prefs: viewToPrefs(S.values) });
@@ -766,7 +768,14 @@ async function scanLan(auto = false) {
         Object.assign(el("span", "nearby-add"), { textContent: "Add" }),
         Object.assign(el("span", "nearby-uid"), { textContent: f.uid }),
       );
-      const add = () => openDialog(null, { name: `Camera ${f.ip.split(".").pop()}`, host: f.ip, uid: f.uid });
+      // One click: re-adds a removed camera, or uses a login that works; only otherwise ask for it.
+      const add = async () => {
+        li.classList.add("busy");
+        const added = await invoke("add_found", { uid: f.uid, ip: f.ip }).catch(() => false);
+        li.classList.remove("busy");
+        if (added) { toast(`Added ${f.ip}`); refresh(); scanLan(); }
+        else openDialog(null, { name: `Camera ${f.ip.split(".").pop()}`, host: f.ip, uid: f.uid });
+      };
       li.onclick = add;
       li.onkeydown = (e) => { if (e.key === "Enter") add(); };
       return li;
@@ -891,7 +900,7 @@ setInterval(refresh, 800);
 $("#rescan").onclick = () => scanLan();
 setupSettings();
 scanLan(true);
-setInterval(() => scanLan(true), 120_000);
+setInterval(() => scanLan(true), 30_000);
 
 // ---------- demo data when opened outside Tauri (design preview only) ----------
 function demoInvoke(cmd, args) {

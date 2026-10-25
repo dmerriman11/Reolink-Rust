@@ -188,6 +188,18 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
     }
 }
 
+/// Log in once with `cfg` over the LAN (no relay) and return the camera's own name, for adding found cameras.
+pub async fn probe_login(cfg: &DeviceConfig) -> Result<String> {
+    // LAN only (the camera was just found here), but keep the UID: Argus cameras won't take a LAN session without it.
+    let opts = BcCameraOpt { discovery: DiscoveryMethods::Local, max_discovery_retries: 3, ..camera_opts(cfg)? };
+    let cam = BcCamera::new(&opts).await.context("connect")?;
+    cam.login().await.context("login")?;
+    let general = cam.get_xml(104, false).await.unwrap_or_default();
+    let name = general.split("<deviceName>").nth(1).and_then(|r| r.split("</deviceName>").next()).unwrap_or("").trim().to_string();
+    let _ = cam.logout().await;
+    Ok(name)
+}
+
 fn camera_opts(cfg: &DeviceConfig) -> Result<BcCameraOpt> {
     let host = cfg.host.trim();
     let uid = cfg.uid.trim();
