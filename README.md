@@ -16,7 +16,13 @@ connected (pinged every 5 s) and reconnects automatically, resuming its live vie
 - Unparseable frames, stray extension payloads and bad UDP datagrams are skipped instead of dropping the connection.
 - `get_xml`/`set_xml` raw settings access (read-modify-write keeps fields the typed model doesn't know).
 
-Re-record the demo above (Playwright + ffmpeg, synthetic feeds): `node docs/demo/record.cjs`.
+| Live grid | Single view |
+|---|---|
+| ![2x2 live grid with motion and recording badges](docs/screenshots/grid.png) | ![Single camera view with stream, snapshot and record controls](docs/screenshots/single.png) |
+| **Motion zone over a live snapshot** | **Camera settings** |
+| ![Motion settings: sensitivity and a painted detection area](docs/screenshots/settings-motion.png) | ![Display settings page](docs/screenshots/settings-display.png) |
+
+Re-record the demo above (Playwright + ffmpeg, synthetic feeds): `node docs/demo/record.cjs`; retake the screenshots: `node docs/demo/screenshots.cjs`.
 
 Test a saved camera end to end (stream, decode, ~8 s recording): `cargo run --example probe -- "<device name>" [main|sub]`.
 Measure each saved camera's video/audio bitrate per stream: `cargo run --release --example bitrate`.

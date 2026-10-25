@@ -135,7 +135,8 @@ function serve() {
   });
 }
 
-(async () => {
+module.exports = { INIT, SCENES, serve, W, H, setGateOnline: (v) => { gateOnline = v; } };
+if (require.main === module) (async () => {
   const srv = await serve();
   const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "reolink-demo-"));
   const browser = await chromium.launch({ channel: "msedge" }); // Edge = the WebView2 engine the app runs in
