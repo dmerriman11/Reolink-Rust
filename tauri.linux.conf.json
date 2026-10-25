@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "targets": ["deb"],
+    "resources": [],
+    "linux": {
+      "deb": {
+        "depends": ["ffmpeg"]
+      }
+    }
+  }
+}

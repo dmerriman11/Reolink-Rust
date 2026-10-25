@@ -26,8 +26,11 @@ fn ffmpeg() -> PathBuf {
     let local = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("ffmpeg.exe")));
+    // Apps launched from Finder don't get Homebrew's PATH.
+    let brew = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].map(PathBuf::from);
     match local {
         Some(p) if p.exists() => p,
+        _ if cfg!(target_os = "macos") => brew.into_iter().find(|p| p.exists()).unwrap_or_else(|| "ffmpeg".into()),
         _ => PathBuf::from("ffmpeg"),
     }
 }
