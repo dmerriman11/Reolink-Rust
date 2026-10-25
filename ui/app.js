@@ -240,6 +240,39 @@ function renderPtz() {
   $("#dpad").classList.toggle("disabled", !d || !d.online);
 }
 
+// ---------- device panel and full screen ----------
+function setupView() {
+  const toggle = $("#sidebar-toggle");
+  const apply = (collapsed) => {
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.title = collapsed ? "Show device panel" : "Hide device panel";
+  };
+  try { apply(localStorage.getItem("sidebarCollapsed") === "1"); } catch { /* storage unavailable */ }
+  toggle.onclick = () => {
+    const collapsed = !document.body.classList.contains("sidebar-collapsed");
+    apply(collapsed);
+    try { localStorage.setItem("sidebarCollapsed", collapsed ? "1" : "0"); } catch { /* ignore */ }
+  };
+
+  // The window goes full screen too (outside Tauri, the browser's own full screen).
+  const win = window.__TAURI__?.window?.getCurrentWindow?.();
+  const setFull = async (on) => {
+    document.body.classList.toggle("fullscreen", on);
+    try {
+      if (win) await win.setFullscreen(on);
+      else if (on) await document.documentElement.requestFullscreen?.();
+      else if (document.fullscreenElement) await document.exitFullscreen();
+    } catch (e) { console.warn("full screen", e); }
+  };
+  $("#fullscreen").onclick = () => setFull(true);
+  $("#fs-exit").onclick = () => setFull(false);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.body.classList.contains("fullscreen") && !document.querySelector("dialog[open]")) setFull(false);
+  });
+  document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && !win) document.body.classList.remove("fullscreen"); });
+}
+
 function setupPtz() {
   const panel = $("#ptz");
   const toggle = $("#ptz-toggle");
@@ -888,11 +921,13 @@ async function refresh() {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && solo != null && !$("#device-dialog").open) setSolo(null);
+  // In full screen, Esc leaves full screen first (setupView).
+  if (e.key === "Escape" && solo != null && !$("#device-dialog").open && !document.body.classList.contains("fullscreen")) setSolo(null);
 });
 $("#media-folder").onclick = () => call("open_media_folder");
 
 buildLayouts();
+setupView();
 setupPtz();
 setupDialog();
 refresh();
