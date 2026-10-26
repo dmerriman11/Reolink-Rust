@@ -102,24 +102,35 @@
           <span class="pb-cam" id="pb-cam"></span>
           <span class="pb-clock" id="pb-clock"></span>
         </div>
+        <button class="pb-zoom" id="pb-zoom" hidden title="Reset zoom (0)"></button>
         <div class="pb-msg" id="pb-msg">Pick a recording on the timeline.</div>
       </section>
       <section class="pb-grid" id="pb-grid" hidden aria-label="Recordings as thumbnails"></section>
 
       <aside class="pb-files">
-        <div class="section-head"><h2 id="pb-files-title">Recordings</h2></div>
+        <div class="section-head">
+          <h2 id="pb-files-title">Recordings</h2>
+          <button class="icon-btn" id="pb-list-thumbs" aria-pressed="false" title="Show thumbnails" aria-label="Show thumbnails in the list">
+            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="7" height="5" rx="1"/><rect x="3" y="14" width="7" height="5" rx="1"/><path d="M13 7.5h8M13 16.5h8"/></svg>
+          </button>
+        </div>
         <ul class="pb-file-list" id="pb-file-list"></ul>
       </aside>
     </div>
 
     <div class="pb-transport" id="pb-transport">
+      <div class="pb-seek">
+        <span class="pb-pos" id="pb-pos">0:00</span>
+        <input type="range" id="pb-seek" min="0" max="1" step="any" value="0" aria-label="Position in this recording" disabled>
+        <span class="pb-pos" id="pb-dur">0:00</span>
+      </div>
       <div class="pb-group">
         <button class="tbtn" data-act="prev" title="Previous recording" aria-label="Previous recording"><svg viewBox="0 0 24 24"><path d="M6 5v14M18 6l-9 6 9 6z"/></svg></button>
-        <button class="tbtn" data-act="back" title="Back 10 s (←)" aria-label="Back 10 seconds"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6M19 6l-6 6 6 6"/></svg></button>
+        <button class="tbtn" data-act="back" title="Back 10 s (←, Shift+← 1 min)" aria-label="Back 10 seconds"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6M19 6l-6 6 6 6"/></svg></button>
         <button class="tbtn" data-act="frame-back" title="Previous frame (,)" aria-label="Previous frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
         <button class="tbtn play" data-act="play" id="pb-play" title="Play (Space)" aria-label="Play"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
         <button class="tbtn" data-act="frame-fwd" title="Next frame (.)" aria-label="Next frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
-        <button class="tbtn" data-act="fwd" title="Forward 10 s (→)" aria-label="Forward 10 seconds"><svg viewBox="0 0 24 24"><path d="M13 6l6 6-6 6M5 6l6 6-6 6"/></svg></button>
+        <button class="tbtn" data-act="fwd" title="Forward 10 s (→, Shift+→ 1 min)" aria-label="Forward 10 seconds"><svg viewBox="0 0 24 24"><path d="M13 6l6 6-6 6M5 6l6 6-6 6"/></svg></button>
         <button class="tbtn" data-act="next" title="Next recording" aria-label="Next recording"><svg viewBox="0 0 24 24"><path d="M18 5v14M6 6l9 6-9 6z"/></svg></button>
         <label class="pb-speed" title="Playback speed ([ and ])">
           <select id="pb-speed" aria-label="Playback speed"></select>

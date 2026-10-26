@@ -60,8 +60,10 @@ Playback (done for local recordings): Playback in the left sidebar opens an NVR 
 folder: day picker, one timeline row per camera (click to play, scroll to zoom, drag to pan), segments play back
 to back across gaps, 0.25-16x speed, frame step, ±10 s, clip export (In/Out, no re-encode, into `Clips\`),
 still frame to the snapshot folder, show in folder, delete, and a Thumbnails view of the day's recordings
-(preview frames cached in `.thumbs\`). Live streams pause while it's open.
-Keys: Space, ← →, , . (frame), [ ] (speed), I / O, F.
+(preview frames cached in `.thumbs\`). A scrubber under the player shows the position in the open recording and
+the In/Out range; the wheel zooms into the picture (up to 8x, drag to pan); the recordings list can show
+thumbnails. Live streams pause while it's open.
+Keys: Space, ← → (Shift: 1 min), Home / End, , . (frame), [ ] (speed), I / O, F, + - 0 (zoom). Double-click: full screen.
 
 Tray (0.4.1): minimizing or closing hides the window to the tray (left-click to show it again). The tray's
 right-click menu has Show, Pause recording (stops manual and scheduled recording until unchecked) and Quit.

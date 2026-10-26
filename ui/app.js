@@ -1107,7 +1107,7 @@ const FRAME = 1 / 15; // shortcut: assumes Reolink's usual 15 fps; read the stre
 const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
 const TICKS = [10 * SEC, 30 * SEC, MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR];
 const NAME_RE = /^(.*)_(\d{4})-(\d\d)-(\d\d)_(\d\d)-(\d\d)-(\d\d)\.mp4$/i;
-const PB = { on: false, opened: false, dir: "", files: [], cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [] };
+const PB = { on: false, opened: false, dir: "", files: [], cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
 const video = $("#pb-video");
 
 const safeName = (n) => n.replace(/[^\p{L}\p{N}-]/gu, "_"); // as device.rs names the files
@@ -1196,18 +1196,32 @@ const thumbs = new Map(); // "<name>|<size>" -> image src, or null when the file
 const thumbQueue = [];
 let thumbsBusy = 0;
 const thumbKey = (f) => `${f.name}|${f.size}`; // a growing file gets another try once it changes
-const thumbObserver = new IntersectionObserver((entries) => {
-  for (const e of entries) {
-    if (!e.isIntersecting) continue;
-    thumbObserver.unobserve(e.target);
-    thumbQueue.push(e.target);
-  }
-  pumpThumbs();
-}, { rootMargin: "200px" });
+// One per view (grid, sidebar list), so rebuilding one doesn't drop the other's pending thumbnails.
+const thumbWatcher = () => {
+  const o = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      o.unobserve(e.target);
+      thumbQueue.push(e.target);
+    }
+    pumpThumbs();
+  }, { rootMargin: "200px" });
+  return o;
+};
+const thumbObserver = thumbWatcher();
+const listThumbObserver = thumbWatcher();
+
+// Show a card's thumbnail now if it's known, else load it once the card scrolls into view.
+function watchThumb(card, observer) {
+  const f = card._file;
+  if (thumbs.has(thumbKey(f))) showThumb(card, thumbs.get(thumbKey(f)));
+  else observer.observe(card);
+}
 
 function pumpThumbs() {
   while (thumbsBusy < 3 && thumbQueue.length) {
     const card = thumbQueue.shift();
+    if (!card.isConnected) continue; // its view was rebuilt meanwhile; the new card asks again
     const f = card._file;
     thumbsBusy++;
     invoke("recording_thumb", { name: f.name })
@@ -1237,7 +1251,6 @@ function renderGrid() {
   const key = JSON.stringify([PB.day, files.map(thumbKey), PB.cur?.name]);
   if (key === gridKey) return;
   gridKey = key;
-  thumbQueue.length = 0;
   thumbObserver.disconnect();
   if (!files.length) { grid.replaceChildren(el("p", "pb-grid-empty", "No recordings this day.")); return; }
   grid.replaceChildren(...files.map((f) => {
@@ -1249,8 +1262,7 @@ function renderGrid() {
     meta.append(Object.assign(el("strong"), { textContent: camLabel(f.cam) }), Object.assign(el("span"), { textContent: `${fmtTime(f.start)} · ${fmtDur(f.end - f.start)}` }));
     card.append(meta);
     card.onclick = () => { setGridMode(false); openFile(f, 0, true); };
-    if (thumbs.has(thumbKey(f))) showThumb(card, thumbs.get(thumbKey(f)));
-    else thumbObserver.observe(card);
+    watchThumb(card, thumbObserver);
     return card;
   }));
 }
@@ -1263,14 +1275,26 @@ function setGridMode(on) {
   if (on) { video.pause(); gridKey = null; renderGrid(); }
 }
 
+let filesKey = null;
 function renderFiles() {
   $("#pb-files-title").textContent = PB.cam ? `${camLabel(PB.cam)} · ${fmtDay(PB.day)}` : "Recordings";
   const files = PB.cam ? dayFiles(PB.cam) : [];
   const list = $("#pb-file-list");
+  // Rebuild only on change: the 10 s refresh would otherwise reload every thumbnail.
+  const key = JSON.stringify([PB.cam, PB.day, files.map((f) => [thumbKey(f), f.end]), PB.cur?.name, PB.listThumbs]);
+  if (key === filesKey) return;
+  filesKey = key;
+  list.classList.toggle("thumbs", PB.listThumbs);
+  listThumbObserver.disconnect();
   if (!files.length) { list.replaceChildren(el("li", "pb-empty", "Nothing recorded this day.")); return; }
   list.replaceChildren(...files.map((f) => {
     const li = el("li", "pb-file" + (f === PB.cur ? " current" : ""));
     li.tabIndex = 0;
+    li._file = f;
+    if (PB.listThumbs) {
+      li.append(el("span", "pb-thumb"));
+      watchThumb(li, listThumbObserver);
+    }
     li.append(Object.assign(el("span", "pb-file-time"), { textContent: `${fmtTime(f.start)} – ${fmtTime(f.end)}` }));
     li.append(Object.assign(el("span", "pb-file-meta"), { textContent: `${fmtDur(f.end - f.start)} · ${fmtBytes(f.size)}` }));
     const menu = el("span", "device-menu");
@@ -1342,7 +1366,30 @@ function renderTimeline() {
   }));
 }
 
-// Cheap updates that rebuild nothing: clock, play button, playhead.
+// "4:05", or "1:02:09" past an hour.
+const fmtClock = (s) => {
+  s = Math.max(0, Math.floor(s || 0));
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+};
+
+// The scrubber under the player: position in the open recording, its length, and the In/Out range.
+let scrubbing = false;
+function renderSeek() {
+  const seek = $("#pb-seek"), dur = video.duration, ok = !!PB.cur && Number.isFinite(dur) && dur > 0;
+  seek.disabled = !ok;
+  const at = ok ? video.currentTime / dur : 0;
+  if (!scrubbing) seek.value = String(at);
+  const pct = (s) => `${Math.min(100, Math.max(0, (s / dur) * 100))}%`;
+  seek.style.setProperty("--played", ok ? pct(video.currentTime) : "0%");
+  const [a, b] = PB.mark;
+  seek.style.setProperty("--in", ok && a != null ? pct(a) : "0%");
+  seek.style.setProperty("--out", ok && a != null ? pct(b ?? a) : "0%");
+  $("#pb-pos").textContent = fmtClock(ok ? video.currentTime : 0);
+  $("#pb-dur").textContent = fmtClock(ok ? dur : 0);
+}
+
+// Cheap updates that rebuild nothing: clock, play button, scrubber, playhead.
 function tick() {
   const t = playTime();
   $("#pb-clock").textContent = t == null ? "" : `${fmtDay(t)}  ${fmtTime(t)}`;
@@ -1353,6 +1400,7 @@ function tick() {
     play.title = paused ? "Play (Space)" : "Pause (Space)";
     play.setAttribute("aria-label", paused ? "Play" : "Pause");
   }
+  renderSeek();
   if (t == null) { for (const h of PB.heads) h.hidden = true; return; }
   // Keep the playhead on screen while playing: page the view forward (into the next day if need be).
   if (!paused && (t > PB.v1 || t < PB.v0)) {
@@ -1413,7 +1461,74 @@ video.onerror = () => {
 video.onended = () => { const n = PB.cur && nextFile(PB.cur); if (n) openFile(n, 0, true); else tick(); };
 video.ontimeupdate = tick;
 video.onplay = video.onpause = tick;
-video.onclick = () => act("play");
+video.onclick = () => { if (zoom.dragged) zoom.dragged = false; else act("play"); };
+video.ondblclick = () => act("full");
+
+// ---------- playback: digital zoom ----------
+// Wheel zooms around the pointer, drag pans, 0 or the chip resets: for a closer look at part of a wide picture.
+const zoom = { s: 1, x: 0, y: 0, drag: null, dragged: false };
+const ZOOM_MAX = 8;
+
+function applyZoom() {
+  const p = $("#pb-player"), w = p.clientWidth, h = p.clientHeight;
+  zoom.s = Math.min(ZOOM_MAX, Math.max(1, zoom.s));
+  // The picture inside the player (object-fit: contain letterboxes it): keep it filling the player along each axis
+  // where it's big enough, else centred, so panning never shows just the black bars.
+  const fit = Math.min(w / (video.videoWidth || w), h / (video.videoHeight || h));
+  const pw = (video.videoWidth || w) * fit, ph = (video.videoHeight || h) * fit;
+  const clamp = (pos, view, size, offset) => {
+    const lo = view - zoom.s * (offset + size), hi = -zoom.s * offset;
+    return zoom.s * size >= view ? Math.min(hi, Math.max(lo, pos)) : (view - zoom.s * size) / 2 - zoom.s * offset;
+  };
+  zoom.x = clamp(zoom.x, w, pw, (w - pw) / 2);
+  zoom.y = clamp(zoom.y, h, ph, (h - ph) / 2);
+  const on = zoom.s > 1.001;
+  video.style.transform = on ? `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})` : "";
+  p.classList.toggle("zoomed", on);
+  const chip = $("#pb-zoom");
+  chip.hidden = !on;
+  chip.textContent = `${zoom.s.toFixed(1)}× · Reset`;
+}
+
+// Zoom by `factor`, keeping the point (px, py) of the player where it is.
+function zoomBy(factor, px, py) {
+  const p = $("#pb-player");
+  px ??= p.clientWidth / 2;
+  py ??= p.clientHeight / 2;
+  const s = Math.min(ZOOM_MAX, Math.max(1, zoom.s * factor));
+  zoom.x = px - ((px - zoom.x) * s) / zoom.s;
+  zoom.y = py - ((py - zoom.y) * s) / zoom.s;
+  zoom.s = s;
+  applyZoom();
+}
+
+function setupZoom() {
+  const p = $("#pb-player");
+  p.addEventListener("wheel", (e) => {
+    if (!PB.cur) return;
+    e.preventDefault();
+    const r = p.getBoundingClientRect();
+    zoomBy(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  video.addEventListener("pointerdown", (e) => {
+    if (zoom.s <= 1 || e.button !== 0) return;
+    video.setPointerCapture(e.pointerId);
+    zoom.drag = { x: e.clientX, y: e.clientY, zx: zoom.x, zy: zoom.y };
+  });
+  video.addEventListener("pointermove", (e) => {
+    const d = zoom.drag;
+    if (!d) return;
+    if (Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) > 4) { zoom.dragged = true; p.classList.add("panning"); }
+    zoom.x = d.zx + e.clientX - d.x;
+    zoom.y = d.zy + e.clientY - d.y;
+    applyZoom();
+  });
+  const endDrag = () => { zoom.drag = null; p.classList.remove("panning"); };
+  video.addEventListener("pointerup", endDrag);
+  video.addEventListener("pointercancel", endDrag);
+  $("#pb-zoom").onclick = () => { zoom.s = 1; applyZoom(); };
+  new ResizeObserver(applyZoom).observe(p); // full screen, window resize: keep the picture in bounds
+}
 
 function seekBy(secs) {
   const t = playTime();
@@ -1543,6 +1658,21 @@ function setupPlayback() {
   $("#pb-speed").value = "1";
   $("#pb-speed").onchange = (e) => setSpeed(+e.target.value);
   for (const b of document.querySelectorAll("#pb-transport [data-act]")) b.onclick = () => act(b.dataset.act);
+  const seek = $("#pb-seek");
+  seek.addEventListener("pointerdown", () => { scrubbing = true; });
+  seek.addEventListener("pointerup", () => { scrubbing = false; });
+  seek.oninput = () => { if (PB.cur && video.duration) { video.currentTime = +seek.value * video.duration; renderSeek(); } };
+  setupZoom();
+  const listThumbs = $("#pb-list-thumbs");
+  const setListThumbs = (on) => {
+    PB.listThumbs = on;
+    listThumbs.setAttribute("aria-pressed", String(on));
+    listThumbs.title = on ? "Hide thumbnails" : "Show thumbnails";
+    try { localStorage.setItem("pbListThumbs", on ? "1" : ""); } catch { /* storage unavailable */ }
+    renderFiles();
+  };
+  listThumbs.onclick = () => setListThumbs(!PB.listThumbs);
+  try { if (localStorage.getItem("pbListThumbs")) setListThumbs(true); } catch { /* storage unavailable */ }
   $("#pb-day").onchange = (e) => {
     if (!e.target.value) return;
     const [y, m, d] = e.target.value.split("-");
@@ -1560,6 +1690,13 @@ function setupPlayback() {
     if (!PB.on || document.querySelector("dialog[open]") || e.target.closest?.("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
     const keys = { " ": "play", ArrowLeft: "back", ArrowRight: "fwd", ",": "frame-back", ".": "frame-fwd", i: "in", o: "out", f: "full" };
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // Extras on the open recording: a minute at a time, its start/end, and zoom.
+    const more = {
+      ArrowLeft: () => e.shiftKey && seekBy(-60), ArrowRight: () => e.shiftKey && seekBy(60),
+      Home: () => PB.cur && (video.currentTime = 0), End: () => PB.cur && video.duration && (video.currentTime = Math.max(0, video.duration - 1)),
+      "+": () => zoomBy(1.25), "=": () => zoomBy(1.25), "-": () => zoomBy(0.8), "0": () => { zoom.s = 1; applyZoom(); },
+    };
+    if (more[k] && more[k]() !== false) { e.preventDefault(); return; }
     if (keys[k]) { e.preventDefault(); act(keys[k]); }
     else if (k === "[" || k === "]") setSpeed(SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, SPEEDS.indexOf(PB.speed) + (k === "]" ? 1 : -1)))]);
   });

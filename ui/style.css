@@ -423,6 +423,42 @@ body.playback .stage, body.playback .ptz { display: none; }
   height: 28px; margin-left: 8px; padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--bg-2);
   color: var(--text); font: 600 12px/1 var(--display); font-variant-numeric: tabular-nums;
 }
+/* Scrubber for the open recording: --played and the In/Out range (--in, --out) paint its track. */
+.pb-seek { flex-basis: 100%; display: flex; align-items: center; gap: 10px; }
+.pb-pos { min-width: 52px; font: 600 12px/1 var(--display); font-variant-numeric: tabular-nums; color: var(--muted); }
+.pb-pos:last-child { text-align: right; }
+.pb-seek input[type="range"] {
+  --played: 0%; --in: 0%; --out: 0%;
+  flex: 1; max-width: none; height: 18px; margin: 0; background: transparent; -webkit-appearance: none; appearance: none; cursor: pointer;
+}
+.pb-seek input::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px;
+  background:
+    linear-gradient(90deg, transparent var(--in), rgba(63, 214, 138, .7) var(--in) var(--out), transparent var(--out)),
+    linear-gradient(90deg, var(--accent) var(--played), var(--line-strong) var(--played));
+}
+.pb-seek input::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px; border: 0; border-radius: 50%; background: var(--accent);
+  transition: transform .15s;
+}
+.pb-seek input:hover::-webkit-slider-thumb, .pb-seek input:focus-visible::-webkit-slider-thumb { transform: scale(1.3); }
+.pb-seek input:disabled { cursor: default; opacity: .4; }
+
+/* Digital zoom: the video is scaled and panned inside the player; the chip shows the level and resets it. */
+.pb-player video { transform-origin: 0 0; }
+.pb-player.zoomed video { cursor: grab; }
+.pb-player.panning video { cursor: grabbing; }
+.pb-zoom {
+  position: absolute; right: 12px; bottom: 12px; padding: 5px 10px; border: 1px solid var(--line-strong); border-radius: 999px;
+  background: rgba(0, 0, 0, .65); color: var(--text); font: 600 11.5px/1 var(--display); font-variant-numeric: tabular-nums;
+}
+.pb-zoom:hover { border-color: var(--accent); color: var(--accent); }
+.pb-zoom[hidden] { display: none; }
+
+/* Recordings list with thumbnails (toggle in its header). */
+.icon-btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.pb-file-list.thumbs .pb-file { grid-template-columns: 80px minmax(0, 1fr); column-gap: 10px; align-items: center; }
+.pb-file-list.thumbs .pb-thumb { grid-row: span 2; width: 80px; border-radius: 5px; font-size: 9.5px; }
 
 .timeline { --gutter: 132px; position: relative; margin: 0 16px 14px; padding: 8px 12px 6px; border-radius: var(--radius); background: var(--bg-2); border: 1px solid var(--line); }
 .tl-zoom { position: absolute; left: 12px; top: 6px; display: flex; gap: 1px; padding: 2px; border-radius: 7px; background: var(--bg); }
