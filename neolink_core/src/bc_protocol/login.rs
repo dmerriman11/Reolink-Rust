@@ -21,6 +21,11 @@ pub enum MaxEncryption {
 }
 
 impl BcCamera {
+    /// Whether the session negotiated at login is AES encrypted (BCEncrypt is a fixed XOR, as good as plain text).
+    pub fn is_aes(&self) -> bool {
+        self.aes.load(Ordering::Relaxed)
+    }
+
     /// Login to the camera.
     ///
     /// This should be called before most other commands
@@ -75,6 +80,9 @@ impl BcCamera {
             sub_login.send(legacy_login).await?;
 
             let legacy_reply = sub_login.recv().await?;
+            // The camera picks the encryption in this reply (0xddXX); remember whether it chose AES.
+            let code = legacy_reply.meta.response_code;
+            self.aes.store(code >> 8 == 0xdd && matches!(code & 0xff, 0x02 | 0x12), Ordering::Relaxed);
 
             let nonce;
             match &legacy_reply.body {

@@ -5,6 +5,8 @@
 
 #[path = "../src/device.rs"]
 mod device;
+#[path = "../src/secrets.rs"]
+mod secrets;
 #[path = "../src/settings.rs"]
 mod settings;
 #[path = "../src/xmledit.rs"]
@@ -31,9 +33,10 @@ fn main() -> anyhow::Result<()> {
     let kind = if args.next().as_deref() == Some("sub") { StreamKind::Sub } else { StreamKind::Main };
     let path = std::path::PathBuf::from(std::env::var("APPDATA")?).join("Reolink-rs/devices.json");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let cfg: DeviceConfig = serde_json::from_value(
+    let mut cfg: DeviceConfig = serde_json::from_value(
         saved["devices"].as_array().unwrap().iter().find(|d| d["name"] == name.as_str()).expect("no such device").clone(),
     )?;
+    secrets::load(&mut cfg); // the password is in the OS credential store
 
     let rt = tokio::runtime::Runtime::new()?;
     let dev = Device::spawn(rt.handle(), 1, cfg);

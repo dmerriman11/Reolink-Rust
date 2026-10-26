@@ -57,6 +57,15 @@ fn route(request: &str, token: &str) -> Option<Route> {
     query.split('&').any(|kv| kv == format!("t={token}")).then_some(route)
 }
 
+/// The app's own page origins (Windows serves it from http://tauri.localhost, macOS/Linux from tauri://localhost).
+const APP_ORIGINS: [&str; 3] = ["http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"];
+
+/// The request's Origin header when it is the app's page; no other site may read /raw.
+fn app_origin(request: &str) -> Option<&'static str> {
+    let origin = request.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("origin")))?.1.trim();
+    APP_ORIGINS.into_iter().find(|o| *o == origin)
+}
+
 async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Result<()> {
     let mut buf = vec![0u8; 2048];
     let mut n = 0;
@@ -82,7 +91,7 @@ async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Resu
     if let Route::Raw(_) = route {
         let (gop, rx) = views.raw.subscribe();
         drop(views);
-        return raw(sock, gop, rx).await;
+        return raw(sock, app_origin(&req), gop, rx).await;
     }
     let mut rx = views.jpeg.subscribe();
     drop(views);
@@ -112,14 +121,20 @@ async fn write_raw(sock: &mut TcpStream, f: &Raw) -> std::io::Result<()> {
     sock.write_all(&f.data).await
 }
 
-async fn raw(mut sock: TcpStream, gop: Vec<Arc<Raw>>, mut rx: broadcast::Receiver<Arc<Raw>>) -> std::io::Result<()> {
+async fn raw(
+    mut sock: TcpStream,
+    origin: Option<&str>,
+    gop: Vec<Arc<Raw>>,
+    mut rx: broadcast::Receiver<Arc<Raw>>,
+) -> std::io::Result<()> {
     sock.set_nodelay(true)?;
-    // Fetched cross-origin from the app's page (a plain GET, so no preflight); the token is what guards it.
-    sock.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\
-          Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-    )
-    .await?;
+    // Fetched cross-origin from the app's page (a plain GET, so no preflight). Only that page may read it; the
+    // token guards it as well.
+    let cors = origin.map(|o| format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n")).unwrap_or_default();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n{cors}Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(head.as_bytes()).await?;
     for f in &gop {
         write_raw(&mut sock, f).await?;
     }
@@ -140,7 +155,17 @@ async fn raw(mut sock: TcpStream, gop: Vec<Arc<Raw>>, mut rx: broadcast::Receive
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, route};
+    use super::{Route, app_origin, route};
+
+    #[test]
+    fn only_the_app_page_may_read_raw() {
+        let req = |origin: &str| format!("GET /raw/1?t=x HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {origin}\r\n\r\n");
+        assert_eq!(app_origin(&req("http://tauri.localhost")), Some("http://tauri.localhost"));
+        assert_eq!(app_origin(&req("tauri://localhost")), Some("tauri://localhost"));
+        assert_eq!(app_origin(&req("https://evil.example")), None);
+        assert_eq!(app_origin(&req("http://tauri.localhost.evil.example")), None);
+        assert_eq!(app_origin("GET /raw/1?t=x HTTP/1.1\r\n\r\n"), None);
+    }
 
     #[test]
     fn routes_only_with_token() {

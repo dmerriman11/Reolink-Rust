@@ -7,6 +7,8 @@
 
 #[path = "../src/device.rs"]
 mod device;
+#[path = "../src/secrets.rs"]
+mod secrets;
 #[path = "../src/prefs.rs"]
 mod prefs;
 #[path = "../src/media.rs"]
@@ -212,7 +214,8 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let mut all_ok = true;
     for (i, d) in saved["devices"].as_array().unwrap().iter().enumerate() {
-        let cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+        let mut cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+        secrets::load(&mut cfg); // the password is in the OS credential store
         let name = cfg.name.clone();
         if only.as_ref().is_some_and(|o| *o != name) {
             continue;

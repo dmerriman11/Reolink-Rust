@@ -6,6 +6,8 @@
 
 #[path = "../src/device.rs"]
 mod device;
+#[path = "../src/secrets.rs"]
+mod secrets;
 #[path = "../src/prefs.rs"]
 mod prefs;
 #[path = "../src/media.rs"]
@@ -25,7 +27,8 @@ fn main() -> anyhow::Result<()> {
     let path = dirs::config_dir().unwrap().join("Reolink-rs/devices.json");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let d = saved["devices"].as_array().unwrap().iter().find(|d| d["name"] == want.as_str()).expect("no such camera");
-    let cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+    let mut cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+    secrets::load(&mut cfg); // the password is in the OS credential store
     let dir = std::env::temp_dir().join("reolink-rs-record-stream-check");
     let _ = std::fs::remove_dir_all(&dir);
     prefs::set(prefs::Prefs { record_dir: dir.clone(), snapshot_dir: dir.clone(), segment_minutes: 0, ..Default::default() });

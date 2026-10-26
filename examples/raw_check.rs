@@ -5,6 +5,8 @@
 
 #[path = "../src/device.rs"]
 mod device;
+#[path = "../src/secrets.rs"]
+mod secrets;
 #[path = "../src/prefs.rs"]
 mod prefs;
 #[path = "../src/media.rs"]
@@ -29,7 +31,8 @@ fn main() -> anyhow::Result<()> {
     let path = dirs::config_dir().unwrap().join("Reolink-rs/devices.json");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let d = saved["devices"].as_array().unwrap().iter().find(|d| d["name"] == want.as_str()).expect("no such camera");
-    let cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+    let mut cfg: DeviceConfig = serde_json::from_value(d.clone())?;
+    secrets::load(&mut cfg); // the password is in the OS credential store
 
     let rt = tokio::runtime::Runtime::new()?;
     let feeds = stream::Feeds::default();

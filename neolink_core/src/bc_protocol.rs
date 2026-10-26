@@ -74,6 +74,8 @@ pub struct BcCamera {
     channel_id: u8,
     connection: Arc<BcConnection>,
     logged_in: AtomicBool,
+    /// The last login negotiated AES (0xdd02 or 0xdd12), not BCEncrypt or plain text.
+    aes: AtomicBool,
     message_num: AtomicU16,
     // Certain commands such as logout require the username/pass in plain text.... why....???
     credentials: Credentials,
@@ -362,6 +364,7 @@ impl BcCamera {
             message_num: AtomicU16::new(0),
             channel_id: options.channel_id,
             logged_in: AtomicBool::new(false),
+            aes: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
             cancel: CancellationToken::new(),

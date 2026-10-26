@@ -48,10 +48,18 @@ pub struct DeviceConfig {
     pub uid: String,
     pub port: Option<u16>,
     pub username: String,
-    // shortcut: stored in plain text in %APPDATA%; move to Windows Credential Manager before sharing builds.
+    /// Held in the OS credential store under `secret` (see secrets.rs); in devices.json only if the store refused it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub password: String,
     /// NVR channel, 0 for a standalone camera.
     pub channel: u8,
+    /// Names this camera's entry in the credential store.
+    #[serde(default)]
+    pub secret: String,
+    /// The camera has logged in with AES before; a weaker offer later means something on the network is
+    /// interfering, so it is refused. Editing the camera clears this.
+    #[serde(default)]
+    pub aes: bool,
 }
 
 /// Reply channel for request/response commands.
@@ -88,6 +96,8 @@ pub struct State {
     pub motion: bool,
     /// Motion starts seen since the app started; the UI beeps when it grows.
     pub motion_events: u64,
+    /// This session is AES encrypted; the app pins the camera to AES from then on (DeviceConfig::aes).
+    pub aes: bool,
 }
 
 pub struct Device {
@@ -169,9 +179,10 @@ struct Wanted {
 
 async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex<State>>, views: Arc<Views>) {
     let mut wanted = Wanted { live: None, record: false, jpeg_box: crate::media::DEFAULT_BOX };
+    let mut aes = cfg.aes; // pinned once seen, for this run too
     let mut backoff = 1;
     loop {
-        let err = match session(&cfg, &mut rx, &state, &views, &mut wanted).await {
+        let err = match session(&cfg, &mut rx, &state, &views, &mut wanted, &mut aes).await {
             Ok(()) => return, // command channel closed: device removed
             Err(e) => e,
         };
@@ -312,6 +323,7 @@ async fn session(
     state: &Arc<Mutex<State>>,
     views: &Views,
     wanted: &mut Wanted,
+    aes: &mut bool,
 ) -> Result<()> {
     let set = |f: &dyn Fn(&mut State)| f(&mut state.lock().unwrap());
     set(&|s| s.status = "Connecting".into());
@@ -319,11 +331,19 @@ async fn session(
     let cam = std::sync::Arc::new(BcCamera::new(&camera_opts(cfg)?).await.context("connect")?);
     set(&|s| s.status = "Logging in".into());
     cam.login().await.context("login")?;
+    // BCEncrypt is a fixed XOR. A camera that has done AES doesn't go back: refuse rather than send video and
+    // settings (camera passwords included) in the clear to whatever answered.
+    if cam.is_aes() {
+        *aes = true;
+    } else if *aes {
+        anyhow::bail!("camera offered weaker encryption than the AES it used before; refused in case something on the network is intercepting (edit the camera to accept it)");
+    }
 
     let battery = cam.battery_info().await.ok();
     set(&|s| {
         s.online = true;
         s.status = "Online".into();
+        s.aes = cam.is_aes();
         s.battery = battery.as_ref().map(|b| b.battery_percent);
         s.charging = battery.as_ref().is_some_and(|b| b.charge_status == "charging");
     });

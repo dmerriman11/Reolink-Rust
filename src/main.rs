@@ -6,6 +6,7 @@ mod prefs;
 mod recordings;
 mod xmledit;
 mod scan;
+mod secrets;
 mod settings;
 mod stream;
 
@@ -93,7 +94,10 @@ struct App {
 }
 
 impl App {
-    fn spawn(&self, inner: &mut Inner, cfg: DeviceConfig) -> u64 {
+    fn spawn(&self, inner: &mut Inner, mut cfg: DeviceConfig) -> u64 {
+        if cfg.secret.is_empty() {
+            cfg.secret = secrets::new_id();
+        }
         inner.next_id += 1;
         let dev = Device::spawn(self.rt.handle(), inner.next_id, cfg);
         self.feeds.lock().unwrap().insert(dev.id, dev.views.clone());
@@ -135,16 +139,27 @@ impl Inner {
     fn save(&self) {
         let idx = |id: u64| self.devices.iter().position(|d| d.id == id);
         let saved = Saved {
-            devices: self.devices.iter().map(|d| d.config.clone()).collect(),
+            devices: self.devices.iter().map(|d| secrets::for_disk(&d.config)).collect(),
             layout: self.layout,
             tiles: self.tiles.iter().map(|t| t.and_then(idx)).collect(),
             clear: self.clear.iter().filter_map(|&id| idx(id)).collect(),
             prefs: prefs::get(),
-            removed: self.removed.clone(),
+            removed: self.removed.iter().map(secrets::for_disk).collect(),
         };
         let path = config_path();
         if let Err(e) = write_atomic(&path, &serde_json::to_vec_pretty(&saved).unwrap()) {
             log::error!("save {}: {e}", path.display());
+        }
+    }
+
+    /// Forget removed cameras that `keep` rejects, with their stored passwords (unless a device still uses one).
+    fn drop_removed(&mut self, keep: impl Fn(&DeviceConfig) -> bool) {
+        let (kept, dropped) = std::mem::take(&mut self.removed).into_iter().partition(|d| keep(d));
+        self.removed = kept;
+        for d in dropped {
+            if !self.devices.iter().any(|x| x.config.secret == d.secret) {
+                secrets::delete(&d.secret);
+            }
         }
     }
 
@@ -188,6 +203,17 @@ struct StateDto {
 fn get_state(app: State<App>) -> StateDto {
     let mut inner = app.inner.lock().unwrap();
     inner.sync_live(); // picks up recordings that ended off screen, so their streams stop
+    // A camera seen on AES is pinned to it from then on (DeviceConfig::aes); saved the first time.
+    let mut pinned = false;
+    for d in inner.devices.iter_mut().filter(|d| !d.config.aes) {
+        if d.state.lock().unwrap().aes {
+            d.config.aes = true;
+            pinned = true;
+        }
+    }
+    if pinned {
+        inner.save();
+    }
     let devices = inner
         .devices
         .iter()
@@ -243,6 +269,10 @@ fn save_device(app: State<App>, id: Option<u64>, mut config: DeviceConfig) -> Re
     if config.host.is_empty() && config.uid.is_empty() {
         return Err("Enter an IP/host or a UID".into());
     }
+    // Never from the page: an id it picked could overwrite another camera's stored password. Editing a camera
+    // also clears its AES pin, which is how a user accepts a camera that really did change encryption.
+    config.secret.clear();
+    config.aes = false;
     let mut inner = app.inner.lock().unwrap();
     match id {
         None => {
@@ -253,6 +283,7 @@ fn save_device(app: State<App>, id: Option<u64>, mut config: DeviceConfig) -> Re
             if config.password.is_empty() {
                 config.password = inner.devices[i].config.password.clone(); // blank = keep current
             }
+            config.secret = inner.devices[i].config.secret.clone();
             let old = inner.devices.remove(i);
             app.feeds.lock().unwrap().remove(&old.id);
             inner.sent.remove(&old.id);
@@ -277,7 +308,7 @@ fn remove_device(app: State<App>, id: u64) -> Result<(), String> {
     let i = inner.index(id)?;
     let old = inner.devices.remove(i); // Drop aborts its worker
     let cfg = old.config.clone();
-    inner.removed.retain(|d| !(d.uid.eq_ignore_ascii_case(&cfg.uid) && d.host == cfg.host));
+    inner.drop_removed(|d| !(d.uid.eq_ignore_ascii_case(&cfg.uid) && d.host == cfg.host));
     inner.removed.push(cfg);
     app.feeds.lock().unwrap().remove(&id);
     inner.sent.remove(&id);
@@ -404,44 +435,54 @@ async fn scan_lan(app: State<'_, App>) -> Result<Vec<FoundDto>, String> {
         .collect())
 }
 
-/// Add a camera found on the LAN without asking for its login when one is known: its own login if it was removed
-/// earlier, else the login the user's other cameras use, else the factory default (admin, no password). Tries at most
-/// three logins so the camera's lock-out after repeated failures isn't reached. Ok(false): ask the user.
+#[derive(Serialize)]
+struct AddFound {
+    added: bool,
+    /// When not added: cameras whose saved login could be tried on it, if the user agrees.
+    reusable: Vec<String>,
+}
+
+/// Add a camera found on the LAN. Only the factory default login (admin, no password) is tried on its own: anything
+/// on the network can answer the scan, and a login hands it MD5(password + a nonce it picks), which it can crack
+/// offline. With `reuse` (the user agreed), the login of a removed camera with this UID or IP and the logins the
+/// other cameras use are tried too. At most three logins, so the camera's lock-out after repeated failures isn't
+/// reached.
 #[tauri::command]
-async fn add_found(app: State<'_, App>, uid: String, ip: String) -> Result<bool, String> {
-    let candidates: Vec<DeviceConfig> = {
+async fn add_found(app: State<'_, App>, uid: String, ip: String, reuse: bool) -> Result<AddFound, String> {
+    // (label, config) for each login, factory default first.
+    let candidates: Vec<(String, DeviceConfig)> = {
         let inner = app.inner.lock().unwrap();
         let fresh = |username: &str, password: &str| DeviceConfig {
-            name: String::new(), host: ip.clone(), uid: uid.clone(), port: None,
-            username: username.into(), password: password.into(), channel: 0,
+            host: ip.clone(), uid: uid.clone(), username: username.into(), password: password.into(), ..Default::default()
         };
-        let mut c: Vec<DeviceConfig> = inner.removed.iter()
+        let mut c = vec![(String::new(), fresh("admin", ""))];
+        c.extend(inner.removed.iter()
             .filter(|d| d.uid.eq_ignore_ascii_case(&uid) || d.host == ip)
-            .map(|d| DeviceConfig { host: ip.clone(), uid: uid.clone(), ..d.clone() })
-            .collect();
-        c.extend(inner.devices.iter().map(|d| fresh(&d.config.username, &d.config.password)));
-        c.push(fresh("admin", ""));
+            .map(|d| (d.name.clone(), DeviceConfig { host: ip.clone(), uid: uid.clone(), aes: false, ..d.clone() })));
+        c.extend(inner.devices.iter().map(|d| (d.config.name.clone(), fresh(&d.config.username, &d.config.password))));
         let mut seen = std::collections::HashSet::new();
-        c.retain(|d| seen.insert((d.username.clone(), d.password.clone())));
+        c.retain(|(_, d)| seen.insert((d.username.clone(), d.password.clone())));
         c.truncate(3);
         c
     };
-    for mut cfg in candidates {
+    let (default, saved) = candidates.split_at(1);
+    let tries = if reuse { &candidates[..] } else { default };
+    for (_, mut cfg) in tries.iter().cloned() {
         let probe = { let cfg = cfg.clone(); app.rt.spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(15), device::probe_login(&cfg)).await }) };
         let Ok(Ok(Ok(name))) = probe.await else { continue };
         if cfg.name.is_empty() {
             cfg.name = if name.is_empty() { format!("Camera {}", ip.rsplit('.').next().unwrap_or(&ip)) } else { name };
         }
         let mut inner = app.inner.lock().unwrap();
-        if inner.devices.iter().any(|d| d.config.uid.eq_ignore_ascii_case(&uid)) {
-            return Ok(true); // added meanwhile
-        }
-        inner.removed.retain(|d| !d.uid.eq_ignore_ascii_case(&uid));
-        app.spawn(&mut inner, cfg);
-        inner.changed();
-        return Ok(true);
+        if !inner.devices.iter().any(|d| d.config.uid.eq_ignore_ascii_case(&uid)) {
+            app.spawn(&mut inner, cfg);
+            inner.drop_removed(|d| !d.uid.eq_ignore_ascii_case(&uid));
+            inner.changed();
+        } // else: added meanwhile
+        return Ok(AddFound { added: true, reusable: vec![] });
     }
-    Ok(false)
+    let reusable = if reuse { vec![] } else { saved.iter().map(|(name, _)| name.clone()).collect() };
+    Ok(AddFound { added: false, reusable })
 }
 
 /// The settings engine's view of a device: requests go through its worker, which owns the connection.
@@ -631,14 +672,18 @@ fn set_live_paused(app: State<App>, paused: bool) {
 
 #[tauri::command(async)]
 fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
-    let dir = prefs::get().record_dir;
-    // The folder is a setting, so the player's file access follows it.
-    for d in [dir.clone(), recordings::thumb_dir(&dir)] {
-        if let Err(e) = handle.asset_protocol_scope().allow_directory(&d, false) {
-            log::error!("asset scope {}: {e}", d.display());
-        }
+    let listing = recordings::list(&prefs::get().record_dir);
+    // The player may read these recordings and nothing else: the folder is a setting that can point anywhere.
+    for f in &listing.files {
+        allow_asset(&handle, &listing.dir.join(&f.name));
     }
-    recordings::list(&dir)
+    listing
+}
+
+fn allow_asset(handle: &tauri::AppHandle, file: &Path) {
+    if let Err(e) = handle.asset_protocol_scope().allow_file(file) {
+        log::error!("asset scope {}: {e}", file.display());
+    }
 }
 
 #[tauri::command(async)]
@@ -651,10 +696,12 @@ fn delete_recording(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn recording_thumb(name: String) -> Result<String, String> {
+async fn recording_thumb(handle: tauri::AppHandle, name: String) -> Result<String, String> {
     let dir = prefs::get().record_dir;
     let src = recordings::resolve(&dir, &name)?;
-    recordings::thumb(&src, &dir).await.map(|p| p.display().to_string())
+    let thumb = recordings::thumb(&src, &dir).await?;
+    allow_asset(&handle, &thumb);
+    Ok(thumb.display().to_string())
 }
 
 #[tauri::command(async)]
@@ -750,7 +797,12 @@ fn main() {
     let token = stream::token();
     let port = rt.block_on(stream::serve(feeds.clone(), token.clone())).expect("start stream server");
 
-    let saved = load_saved(&config_path());
+    let mut saved = load_saved(&config_path());
+    // Passwords still in the file (saved before the credential store) move into the store at the save below.
+    let migrate = saved.devices.iter().chain(&saved.removed).any(|c| !c.password.is_empty() || c.secret.is_empty());
+    for c in saved.devices.iter_mut().chain(saved.removed.iter_mut()) {
+        secrets::load(c);
+    }
     prefs::set(saved.prefs.clone());
     let app = App {
         rt,
@@ -768,6 +820,9 @@ fn main() {
         }
         inner.clear = saved.clear.iter().filter_map(|&i| ids.get(i).copied()).collect();
         inner.sync_live();
+        if migrate {
+            inner.save();
+        }
     }
 
     tauri::Builder::default()

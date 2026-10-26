@@ -16,6 +16,7 @@ connected (pinged every 5 s) and reconnects automatically, resuming its live vie
 - Stream and connection task errors are surfaced/logged instead of a bare `StreamFinished`.
 - Unparseable frames, stray extension payloads and bad UDP datagrams are skipped instead of dropping the connection.
 - `get_xml`/`set_xml` raw settings access (read-modify-write keeps fields the typed model doesn't know).
+- `is_aes()` reports whether login negotiated AES; the app refuses a camera that used AES before and later offers less.
 
 | Live grid | Single view |
 |---|---|
@@ -40,7 +41,7 @@ Requires `ffmpeg.exe` on PATH or next to the exe (used to write MP4s, and to dec
 cargo run --release
 ```
 
-Devices are saved to `%APPDATA%\Reolink-rs\devices.json` (`~/.config/Reolink-rs` on Linux, `~/Library/Application Support/Reolink-rs` on macOS). Snapshots and recordings go to `Videos\Reolink-rs` in your user folder.
+Devices are saved to `%APPDATA%\Reolink-rs\devices.json` (`~/.config/Reolink-rs` on Linux, `~/Library/Application Support/Reolink-rs` on macOS). Camera passwords are not in that file: they live in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under "Reolink-rs", and move there automatically from older configs. Snapshots and recordings go to `Videos\Reolink-rs` in your user folder.
 
 ## Status
 

@@ -991,12 +991,20 @@ async function scanLan(auto = false) {
         Object.assign(el("span", "nearby-add"), { textContent: "Add" }),
         Object.assign(el("span", "nearby-uid"), { textContent: f.uid }),
       );
-      // One click: re-adds a removed camera, or uses a login that works; only otherwise ask for it.
+      // One click adds a camera still on the factory login. A saved login is only tried with the user's OK: anything
+      // on the network can answer the scan, and trying a login lets it crack that password offline.
       const add = async () => {
         li.classList.add("busy");
-        const added = await invoke("add_found", { uid: f.uid, ip: f.ip }).catch(() => false);
+        const fail = { added: false, reusable: [] };
+        const tryAdd = (reuse) => invoke("add_found", { uid: f.uid, ip: f.ip, reuse }).then((r) => r || fail, () => fail);
+        let r = await tryAdd(false);
+        if (!r.added && r.reusable.length) {
+          const names = r.reusable.join(", ");
+          const ok = confirm(`Try the login saved for ${names} on ${f.ip}?\n\nOnly do this if ${f.ip} is really your camera: any device on the network can show up here, and trying a login lets it work out that password.`);
+          if (ok) r = await tryAdd(true);
+        }
         li.classList.remove("busy");
-        if (added) { toast(`Added ${f.ip}`); refresh(); scanLan(); }
+        if (r.added) { toast(`Added ${f.ip}`); refresh(); scanLan(); }
         else openDialog(null, { name: `Camera ${f.ip.split(".").pop()}`, host: f.ip, uid: f.uid });
       };
       li.onclick = add;

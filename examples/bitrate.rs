@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
             name: s("name"), channel_id: 0, addrs: s("host").parse().ok().into_iter().collect(),
             uid: Some(s("uid")).filter(|u| !u.is_empty()), port: None, protocol: ConnectionProtocol::TcpUdp,
             discovery: DiscoveryMethods::Local, max_discovery_retries: 5,
-            credentials: Credentials { username: s("username"), password: Some(s("password")) }, debug: false,
+            credentials: Credentials { username: s("username"), password: Some(password(&s("secret"), s("password"))) }, debug: false,
         }).await?;
         cam.login().await?;
         for kind in [StreamKind::Sub, StreamKind::Main] {
@@ -37,4 +37,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A camera's password from the OS credential store (see src/secrets.rs), else the one still in devices.json.
+fn password(secret: &str, in_file: String) -> String {
+    keyring::Entry::new("Reolink-rs", secret).and_then(|e| e.get_password()).unwrap_or(in_file)
 }
