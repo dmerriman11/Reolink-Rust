@@ -185,6 +185,8 @@ struct DeviceDto {
     motion: bool,
     motion_events: u64,
     message: Option<String>,
+    /// Milliseconds since the live stream's last video frame, while online and streaming.
+    frame_age_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -234,6 +236,7 @@ fn get_state(app: State<App>) -> StateDto {
                 motion: s.motion,
                 motion_events: s.motion_events,
                 message: s.message.take(),
+                frame_age_ms: s.last_frame.filter(|_| s.online && s.live.is_some()).map(|t| t.elapsed().as_millis() as u64),
             }
         })
         .collect();
@@ -721,6 +724,34 @@ fn reveal_recording(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Show an exported clip (a file name in the recording folder's Clips subfolder) in the file manager.
+#[tauri::command(async)]
+fn reveal_clip(name: String) -> Result<(), String> {
+    let path = recordings::resolve(&prefs::get().record_dir.join("Clips"), &name)?;
+    reveal(&path, true);
+    Ok(())
+}
+
+/// Connect a camera again now: restarts a frozen stream, or skips the wait while it's offline.
+#[tauri::command]
+fn reconnect(app: State<App>, id: u64) -> Result<(), String> {
+    let inner = app.inner.lock().unwrap();
+    inner.devices[inner.index(id)?].send(Cmd::Reconnect);
+    Ok(())
+}
+
+/// Pause or resume all recording from the window; the tray menu's check mark follows.
+#[tauri::command]
+fn pause_recording(handle: tauri::AppHandle, paused: bool) {
+    set_recording_paused(&handle, paused);
+    if let Some(item) = handle.try_state::<PauseItem>() {
+        let _ = item.0.set_checked(paused);
+    }
+}
+
+/// The tray's "Pause recording" check item.
+struct PauseItem(tauri::menu::CheckMenuItem<tauri::Wry>);
+
 #[tauri::command]
 async fn export_clip(name: String, from: f64, to: f64) -> Result<String, String> {
     let dir = prefs::get().record_dir;
@@ -775,6 +806,7 @@ fn tray(app: &tauri::App) -> tauri::Result<()> {
     let pause = CheckMenuItem::with_id(app, "pause", "Pause recording", true, false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &pause, &PredefinedMenuItem::separator(app)?, &quit])?;
+    app.manage(PauseItem(pause.clone()));
     TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().expect("bundle icon").clone())
         .tooltip("Reolink-rs")
@@ -846,7 +878,7 @@ fn main() {
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
             get_prefs, save_prefs, pick_folder, add_found,
-            set_live_paused, list_recordings, delete_recording, reveal_recording, export_clip, recording_still, recording_thumb
+            set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
         ])
         .setup(|app| Ok(tray(app)?))
         // Minimizing or closing tucks the window into the tray; Quit is in the tray menu.

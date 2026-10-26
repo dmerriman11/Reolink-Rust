@@ -79,6 +79,8 @@ pub enum Cmd {
     View((u32, u32)),
     /// Internal: the local recording schedule's wish changed (see prefs::Prefs::local_record).
     Auto,
+    /// Drop the session and connect again now (live view and recording resume), or end the wait when offline.
+    Reconnect,
 }
 
 #[derive(Default)]
@@ -98,6 +100,8 @@ pub struct State {
     pub motion_events: u64,
     /// This session is AES encrypted; the app pins the camera to AES from then on (DeviceConfig::aes).
     pub aes: bool,
+    /// When the live stream last delivered a video frame (or started): the UI shows a stalled picture from this.
+    pub last_frame: Option<Instant>,
 }
 
 pub struct Device {
@@ -181,11 +185,16 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
     let mut wanted = Wanted { live: None, record: false, jpeg_box: crate::media::DEFAULT_BOX };
     let mut aes = cfg.aes; // pinned once seen, for this run too
     let mut backoff = 1;
-    loop {
+    'run: loop {
+        let started = Instant::now();
         let err = match session(&cfg, &mut rx, &state, &views, &mut wanted, &mut aes).await {
             Ok(()) => return, // command channel closed: device removed
             Err(e) => e,
         };
+        // A session that ran a while, or a reconnect the user asked for, starts the backoff over.
+        if started.elapsed() > Duration::from_secs(60) || err.to_string() == RECONNECT {
+            backoff = 1;
+        }
         {
             let mut s = state.lock().unwrap();
             s.online = false;
@@ -208,6 +217,7 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     Some(Cmd::Xml { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Reboot(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::SnapshotJpeg(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::Reconnect) => { backoff = 1; continue 'run; }
                     Some(_) => {}
                 },
             }
@@ -301,6 +311,10 @@ async fn draining<T>(
 
 /// A camera that doesn't answer a ping in this long is gone; reconnect instead of waiting forever.
 const PING_TIMEOUT: Duration = Duration::from_secs(20);
+/// A live stream with no video for this long is restarted by reconnecting, even while pings still work.
+const STALL_RESTART: Duration = Duration::from_secs(20);
+/// The session error for Cmd::Reconnect.
+const RECONNECT: &str = "reconnect requested";
 
 async fn next_motion(m: &mut Option<MotionData>) -> Result<MotionStatus, neolink_core::Error> {
     match m {
@@ -377,6 +391,9 @@ async fn session(
                 _ = ping.tick() => {
                     let r = tokio::time::timeout(PING_TIMEOUT, draining(cam.ping(), &mut live, &cfg.name, state, views)).await;
                     r.context("ping: no answer")??.context("ping")?;
+                    if live.is_some() && state.lock().unwrap().last_frame.is_some_and(|t| t.elapsed() > STALL_RESTART) {
+                        anyhow::bail!("no video for {} s", STALL_RESTART.as_secs());
+                    }
                     None
                 }
                 _ = battery_poll.tick(), if battery.is_some() => {
@@ -456,6 +473,7 @@ async fn session(
                     if let Some(k) = want {
                         log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
                         let stream = cam.start_video(k, 0, false).await.context("start live")?;
+                        set(&|s| s.last_frame = Some(Instant::now())); // a stream that never sends counts from here
                         live = Some(Live { kind: k, stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
                     }
                 }
@@ -477,7 +495,7 @@ async fn session(
             }
             Cmd::Record(on) => {
                 if on && RECORDING_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
-                    set(&|s| s.message = Some("Recording is paused (tray menu)".into()));
+                    set(&|s| s.message = Some("Recording is paused (Resume in the top bar or the tray menu)".into()));
                     continue;
                 }
                 wanted.record = on;
@@ -506,6 +524,7 @@ async fn session(
                 // Starts (or, when the schedule ends, stops) a recording-only stream, and picks the stream to use.
                 pending.push(Cmd::Live(wanted.live));
             }
+            Cmd::Reconnect => anyhow::bail!(RECONNECT),
             Cmd::View(b) => {
                 wanted.jpeg_box = b;
                 if let Some(l) = live.as_mut() {
@@ -564,6 +583,7 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         BcMedia::Pframe(f) => (f.video_type, f.data, false),
         _ => return, // shortcut: live audio playback not implemented yet (phase 2)
     };
+    state.lock().unwrap().last_frame = Some(Instant::now());
 
     if live.record && live.recorder.is_none() {
         let prefs = crate::prefs::get();

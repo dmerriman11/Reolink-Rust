@@ -238,7 +238,7 @@ function streamInfo(frame, hevc) {
 }
 
 // Play GET /raw/<id> (see stream.rs: 1-byte flags, 4-byte length, access unit) into `canvas`.
-function rawPlayer(canvas, url, onFirst, onFail) {
+function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const ctx = canvas.getContext("2d");
   const abort = new AbortController();
   let dec = null, sig = null, waitKey = true, ts = 0, shown = false, size = null;
@@ -291,10 +291,10 @@ function rawPlayer(canvas, url, onFirst, onFail) {
     const parse = framer(onFrame);
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) return; // device removed or edited: the tile gets a new stream
+      if (done) return onEnd(); // the server closed it (camera reconnecting, removed or edited)
       await parse(value);
     }
-  })().catch((e) => { if (!abort.signal.aborted) console.warn("live stream:", e); });
+  })().catch((e) => { if (!abort.signal.aborted) { console.warn("live stream:", e); onEnd(); } });
   return { stop };
 }
 
@@ -338,14 +338,16 @@ function showVideo(t, d) {
   if (t.src === src) return raw ? t.canvas : t.img;
   stopVideo(t);
   t.src = src;
+  // A connection that ends is opened again by the next refresh, so a tile never sits on a dead stream.
+  const ended = () => { if (t.src === src) { t.src = ""; t.key = null; } };
   if (raw) {
     const ready = () => { t.canvas.classList.add("ok"); t.loading?.remove(); };
     const fallback = () => { mjpegOnly.add(d.id); t.key = null; renderTiles(); };
-    t.player = rawPlayer(t.canvas, src, ready, fallback);
+    t.player = rawPlayer(t.canvas, src, ready, fallback, ended);
     return t.canvas;
   }
   t.img.onload = () => { t.img.classList.add("ok"); t.loading?.remove(); };
-  t.img.onerror = () => t.img.classList.remove("ok");
+  t.img.onerror = () => { t.img.classList.remove("ok"); setTimeout(ended, 2000); };
   t.img.src = src;
   return t.img;
 }
@@ -364,12 +366,51 @@ function makeTile(idx) {
   sizeObserver.observe(t.root);
   t.img.alt = "";
   t.img.draggable = false;
+  t.root.tabIndex = 0;
   t.root.onclick = () => { selected = idx; renderTiles(); renderPtz(); };
+  t.root.onfocus = () => { if (selected !== idx) { selected = idx; renderTiles(); renderPtz(); } };
   t.root.ondblclick = (e) => {
-    if (e.target.closest(".tile-bar")) return;
+    if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button")) return;
     setSolo(solo === idx ? null : idx);
   };
+  // Keyboard: Enter toggles single view (Esc leaves it), arrows move between tiles.
+  t.root.onkeydown = (e) => {
+    if (e.target !== t.root) return;
+    if (e.key === "Enter") { e.preventDefault(); setSolo(solo === idx ? null : idx); return; }
+    const l = LAYOUTS.find((x) => x.n === state.layout) || LAYOUTS[2];
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -l.cols, ArrowDown: l.cols }[e.key];
+    const next = idx + (step ?? 0);
+    if (!step || solo != null || next < 0 || next >= l.n) return;
+    e.preventDefault();
+    tiles[next].root.focus();
+  };
   return t;
+}
+
+// A live tile whose camera stopped sending frames keeps its last picture, so say it's frozen and offer a way out.
+// Based on frame arrival (the backend's clock), not on whether the scene changes.
+const STALL_MS = 3000;
+function renderHealth(t, d) {
+  const age = d?.online && d.live ? d.frame_age_ms : null;
+  const stalled = age != null && age > STALL_MS;
+  const chip = t.root.querySelector(".chip.live");
+  if (chip) {
+    chip.classList.toggle("stale", stalled);
+    chip.title = age == null ? "" : stalled ? "Live stream stalled" : "Live";
+  }
+  if (!stalled) { if (t.stall) t.stall.hidden = true; return; }
+  if (!t.stall || !t.root.contains(t.stall)) {
+    t.stall = el("div", "tile-stall");
+    t.stall.setAttribute("role", "status");
+    const text = el("span");
+    const retry = Object.assign(el("button"), { textContent: "Reconnect", title: "Connect to the camera again (it also does this by itself after 20 s)" });
+    retry.onclick = (e) => { e.stopPropagation(); call("reconnect", { id: +t.stall.dataset.id }); };
+    t.stall.append(text, retry);
+    t.root.append(t.stall);
+  }
+  t.stall.dataset.id = d.id;
+  t.stall.hidden = false;
+  t.stall.firstChild.textContent = `No new video for ${Math.round(age / 1000)} s`;
 }
 
 function renderTiles() {
@@ -390,57 +431,69 @@ function renderTiles() {
     t.root.style.animationDelay = `${idx * 35}ms`;
     const d = device(state.tiles[idx]);
     t.root.classList.toggle("motion", !!d?.motion);
+    t.root.setAttribute("aria-label", d ? `${d.name}: Enter for single view` : `Tile ${idx + 1}, empty`);
     // Rebuild a tile only when what it shows changes; the <img> keeps its stream connection otherwise.
-    const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.live ? "" : d.status].join("|") : "empty";
-    if (key === t.key) return;
-    t.key = key;
-    reportSizes(); // the tile may now show another camera
-    t.root.replaceChildren();
-
-    if (!d) {
-      stopVideo(t);
-      t.root.append(el("div", "tile-empty", `${ICON.plus}<span>Pick a device</span>`));
-      return;
-    }
-    const loading = el("div", "tile-msg", d.online ? '<div><div class="spinner"></div>Starting stream…</div>' : "");
-    if (!d.online) loading.textContent = d.status;
-    t.loading = loading;
-    const view = showVideo(t, d);
-    // A picture already showing needs no spinner; an offline status always shows.
-    t.root.append(...(d.online && view.classList.contains("ok") ? [] : [loading]), view);
-
-    const head = el("div", "tile-head");
-    head.append(Object.assign(el("span"), { textContent: d.name }));
-    if (d.live) head.append(Object.assign(el("span", "chip live"), { textContent: d.live === "main" ? "HD" : "SD" }));
-    if (d.recording) head.append(Object.assign(el("span", "chip rec"), { textContent: "REC" }));
-    t.root.append(head);
-
-    const bar = el("div", "tile-bar");
-    const seg = el("div", "seg");
-    for (const [label, clear] of [["Fluent", false], ["Clear", true]]) {
-      const b = Object.assign(el("button"), { textContent: label });
-      b.setAttribute("aria-pressed", String(d.clear === clear));
-      if (clear) b.title = "HD in single view and 1–2 camera layouts; smaller tiles use Fluent to save bandwidth";
-      b.onclick = (e) => { e.stopPropagation(); call("set_clear", { id: d.id, clear }).then(refresh); };
-      seg.append(b);
-    }
-    const snap = el("button", "bar-btn", `${ICON.camera}`);
-    snap.title = "Snapshot";
-    snap.onclick = (e) => { e.stopPropagation(); call("snapshot", { id: d.id }); };
-    const rec = el("button", "bar-btn" + (d.recording ? " recording" : ""), `${ICON.rec}<span>${d.recording ? "Stop" : "Record"}</span>`);
-    rec.onclick = (e) => { e.stopPropagation(); call("record", { id: d.id, on: !d.recording }).then(refresh); };
-    const close = el("button", "bar-btn", ICON.close);
-    close.title = "Close live view";
-    close.onclick = (e) => {
-      e.stopPropagation();
-      if (solo === idx) setSolo(null);
-      call("assign_tile", { tile: idx, id: null }).then(refresh);
-    };
-    bar.append(seg, snap, rec, el("span", "spacer"), close);
-    t.root.append(bar);
+    const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.online && d.live ? "" : d.status].join("|") : "empty";
+    if (key !== t.key) buildTile(t, d, idx, key);
+    renderHealth(t, d);
   });
   // Drop streams for tiles hidden by a smaller layout.
   tiles.slice(l.n).forEach((t) => { stopVideo(t); t.key = null; });
+}
+
+function buildTile(t, d, idx, key) {
+  t.key = key;
+  reportSizes(); // the tile may now show another camera
+  t.root.replaceChildren();
+
+  if (!d) {
+    stopVideo(t);
+    t.root.append(el("div", "tile-empty", `${ICON.plus}<span>Pick a device</span>`));
+    return;
+  }
+  const loading = el("div", "tile-msg", d.online ? '<div><div class="spinner"></div>Starting stream…</div>' : "");
+  if (!d.online) {
+    // Offline: it reconnects by itself; say why it's down and let the user try now.
+    const retry = Object.assign(el("button"), { textContent: "Retry now" });
+    retry.onclick = (e) => { e.stopPropagation(); call("reconnect", { id: d.id }).then(refresh); };
+    const box = el("div");
+    box.append(Object.assign(el("strong"), { textContent: "Not connected" }), Object.assign(el("span", "why"), { textContent: d.status }), retry);
+    loading.append(box);
+  }
+  t.loading = loading;
+  const view = showVideo(t, d);
+  // A picture already showing needs no spinner; an offline status always shows.
+  t.root.append(...(d.online && view.classList.contains("ok") ? [] : [loading]), view);
+
+  const head = el("div", "tile-head");
+  head.append(Object.assign(el("span"), { textContent: d.name }));
+  if (d.live && d.online) head.append(Object.assign(el("span", "chip live"), { textContent: d.live === "main" ? "HD" : "SD" }));
+  if (d.recording) head.append(Object.assign(el("span", "chip rec"), { textContent: "REC" }));
+  t.root.append(head);
+
+  const bar = el("div", "tile-bar");
+  const seg = el("div", "seg");
+  for (const [label, clear] of [["Fluent", false], ["Clear", true]]) {
+    const b = Object.assign(el("button"), { textContent: label });
+    b.setAttribute("aria-pressed", String(d.clear === clear));
+    if (clear) b.title = "HD in single view and 1–2 camera layouts; smaller tiles use Fluent to save bandwidth";
+    b.onclick = (e) => { e.stopPropagation(); call("set_clear", { id: d.id, clear }).then(refresh); };
+    seg.append(b);
+  }
+  const snap = el("button", "bar-btn", `${ICON.camera}`);
+  snap.title = "Snapshot";
+  snap.onclick = (e) => { e.stopPropagation(); call("snapshot", { id: d.id }); };
+  const rec = el("button", "bar-btn" + (d.recording ? " recording" : ""), `${ICON.rec}<span>${d.recording ? "Stop" : "Record"}</span>`);
+  rec.onclick = (e) => { e.stopPropagation(); call("record", { id: d.id, on: !d.recording }).then(refresh); };
+  const close = el("button", "bar-btn", ICON.close);
+  close.title = "Close live view";
+  close.onclick = (e) => {
+    e.stopPropagation();
+    if (solo === idx) setSolo(null);
+    call("assign_tile", { tile: idx, id: null }).then(refresh);
+  };
+  bar.append(seg, snap, rec, el("span", "spacer"), close);
+  t.root.append(bar);
 }
 
 // ---------- PTZ ----------
@@ -505,16 +558,22 @@ function setupPtz() {
     invoke("ptz", { id: ptzActive.id, dir: "stop" }).catch(() => {});
     ptzActive = null;
   };
+  // Moves while held: pointer down/up, or Enter/Space down/up; losing focus always stops it.
+  const start = (btn) => {
+    const d = device(state.tiles[selected]);
+    if (!d || ptzActive) return false;
+    btn.classList.add("active");
+    ptzActive = { id: d.id, btn };
+    call("ptz", { id: d.id, dir: btn.dataset.dir }).catch(stop);
+    return true;
+  };
+  const held = (e) => e.key === "Enter" || e.key === " ";
   for (const btn of document.querySelectorAll("#dpad button")) {
-    btn.onpointerdown = (e) => {
-      const d = device(state.tiles[selected]);
-      if (!d) return;
-      btn.setPointerCapture(e.pointerId);
-      btn.classList.add("active");
-      ptzActive = { id: d.id, btn };
-      call("ptz", { id: d.id, dir: btn.dataset.dir }).catch(stop);
-    };
+    btn.onpointerdown = (e) => { if (start(btn)) btn.setPointerCapture(e.pointerId); };
     btn.onpointerup = btn.onpointercancel = btn.onlostpointercapture = stop;
+    btn.onkeydown = (e) => { if (held(e)) { e.preventDefault(); if (!e.repeat) start(btn); } };
+    btn.onkeyup = (e) => { if (held(e)) stop(); };
+    btn.onblur = stop;
   }
 }
 
@@ -838,6 +897,9 @@ function scheduleEditor(f, set) {
   const tabs = el("div", "seg sched-tabs");
   const grid = el("div", "sched-grid");
   const commit = () => set(JSON.stringify(value));
+  let focused = 0; // the one cell in the tab order (roving focus)
+  grid.setAttribute("role", "group");
+  grid.setAttribute("aria-label", "Hours: arrow keys move, Space turns an hour on or off, Shift+arrows paint");
   const draw = () => {
     for (const b of tabs.children) b.setAttribute("aria-pressed", String(b.dataset.t === current));
     const table = value[current];
@@ -850,23 +912,45 @@ function scheduleEditor(f, set) {
         const c = el("span", "sched-cell" + (table[i] === "1" ? " on" : ""));
         c.dataset.i = i;
         c.title = `${d} ${String(h).padStart(2, "0")}:00`;
+        c.tabIndex = i === focused ? 0 : -1;
+        c.setAttribute("role", "checkbox");
+        c.setAttribute("aria-checked", String(table[i] === "1"));
+        c.setAttribute("aria-label", c.title);
         grid.append(c);
       }
     });
   };
+  const cell = (i) => grid.querySelector(`[data-i="${i}"]`);
+  grid.addEventListener("keydown", (e) => {
+    const c = e.target.closest?.("[data-i]");
+    if (!c) return;
+    const i = +c.dataset.i, on = c.classList.contains("on") ? "1" : "0";
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); paint(i, on === "1" ? "0" : "1"); return; }
+    const move = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -24, ArrowDown: 24, Home: -(i % 24), End: 23 - (i % 24) }[e.key];
+    const n = i + (move ?? 0);
+    if (!move || n < 0 || n >= 168 || (Math.abs(move) < 24 && Math.floor(n / 24) !== Math.floor(i / 24))) return;
+    e.preventDefault();
+    if (e.shiftKey) paint(n, on); // carry this hour's state along
+    c.tabIndex = -1;
+    focused = n;
+    cell(n).tabIndex = 0;
+    cell(n).focus();
+  });
   for (const t of types) {
     const b = Object.assign(el("button"), { type: "button", textContent: t.replace("_", " / ") });
     b.dataset.t = t;
     b.onclick = () => { current = t; draw(); };
     tabs.append(b);
   }
-  paintable(grid, (i, v) => {
+  function paint(i, v) {
     const t = value[current];
     if (t[i] === v) return;
     value[current] = t.slice(0, i) + v + t.slice(i + 1);
-    grid.querySelector(`[data-i="${i}"]`).classList.toggle("on", v === "1");
+    cell(i).classList.toggle("on", v === "1");
+    cell(i).setAttribute("aria-checked", String(v === "1"));
     commit();
-  });
+  }
+  paintable(grid, paint);
   const fill = (v) => { value[current] = v.repeat(168); draw(); commit(); };
   const tools = el("div", "editor-tools");
   tools.append(
@@ -1129,7 +1213,7 @@ const FRAME = 1 / 15; // shortcut: assumes Reolink's usual 15 fps; read the stre
 const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
 const TICKS = [10 * SEC, 30 * SEC, MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR];
 const NAME_RE = /^(.*)_(\d{4})-(\d\d)-(\d\d)_(\d\d)-(\d\d)-(\d\d)\.mp4$/i;
-const PB = { on: false, opened: false, dir: "", files: [], byCam: new Map(), listing: "", cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
+const PB = { on: false, opened: false, dir: "", files: [], byCam: new Map(), listing: "", days: new Map(), cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
 const video = $("#pb-video");
 
 const safeName = (n) => n.replace(/[^\p{L}\p{N}-]/gu, "_"); // as device.rs names the files
@@ -1175,6 +1259,8 @@ async function loadRecordings() {
   }).sort((a, b) => a.start - b.start);
   PB.byCam = new Map(); // each camera's list stays in start order
   for (const f of PB.files) PB.byCam.get(f.cam)?.push(f) ?? PB.byCam.set(f.cam, [f]);
+  PB.days = new Map(); // day -> recordings starting that day, in day order
+  for (const f of PB.files) PB.days.set(dayOf(f.start), (PB.days.get(dayOf(f.start)) ?? 0) + 1);
   PB.cams = [...PB.byCam.keys()].sort((a, b) => camLabel(a).localeCompare(camLabel(b)));
   if (PB.cur) PB.cur = PB.files.find((f) => f.name === PB.cur.name) || PB.cur;
   if (!PB.opened) {
@@ -1211,11 +1297,82 @@ function renderPlayback() {
   const today = PB.cams.flatMap(dayFiles);
   $("#pb-summary").textContent = today.length ? `${today.length} recording${today.length > 1 ? "s" : ""} · ${fmtBytes(today.reduce((n, f) => n + f.size, 0))}` : "No recordings this day";
   $("#pb-cam").textContent = PB.cur ? camLabel(PB.cur.cam) : "";
-  $("#pb-export").disabled = !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
+  $("#pb-export").disabled = exporting || !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
+  renderDays();
+  renderClip();
   renderFiles();
   renderGrid();
   renderTimeline();
   tick();
+}
+
+// Which days have recordings: the day list, and the arrows that step between those days.
+const recordedDays = () => [...PB.days.keys()];
+let daysKey = null;
+function renderDays() {
+  const days = recordedDays(), sel = $("#pb-days");
+  const key = JSON.stringify([...PB.days]);
+  if (key !== daysKey) {
+    daysKey = key;
+    sel.replaceChildren(
+      Object.assign(el("option"), { value: "", textContent: days.length ? `${days.length} day${days.length > 1 ? "s" : ""} recorded` : "No recordings", disabled: true }),
+      ...[...days].reverse().map((d) => Object.assign(el("option"), { value: String(d), textContent: `${fmtDay(d)} · ${PB.days.get(d)}` })),
+    );
+  }
+  sel.value = PB.days.has(PB.day) ? String(PB.day) : "";
+  $("#pb-prev-day").disabled = !days.some((d) => d < PB.day);
+  $("#pb-next-day").disabled = !days.some((d) => d > PB.day);
+  $("#pb-day").min = days.length ? isoDay(days[0]) : "";
+  $("#pb-day").max = days.length ? isoDay(days.at(-1)) : "";
+}
+
+// "14:05:09", the value a time input takes.
+const hms = (t) => { const d = new Date(t), p = (n) => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
+// A time-of-day typed for the open recording, as seconds into it (the next such time after its start).
+function secondsInto(f, value) {
+  const [h, m, s = 0] = value.split(":").map(Number);
+  const d = new Date(f.start);
+  d.setHours(h, m, s, 0);
+  let at = (d.getTime() - f.start) / SEC;
+  if (at < 0) at += 24 * 3600; // a recording that runs past midnight
+  return at;
+}
+
+// The clip being marked: editable In/Out times, its length, and the recording it must stay within.
+let exporting = false;
+function renderClip() {
+  const f = PB.cur, row = $("#pb-clip");
+  row.hidden = !f;
+  if (!f) return;
+  const [a, b] = PB.mark;
+  for (const [id, v] of [["#pb-in", a], ["#pb-out", b]]) {
+    const input = $(id);
+    if (document.activeElement !== input) input.value = v == null ? "" : hms(f.start + v * SEC);
+  }
+  $("#pb-clip-len").textContent = a != null && b > a ? fmtDur((b - a) * SEC) : "Mark In and Out (I, O) or type the times";
+  $("#pb-clip-bounds").textContent = `within this recording, ${fmtTime(f.start)}–${fmtTime(f.end)}`;
+  $("#pb-clip-bounds").title = "A clip comes from one recording file; marks reset when another recording opens";
+}
+
+async function exportClip(f) {
+  const status = $("#pb-clip-status");
+  exporting = true;
+  status.className = "pb-clip-status";
+  status.textContent = "Exporting clip…";
+  renderPlayback();
+  try {
+    const path = await invoke("export_clip", { name: f.name, from: PB.mark[0], to: PB.mark[1] });
+    const name = path.split(/[\\/]/).pop();
+    const show = Object.assign(el("button"), { textContent: "Show in folder" });
+    show.onclick = () => call("reveal_clip", { name });
+    status.replaceChildren(`Saved ${name}`, show);
+  } catch (e) {
+    status.classList.add("error");
+    status.textContent = `Export failed: ${e}`;
+  } finally {
+    exporting = false;
+    renderPlayback();
+  }
 }
 
 // ---------- playback: thumbnail grid ----------
@@ -1451,6 +1608,7 @@ function playAt(cam, t, play = true) {
   PB.cam = cam;
   const f = fileAt(cam, t) || camFiles(cam).find((g) => g.start >= t);
   if (!f) { toast(`No ${camLabel(cam)} recording after ${fmtTime(t)}`); renderPlayback(); return; }
+  if (f.start - t >= SEC) toast(`Nothing recorded at ${fmtTime(t)}; playing the next recording, from ${dayOf(f.start) === dayOf(t) ? "" : fmtDay(f.start) + " "}${fmtTime(f.start)}`);
   openFile(f, Math.max(0, (t - f.start) / SEC), play);
 }
 
@@ -1590,10 +1748,7 @@ function act(a) {
     case "next": { const n = nextFile(f); if (n) openFile(n, 0, !video.paused); break; }
     case "in": PB.mark = [video.currentTime, PB.mark[1] > video.currentTime ? PB.mark[1] : null]; renderPlayback(); break;
     case "out": PB.mark = [PB.mark[0] != null && PB.mark[0] < video.currentTime ? PB.mark[0] : 0, video.currentTime]; renderPlayback(); break;
-    case "export":
-      toast("Exporting clip…");
-      call("export_clip", { name: f.name, from: PB.mark[0], to: PB.mark[1] }).then((p) => toast(`Clip saved: ${p}`));
-      break;
+    case "export": if (!exporting) exportClip(f); break;
     case "still": call("recording_still", { name: f.name, at: video.currentTime }).then((p) => toast(`Snapshot saved: ${p}`)); break;
     case "full":
       if (document.fullscreenElement) document.exitFullscreen();
@@ -1707,8 +1862,34 @@ function setupPlayback() {
     setDay(new Date(+y, m - 1, +d).getTime());
     renderPlayback();
   };
-  $("#pb-prev-day").onclick = () => { setDay(addDays(PB.day, -1)); renderPlayback(); };
-  $("#pb-next-day").onclick = () => { setDay(addDays(PB.day, 1)); renderPlayback(); };
+  // The arrows skip days with nothing recorded.
+  $("#pb-prev-day").onclick = () => { const d = recordedDays().findLast((d) => d < PB.day); if (d != null) { setDay(d); renderPlayback(); } };
+  $("#pb-next-day").onclick = () => { const d = recordedDays().find((d) => d > PB.day); if (d != null) { setDay(d); renderPlayback(); } };
+  $("#pb-days").onchange = (e) => { if (e.target.value) { setDay(+e.target.value); renderPlayback(); } };
+  // Go to a time on the shown day, on the selected camera's timeline (a gap plays the next recording, and says so).
+  let timeTimer;
+  const goToTime = () => {
+    clearTimeout(timeTimer);
+    const v = $("#pb-time").value, cam = PB.cam ?? PB.cams[0];
+    if (!v || !cam) return;
+    const [h, m, s = 0] = v.split(":").map(Number);
+    playAt(cam, new Date(PB.day).setHours(h, m, s, 0), true);
+  };
+  $("#pb-time").onkeydown = (e) => { if (e.key === "Enter") goToTime(); };
+  $("#pb-time").onchange = () => { clearTimeout(timeTimer); timeTimer = setTimeout(goToTime, 900); }; // after typing settles
+  // Typed clip times: clamped to the open recording, and the player moves there to show the frame.
+  const setMark = (which, input) => {
+    const f = PB.cur, dur = video.duration;
+    if (!f || !input.value || !Number.isFinite(dur)) return renderClip();
+    const at = Math.min(dur, Math.max(0, secondsInto(f, input.value)));
+    const [a, b] = PB.mark;
+    PB.mark = which === "in" ? [at, b != null && b > at ? b : null] : [a != null && a < at ? a : 0, at];
+    video.currentTime = at;
+    renderPlayback();
+  };
+  $("#pb-in").onchange = (e) => setMark("in", e.target);
+  $("#pb-out").onchange = (e) => setMark("out", e.target);
+  for (const id of ["#pb-in", "#pb-out"]) $(id).onblur = renderClip; // show the clamped value once editing ends
   $("#pb-latest").onclick = () => {
     const last = (PB.cam && camFiles(PB.cam).at(-1)) || PB.files.at(-1);
     if (last) openFile(last, 0, true);
@@ -1734,14 +1915,20 @@ function setupPlayback() {
 }
 
 // ---------- refresh loop ----------
+let refreshFails = 0;
 async function refresh() {
   try {
     state = await invoke("get_state");
+    refreshFails = 0;
   } catch (e) {
+    // A few misses in a row and everything on screen may be stale: say so instead of looking normal.
+    if (++refreshFails === 3) console.warn("get_state:", e);
+    for (const p of document.querySelectorAll(".app-stale")) p.hidden = refreshFails < 3;
     return;
   }
+  for (const p of document.querySelectorAll(".app-stale")) p.hidden = true;
   checkMotion();
-  $("#rec-paused").hidden = !state.recording_paused;
+  for (const p of document.querySelectorAll(".rec-paused")) p.hidden = !state.recording_paused;
   for (const d of state.devices) if (d.message) toast(d.message);
   for (const b of document.querySelectorAll(".layout-btn")) {
     b.setAttribute("aria-checked", String(+b.dataset.n === state.layout));
@@ -1756,6 +1943,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && solo != null && !$("#device-dialog").open && !document.body.classList.contains("fullscreen")) setSolo(null);
 });
 $("#media-folder").onclick = () => call("open_media_folder");
+for (const p of document.querySelectorAll(".rec-paused")) p.onclick = () => call("pause_recording", { paused: false }).then(refresh);
 
 buildLayouts();
 setupView();
@@ -1809,6 +1997,7 @@ function demoInvoke(cmd, args) {
     for (let h = 0; h < 12; h += 0.5) files.push({ name: name("Driveway", day + h * 3600e3), size: 410e6, modified: day + (h + 0.5) * 3600e3 });
     return Promise.resolve({ dir: "", files });
   }
+  if (cmd === "export_clip") return new Promise((r) => setTimeout(() => r(`C:\\Users\\you\\Videos\\Reolink-rs\\Clips\\${args.name.replace(".mp4", "")}_clip.mp4`), 600));
   if (cmd === "scan_lan") return Promise.resolve([{ uid: "95270000EXAMPLEA", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;

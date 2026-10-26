@@ -64,6 +64,13 @@ still frame to the snapshot folder, show in folder, delete, and a Thumbnails vie
 the In/Out range; the wheel zooms into the picture (up to 8x, drag to pan); the recordings list can show
 thumbnails. Live streams pause while it's open.
 Keys: Space, ← → (Shift: 1 min), Home / End, , . (frame), [ ] (speed), I / O, F, + - 0 (zoom). Double-click: full screen.
+The day list and arrows step between days that have recordings; a time box jumps to a time (a gap plays the next
+recording and says so). Clip In/Out can be typed as times; the export result stays on screen with Show in folder.
+
+Live view health: a tile whose camera stops sending frames says "No new video for N s" with a Reconnect button
+(the app also reconnects by itself after 20 s); an offline tile shows why, with Retry now. Recording paused (tray)
+shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Enter for single
+view, Esc back; hold Enter/Space on a PTZ arrow to move; schedule grids take arrows, Space, and Shift+arrows to paint.
 
 Tray (0.4.1): minimizing or closing hides the window to the tray (left-click to show it again). The tray's
 right-click menu has Show, Pause recording (stops manual and scheduled recording until unchecked) and Quit.

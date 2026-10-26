@@ -51,7 +51,8 @@
       <div class="layouts" role="radiogroup" aria-label="Layout" id="layouts"></div>
       </div>
       <div class="topbar-right">
-        <span class="paused-pill" id="rec-paused" hidden title="Resume from the tray icon's menu">Recording paused</span>
+        <span class="paused-pill app-stale" hidden title="The window can't reach the app's background service; camera states shown may be out of date">Not updating</span>
+        <button class="paused-pill rec-paused" hidden title="All recording (manual and scheduled) is paused. Click to resume.">Recording paused · Resume</button>
         <button class="ghost-btn" id="app-settings" title="App settings">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
           Settings
@@ -76,14 +77,18 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="day-nav">
-          <button class="icon-btn" id="pb-prev-day" title="Previous day" aria-label="Previous day"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <button class="icon-btn" id="pb-prev-day" title="Previous day with recordings" aria-label="Previous day with recordings"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
           <input type="date" id="pb-day" aria-label="Day">
-          <button class="icon-btn" id="pb-next-day" title="Next day" aria-label="Next day"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+          <button class="icon-btn" id="pb-next-day" title="Next day with recordings" aria-label="Next day with recordings"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+          <select id="pb-days" aria-label="Days with recordings" title="Days with recordings"></select>
+          <input type="time" id="pb-time" step="1" aria-label="Go to time" title="Go to a time on this day (Enter)">
           <button class="ghost-btn" id="pb-latest" title="Jump to the latest recording">Latest</button>
         </div>
         <span class="pb-summary" id="pb-summary"></span>
       </div>
       <div class="topbar-right">
+        <span class="paused-pill app-stale" hidden title="The window can't reach the app's background service; what's shown may be out of date">Not updating</span>
+        <button class="paused-pill rec-paused" hidden title="All recording (manual and scheduled) is paused. Click to resume.">Recording paused · Resume</button>
         <div class="seg pb-mode" role="group" aria-label="Playback layout">
           <button id="pb-mode-player" aria-pressed="true">Player</button>
           <button id="pb-mode-grid" aria-pressed="false">Thumbnails</button>
@@ -123,6 +128,14 @@
         <span class="pb-pos" id="pb-pos">0:00</span>
         <input type="range" id="pb-seek" min="0" max="1" step="any" value="0" aria-label="Position in this recording" disabled>
         <span class="pb-pos" id="pb-dur">0:00</span>
+      </div>
+      <div class="pb-clip" id="pb-clip" hidden>
+        <span class="pb-clip-label">Clip</span>
+        <label>In <input type="time" step="1" id="pb-in" aria-label="Clip start time"></label>
+        <label>Out <input type="time" step="1" id="pb-out" aria-label="Clip end time"></label>
+        <span class="pb-clip-len" id="pb-clip-len"></span>
+        <span class="pb-clip-bounds" id="pb-clip-bounds"></span>
+        <span class="pb-clip-status" id="pb-clip-status" role="status"></span>
       </div>
       <div class="pb-group">
         <button class="tbtn" data-act="prev" title="Previous recording" aria-label="Previous recording"><svg viewBox="0 0 24 24"><path d="M6 5v14M18 6l-9 6 9 6z"/></svg></button>
