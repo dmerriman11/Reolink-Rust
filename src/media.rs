@@ -221,11 +221,29 @@ impl RawFeed {
     }
 }
 
+/// Video a recording may have waiting for ffmpeg (a minute or more of a main stream) before frames are dropped.
+const REC_QUEUE_BYTES: usize = 64 << 20;
+
+/// What became of a frame handed to a [`Recorder`].
+#[derive(Debug, PartialEq)]
+pub enum Pushed {
+    /// Queued for ffmpeg (or skipped while waiting for the first keyframe).
+    Queued,
+    /// ffmpeg is too far behind (slow or stalled disk): frames are being dropped until it catches up, and the
+    /// recording resumes at a keyframe. Returned once when dropping starts.
+    Overloaded,
+    /// ffmpeg has gone (disk full, crashed): nothing more is being written.
+    Dead,
+}
+
 pub struct Recorder {
     pub path: PathBuf,
     child: Option<Child>,
-    tx: Option<SyncSender<Vec<u8>>>,
-    started: bool,
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Waiting for a keyframe: at the start, and after dropping frames.
+    waiting: bool,
+    dropping: bool,
 }
 
 impl Recorder {
@@ -243,18 +261,44 @@ impl Recorder {
             ],
             false,
         )?;
-        let tx = feeder(child.stdin.take().expect("piped stdin"));
-        Ok(Self { path: dir.to_owned(), child: Some(child), tx: Some(tx), started: false })
+        let stdin = child.stdin.take().expect("piped stdin");
+        Ok(Self::with_writer(dir.to_owned(), Some(child), stdin))
     }
 
-    /// False once ffmpeg has gone (disk full, crashed): nothing more is being written.
-    pub fn push(&mut self, data: &[u8], keyframe: bool) -> bool {
-        self.started |= keyframe;
-        match &self.tx {
-            // Blocking send: a recording must not silently lose frames. Fails only when the feeder has stopped.
-            Some(tx) if self.started => tx.send(data.to_vec()).is_ok(),
-            _ => true,
+    /// The writer thread owns all waiting on the disk; the camera loop only ever queues or drops.
+    fn with_writer(path: PathBuf, child: Option<Child>, mut out: impl Write + Send + 'static) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let q = queued.clone();
+        std::thread::spawn(move || {
+            for buf in rx {
+                if out.write_all(&buf).is_err() {
+                    break;
+                }
+                q.fetch_sub(buf.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        Self { path, child, tx: Some(tx), queued, waiting: true, dropping: false }
+    }
+
+    /// Never blocks: a stalled ffmpeg must not stall the camera's media, commands and pings.
+    pub fn push(&mut self, data: &[u8], keyframe: bool) -> Pushed {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(tx) = &self.tx else { return Pushed::Dead };
+        if self.queued.load(Relaxed) + data.len() > REC_QUEUE_BYTES {
+            self.waiting = true; // a file can only pick up again at a keyframe
+            return if std::mem::replace(&mut self.dropping, true) { Pushed::Queued } else { Pushed::Overloaded };
         }
+        if self.waiting && !keyframe {
+            return Pushed::Queued;
+        }
+        self.waiting = false;
+        self.dropping = false;
+        self.queued.fetch_add(data.len(), Relaxed);
+        if tx.send(data.to_vec()).is_err() {
+            return Pushed::Dead; // the writer stopped: ffmpeg quit
+        }
+        Pushed::Queued
     }
 }
 
@@ -308,14 +352,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0).unwrap();
-        assert!(rec.push(b"\0\0\0\x01", true));
+        assert_eq!(rec.push(b"\0\0\0\x01", true), Pushed::Queued);
         let mut child = rec.child.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         // The feeder notices on its next write; from then on every push fails.
         let gone = (0..500).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            !rec.push(&[0u8; 4096], false)
+            rec.push(&[0u8; 4096], false) == Pushed::Dead
         });
         assert!(gone, "push kept succeeding after ffmpeg exited");
         drop(rec);
@@ -355,5 +399,49 @@ mod tests {
         assert_eq!(read_mpjpeg(&mut r).unwrap(), b"abc");
         assert_eq!(read_mpjpeg(&mut r).unwrap(), b"xy");
         assert!(read_mpjpeg(&mut r).is_none());
+    }
+
+    /// A writer that blocks until the test lets it go, then records what reached it.
+    struct Gate(std::sync::mpsc::Receiver<()>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Gate {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.recv().map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            self.1.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recorder_never_blocks_and_resumes_at_a_keyframe() {
+        let (open, gate) = std::sync::mpsc::channel();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let mut r = Recorder::with_writer(PathBuf::new(), None, Gate(gate, got.clone()));
+        let mb = vec![1u8; 1 << 20];
+        assert_eq!(r.push(&[9], false), Pushed::Queued); // before the first keyframe: skipped
+        // A stalled disk: the queue fills, then frames drop with one report, all without blocking.
+        let t = std::time::Instant::now();
+        let results: Vec<_> = (0..80).map(|i| r.push(&mb, i == 0)).collect();
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(results.iter().filter(|p| **p == Pushed::Overloaded).count(), 1);
+        assert_eq!(results.iter().position(|p| *p == Pushed::Overloaded), Some(REC_QUEUE_BYTES >> 20));
+        // The disk catches up; a delta frame still waits, the next keyframe is written.
+        for _ in 0..(REC_QUEUE_BYTES >> 20) {
+            open.send(()).unwrap();
+        }
+        while r.queued.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(r.push(&[2], false), Pushed::Queued);
+        assert_eq!(r.push(&[3], true), Pushed::Queued);
+        open.send(()).unwrap();
+        while r.queued.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            std::thread::yield_now();
+        }
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), REC_QUEUE_BYTES + 1);
+        assert_eq!(got.last(), Some(&3));
     }
 }

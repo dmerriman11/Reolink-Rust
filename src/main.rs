@@ -681,8 +681,18 @@ fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
 }
 
 fn allow_asset(handle: &tauri::AppHandle, file: &Path) {
-    if let Err(e) = handle.asset_protocol_scope().allow_file(file) {
-        log::error!("asset scope {}: {e}", file.display());
+    // Each refresh lists every recording again; the scope only needs to hear about new ones.
+    static ALLOWED: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
+    let mut allowed = ALLOWED.lock().unwrap();
+    let allowed = allowed.get_or_insert_default();
+    if allowed.contains(file) {
+        return;
+    }
+    match handle.asset_protocol_scope().allow_file(file) {
+        Ok(()) => {
+            allowed.insert(file.to_owned());
+        }
+        Err(e) => log::error!("asset scope {}: {e}", file.display()),
     }
 }
 

@@ -288,25 +288,47 @@ function rawPlayer(canvas, url, onFirst, onFail) {
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
-    let buf = new Uint8Array(0);
+    const parse = framer(onFrame);
     for (;;) {
       const { value, done } = await reader.read();
       if (done) return; // device removed or edited: the tile gets a new stream
-      const next = new Uint8Array(buf.length + value.length);
-      next.set(buf);
-      next.set(value, buf.length);
-      buf = next;
-      let at = 0;
-      while (buf.length - at >= 5) {
-        const len = new DataView(buf.buffer, at + 1, 4).getUint32(0);
-        if (buf.length - at - 5 < len) break;
-        await onFrame(buf[at], buf.subarray(at + 5, at + 5 + len));
-        at += 5 + len;
-      }
-      buf = buf.subarray(at);
+      await parse(value);
     }
   })().catch((e) => { if (!abort.signal.aborted) console.warn("live stream:", e); });
   return { stop };
+}
+
+// Split /raw's byte stream (1 flag byte, 4-byte big-endian length, payload) into frames, however the chunks fall.
+// Each payload is allocated once and every byte copied once, so big keyframes spread over many chunks stay cheap.
+function framer(onFrame) {
+  const head = new Uint8Array(5);
+  let have = 0; // header bytes so far
+  let body = null; // payload being filled
+  let filled = 0;
+  return async (chunk) => {
+    let at = 0;
+    while (at < chunk.length) {
+      if (!body) {
+        const n = Math.min(5 - have, chunk.length - at);
+        head.set(chunk.subarray(at, at + n), have);
+        have += n;
+        at += n;
+        if (have < 5) return;
+        body = new Uint8Array(((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4]);
+        filled = 0;
+      }
+      const n = Math.min(body.length - filled, chunk.length - at);
+      body.set(chunk.subarray(at, at + n), filled);
+      filled += n;
+      at += n;
+      if (filled === body.length) {
+        const frame = body;
+        body = null;
+        have = 0;
+        await onFrame(head[0], frame);
+      }
+    }
+  };
 }
 
 // Point a tile at a camera's video, keeping its connection while it shows the same camera.
@@ -1107,7 +1129,7 @@ const FRAME = 1 / 15; // shortcut: assumes Reolink's usual 15 fps; read the stre
 const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
 const TICKS = [10 * SEC, 30 * SEC, MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR];
 const NAME_RE = /^(.*)_(\d{4})-(\d\d)-(\d\d)_(\d\d)-(\d\d)-(\d\d)\.mp4$/i;
-const PB = { on: false, opened: false, dir: "", files: [], cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
+const PB = { on: false, opened: false, dir: "", files: [], byCam: new Map(), listing: "", cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
 const video = $("#pb-video");
 
 const safeName = (n) => n.replace(/[^\p{L}\p{N}-]/gu, "_"); // as device.rs names the files
@@ -1120,7 +1142,7 @@ const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.max(0.
 const fmtDur = (ms) => { const s = Math.round(ms / SEC); return s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.floor(s % 3600 / 60)} min` : s >= 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s} s`; };
 const isoDay = (t) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
 const playTime = () => PB.cur ? PB.cur.start + video.currentTime * SEC : null;
-const camFiles = (cam) => PB.files.filter((f) => f.cam === cam);
+const camFiles = (cam) => PB.byCam.get(cam) ?? [];
 const dayFiles = (cam) => camFiles(cam).filter((f) => f.end > PB.day && f.start < addDays(PB.day, 1));
 
 function fileSrc(name) {
@@ -1141,13 +1163,19 @@ function parseFile(f) {
 async function loadRecordings() {
   let res;
   try { res = await invoke("list_recordings"); } catch { return; }
+  // The 10 s refresh usually finds nothing new: then there's nothing to reparse or redraw.
+  const listing = res.dir + "\n" + res.files.map((f) => `${f.name}/${f.size}/${f.modified}`).join("\n");
+  if (PB.opened && listing === PB.listing) return;
+  PB.listing = listing;
   PB.dir = res.dir;
   const old = new Map(PB.files.map((f) => [f.name, f]));
   PB.files = res.files.map(parseFile).filter(Boolean).map((f) => {
     const o = old.get(f.name);
     return o && o.size === f.size ? o : f; // keep the object (and its measured length) while the file is unchanged
   }).sort((a, b) => a.start - b.start);
-  PB.cams = [...new Set(PB.files.map((f) => f.cam))].sort((a, b) => camLabel(a).localeCompare(camLabel(b)));
+  PB.byCam = new Map(); // each camera's list stays in start order
+  for (const f of PB.files) PB.byCam.get(f.cam)?.push(f) ?? PB.byCam.set(f.cam, [f]);
+  PB.cams = [...PB.byCam.keys()].sort((a, b) => camLabel(a).localeCompare(camLabel(b)));
   if (PB.cur) PB.cur = PB.files.find((f) => f.name === PB.cur.name) || PB.cur;
   if (!PB.opened) {
     PB.opened = true;
@@ -1414,14 +1442,14 @@ function tick() {
 }
 
 // ---------- playback: control ----------
-const fileAt = (cam, t) => PB.files.find((f) => f.cam === cam && f.start <= t && t < f.end);
-const nextFile = (f) => PB.files.find((g) => g.cam === f.cam && g.start > f.start);
-const prevFile = (f) => PB.files.findLast((g) => g.cam === f.cam && g.start < f.start);
+const fileAt = (cam, t) => camFiles(cam).find((f) => f.start <= t && t < f.end);
+const nextFile = (f) => camFiles(f.cam).find((g) => g.start > f.start);
+const prevFile = (f) => camFiles(f.cam).findLast((g) => g.start < f.start);
 
 // Play `cam` at wall time `t`, skipping ahead to its next recording when `t` falls in a gap.
 function playAt(cam, t, play = true) {
   PB.cam = cam;
-  const f = fileAt(cam, t) || PB.files.find((g) => g.cam === cam && g.start >= t);
+  const f = fileAt(cam, t) || camFiles(cam).find((g) => g.start >= t);
   if (!f) { toast(`No ${camLabel(cam)} recording after ${fmtTime(t)}`); renderPlayback(); return; }
   openFile(f, Math.max(0, (t - f.start) / SEC), play);
 }

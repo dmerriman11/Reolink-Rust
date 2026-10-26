@@ -4,7 +4,7 @@
 //! with pings for as long as the app runs, and any drop (battery camera or not) reconnects
 //! automatically and resumes the live view that was showing.
 
-use crate::media::{Decoder, Raw, Recorder};
+use crate::media::{Decoder, Pushed, Raw, Recorder};
 use neolink_core::bcmedia::model::VideoType;
 use anyhow::{Context as _, Result};
 use neolink_core::bc_protocol::{
@@ -584,14 +584,22 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
             }
         }
     }
-    if let Some(r) = live.recorder.as_mut()
-        && !r.push(&data, key)
-    {
-        live.recorder = None;
-        live.record = false;
-        let mut s = state.lock().unwrap();
-        s.recording = None;
-        s.message = Some("Recording stopped: ffmpeg quit writing (disk full or removed?)".into());
+    if let Some(r) = live.recorder.as_mut() {
+        match r.push(&data, key) {
+            Pushed::Queued => {}
+            Pushed::Overloaded => {
+                log::warn!("{name}: recording can't keep up, dropping frames");
+                state.lock().unwrap().message =
+                    Some("Recording is falling behind (disk too slow?): some video is being skipped".into());
+            }
+            Pushed::Dead => {
+                live.recorder = None;
+                live.record = false;
+                let mut s = state.lock().unwrap();
+                s.recording = None;
+                s.message = Some("Recording stopped: ffmpeg quit writing (disk full or removed?)".into());
+            }
+        }
     }
     if !live.show {
         return;
