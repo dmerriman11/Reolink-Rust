@@ -174,13 +174,11 @@ fn bc_modern_msg<'a>(
             encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
         if context.in_bin_mode.contains(&(header.msg_num)) || in_binary {
             payload = match (context.get_encrypted(), encrypted_len) {
-                (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
-                    // if if context.debug {
-                    //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
-                    // }
-                    Some(BcPayloads::Binary(
-                        processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
-                    ))
+                (EncryptionProtocol::Aes { .. } | EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
+                    let n = (encrypted_len as usize).min(payload_buf.len());
+                    let mut data = processed_payload_buf[..n].to_vec();
+                    data.extend_from_slice(&payload_buf[n..]);
+                    Some(BcPayloads::Binary(data))
                 }
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
             };
@@ -259,6 +257,24 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    fn sd_media_keeps_the_plain_tail_after_an_encrypted_prefix() {
+        for full in [false, true] {
+            let protocol = if full { EncryptionProtocol::full_aes([7;16]) } else { EncryptionProtocol::aes([7;16]) };
+            let extension = b"<Extension version=\"1.1\"><binaryData>1</binaryData><encryptLen>16</encryptLen></Extension>";
+            let plain: Vec<u8> = (0..64).collect();
+            let mut body = protocol.encrypt(0, extension);
+            let offset = body.len() as u32;
+            body.extend(protocol.encrypt(0, &plain[..16]));
+            body.extend_from_slice(&plain[16..]);
+            let header = BcHeader { body_len: body.len() as u32, msg_id: 143, channel_id:0, stream_type:0,
+                msg_num:9, response_code:200, class:0x6414, payload_offset:Some(offset) };
+            let context = BcContext::new_with_encryption(protocol);
+            let (_, parsed) = bc_body(&context, &header, &body).unwrap();
+            match parsed { BcBody::ModernMsg(ModernMsg { payload:Some(BcPayloads::Binary(data)), .. }) => assert_eq!(data,plain), _ => panic!("expected SD media") }
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod device;
 mod media;
 mod prefs;
 mod recordings;
+mod sd;
 mod xmledit;
 mod scan;
 mod secrets;
@@ -683,6 +684,37 @@ fn list_recordings(handle: tauri::AppHandle) -> recordings::Listing {
     listing
 }
 
+#[tauri::command(async)]
+fn set_playback_default(app: State<App>, source: String) -> Result<(),String> {
+    if !["local","sd"].contains(&source.as_str()) {return Err("Invalid playback source".into());}
+    let inner=app.inner.lock().unwrap();
+    let mut p=prefs::get();p.playback_source=source;prefs::set(p);inner.save();Ok(())
+}
+#[tauri::command]
+async fn sd_recordings(app: State<'_,App>, id:u64, day:String) -> Result<Vec<sd::Clip>,String> {
+    let tx=device_cam(&app,id)?.0;
+    let (reply,rx)=tokio::sync::oneshot::channel();
+    tx.send(Cmd::SdSearch{day,reply}).map_err(|_|"Camera removed")?;
+    tokio::time::timeout(std::time::Duration::from_secs(90),rx).await.map_err(|_|"SD search timed out")?.map_err(|_|"Camera session ended")?
+}
+#[tauri::command]
+async fn sd_recording_file(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:String,end:String) -> Result<String,String> {
+    use std::hash::{Hash,Hasher};
+    let (tx,cache)={
+        let inner=app.inner.lock().unwrap();let d=&inner.devices[inner.index(id)?];
+        let mut h=std::collections::hash_map::DefaultHasher::new();
+        (&d.config.host,&d.config.uid,d.config.channel).hash(&mut h);
+        (d.sender(),handle.path().app_cache_dir().map_err(|e|e.to_string())?.join("sd").join(format!("{:x}",h.finish())))
+    };
+    // Serialize downloads so repeated clicks cannot write the same temporary file concurrently.
+    static DOWNLOAD:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());
+    let _guard=DOWNLOAD.lock().await;
+    let (reply,rx)=tokio::sync::oneshot::channel();
+    tx.send(Cmd::SdDownload{start,end,cache,reply}).map_err(|_|"Camera removed")?;
+    let path=rx.await.map_err(|_|"Camera session ended")??;
+    allow_asset(&handle,&path);Ok(path.to_string_lossy().into_owned())
+}
+
 fn allow_asset(handle: &tauri::AppHandle, file: &Path) {
     // Each refresh lists every recording again; the scope only needs to hear about new ones.
     static ALLOWED: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
@@ -878,7 +910,7 @@ fn main() {
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
             get_prefs, save_prefs, pick_folder, add_found,
-            set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
+            set_playback_default, sd_recordings, sd_recording_file, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
         ])
         .setup(|app| Ok(tray(app)?))
         // Minimizing or closing tucks the window into the tray; Quit is in the tray menu.

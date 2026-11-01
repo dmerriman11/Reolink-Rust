@@ -16,6 +16,8 @@ mod media;
 mod settings;
 #[path = "../src/xmledit.rs"]
 mod xmledit;
+#[path = "../src/sd.rs"]
+mod sd;
 
 use device::{Cmd, Device, DeviceConfig};
 use neolink_core::bc_protocol::StreamKind;

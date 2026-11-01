@@ -11,6 +11,7 @@ pub const SEGMENT_MINUTES: [u32; 6] = [0, 5, 10, 15, 30, 60];
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Prefs {
+    pub playback_source: String,
     pub snapshot_dir: PathBuf,
     pub record_dir: PathBuf,
     /// Split recordings into files of this many minutes (0 = one file). Segments limit what a crash can lose.
@@ -40,6 +41,7 @@ impl Default for Prefs {
         let videos = dirs::video_dir().or_else(|| dirs::home_dir().map(|h| h.join("Videos"))).unwrap_or_default();
         let media = videos.join("Reolink-rs");
         Prefs {
+            playback_source: "local".into(),
             snapshot_dir: media.clone(),
             record_dir: media,
             segment_minutes: 30,
@@ -68,6 +70,7 @@ pub fn set(p: Prefs) {
 impl Prefs {
     /// Reject values the app can't use, and make sure both folders exist and are writable.
     pub fn validate(&self) -> Result<(), String> {
+        if !["local", "sd"].contains(&self.playback_source.as_str()) { return Err("Invalid playback source".into()); }
         if !SEGMENT_MINUTES.contains(&self.segment_minutes) {
             return Err("Video file duration must be one of the listed options".into());
         }
@@ -157,6 +160,9 @@ mod tests {
         let p: Prefs = serde_json::from_str(r#"{"hardware_decode": false}"#).unwrap();
         assert!(!p.hardware_decode);
         assert_eq!(p.segment_minutes, d.segment_minutes);
+        assert_eq!(p.playback_source, "local");
+        let sd = Prefs { playback_source: "sd".into(), ..p };
+        assert_eq!(serde_json::from_str::<Prefs>(&serde_json::to_string(&sd).unwrap()).unwrap().playback_source, "sd");
     }
 
     #[test]

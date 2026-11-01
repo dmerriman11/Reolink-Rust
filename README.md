@@ -56,13 +56,21 @@ tests, time sync and reboot. App settings: folders, recording segments, disk-spa
 network scan, run at startup. LAN auto-detect of cameras. Inventory, SDK command table and validation results:
 [docs/settings-inventory.md](docs/settings-inventory.md).
 
-Playback (done for local recordings): Playback in the left sidebar opens an NVR view of the recording
+Playback (local files and camera SD recordings): Playback in the left sidebar opens an NVR view of the recording
 folder: day picker, one timeline row per camera (click to play, scroll to zoom, drag to pan), segments play back
 to back across gaps, 0.25-16x speed, frame step, ±10 s, clip export (In/Out, no re-encode, into `Clips\`),
 still frame to the snapshot folder, show in folder, delete, and a Thumbnails view of the day's recordings
 (preview frames cached in `.thumbs\`). A scrubber under the player shows the position in the open recording and
 the In/Out range; the wheel zooms into the picture (up to 8x, drag to pan); the recordings list can show
 thumbnails. Live streams pause while it's open.
+Playback's **Recordings from** selector switches between **Local storage** and **Camera SD card**.
+For Camera SD, choose a saved camera and a date; select a recording to download it into the app's playback cache and play it.
+**Make default** saves the selected source for future visits and app restarts; App settings also has a **Default playback source** choice.
+SD browsing uses the camera's clock. Downloads are limited to 1 GB and five minutes of transfer time per clip;
+unsupported cameras and offline cameras show an error with a Refresh option. Cached SD clips remain separate from the local recording folder.
+Delete, clip export and snapshots in this player apply to local recordings; camera SD contents are never deleted by this feature.
+Hardware check: `cargo run --example sd_playback_check -- "<camera name>" YYYY-MM-DD --download --sample` (five-second sample).
+
 Keys: Space, ← → (Shift: 1 min), Home / End, , . (frame), [ ] (speed), I / O, F, + - 0 (zoom). Double-click: full screen.
 The day list and arrows step between days that have recordings; a time box jumps to a time (a gap plays the next
 recording and says so). Clip In/Out can be typed as times; the export result stays on screen with Show in folder.
@@ -79,7 +87,7 @@ Reboot a saved camera and time its reconnect: `cargo run --example reboot_check 
 
 Next phases toward parity with the official client:
 1. Live audio and two-way talk; PTZ presets/zoom/focus
-2. Playback of SD card / NVR recordings (search and download over Baichuan); motion markers on the timeline
+2. Expanded NVR compatibility, playback while SD clips download, and motion markers on the timeline
 3. Alarm/motion notifications and event log; firmware update
 4. Users, Wi-Fi network switching, AI detection config (need protocol work; read-only today)
 

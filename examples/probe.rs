@@ -11,6 +11,8 @@ mod secrets;
 mod settings;
 #[path = "../src/xmledit.rs"]
 mod xmledit;
+#[path = "../src/sd.rs"]
+mod sd;
 #[path = "../src/prefs.rs"]
 mod prefs;
 #[path = "../src/media.rs"]

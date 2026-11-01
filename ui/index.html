@@ -68,6 +68,22 @@
       </div>
     </header>
     <section class="grid" id="grid"></section>
+    <aside class="ptz" id="ptz" aria-label="Pan and tilt" hidden>
+      <button class="ptz-toggle" id="ptz-toggle" aria-label="Toggle PTZ controls" aria-expanded="true" title="Hide PTZ controls">
+        <svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"/></svg>
+        <span>PTZ</span>
+      </button>
+      <div class="ptz-body">
+        <div class="dpad" id="dpad">
+          <button data-dir="up" class="d-up" aria-label="Tilt up"><svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg></button>
+          <button data-dir="left" class="d-left" aria-label="Pan left"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <span class="d-hub" aria-hidden="true"></span>
+          <button data-dir="right" class="d-right" aria-label="Pan right"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+          <button data-dir="down" class="d-down" aria-label="Tilt down"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+        </div>
+        <p class="ptz-hint">Hold to move</p>
+      </div>
+    </aside>
     <button class="fs-exit" id="fs-exit" title="Exit full screen (Esc)" aria-label="Exit full screen">
       <svg viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
     </button>
@@ -75,17 +91,33 @@
 
   <main class="nvr" id="nvr" hidden>
     <header class="topbar">
-      <div class="topbar-left">
+      <div class="topbar-left playback-deck">
+        <div class="pb-sourcebar" role="group" aria-label="Recording source and camera">
+          <label><span class="sr-only">Recordings from</span><select id="pb-source" aria-label="Recordings from"><option value="local">Local storage</option><option value="sd">Camera SD card</option></select></label>
+          <label id="pb-sd-camera-label" hidden><span class="sr-only">Camera</span><select id="pb-sd-camera" aria-label="Camera SD card"></select></label>
+          <details class="pb-options">
+            <summary title="Recording source options">Options<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary>
+            <div class="pb-options-menu">
+              <button class="ghost-btn" id="pb-source-default">Make default</button>
+              <button class="ghost-btn" id="pb-sd-refresh" hidden>Refresh SD recordings</button>
+            </div>
+          </details>
+          <span class="sr-only" id="pb-source-status" role="status"></span>
+        </div>
         <div class="day-nav">
+          <div class="pb-date-group" role="group" aria-label="Recording day">
           <button class="icon-btn" id="pb-prev-day" title="Previous day with recordings" aria-label="Previous day with recordings"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
           <input type="date" id="pb-day" aria-label="Day">
           <button class="icon-btn" id="pb-next-day" title="Next day with recordings" aria-label="Next day with recordings"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
           <select id="pb-days" aria-label="Days with recordings" title="Days with recordings"></select>
+          </div>
+          <div class="pb-time-group" role="group" aria-label="Recording time">
           <input type="time" id="pb-time" step="1" aria-label="Go to time" title="Go to a time on this day (Enter)">
           <button class="ghost-btn" id="pb-latest" title="Jump to the latest recording">Latest</button>
+          </div>
         </div>
-        <span class="pb-summary" id="pb-summary"></span>
       </div>
+      <span class="pb-summary" id="pb-summary"></span>
       <div class="topbar-right">
         <span class="paused-pill app-stale" hidden title="The window can't reach the app's background service; what's shown may be out of date">Not updating</span>
         <button class="paused-pill rec-paused" hidden title="All recording (manual and scheduled) is paused. Click to resume.">Recording paused · Resume</button>
@@ -101,6 +133,15 @@
     </header>
 
     <div class="pb-body">
+      <aside class="pb-files">
+        <div class="section-head">
+          <h2 id="pb-files-title">Recordings</h2>
+          <button class="icon-btn" id="pb-list-thumbs" aria-pressed="false" title="Show thumbnails" aria-label="Show thumbnails in the list">
+            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="7" height="5" rx="1"/><rect x="3" y="14" width="7" height="5" rx="1"/><path d="M13 7.5h8M13 16.5h8"/></svg>
+          </button>
+        </div>
+        <ul class="pb-file-list" id="pb-file-list"></ul>
+      </aside>
       <section class="pb-player" id="pb-player">
         <video id="pb-video" preload="auto" playsinline></video>
         <div class="pb-overlay">
@@ -112,15 +153,7 @@
       </section>
       <section class="pb-grid" id="pb-grid" hidden aria-label="Recordings as thumbnails"></section>
 
-      <aside class="pb-files">
-        <div class="section-head">
-          <h2 id="pb-files-title">Recordings</h2>
-          <button class="icon-btn" id="pb-list-thumbs" aria-pressed="false" title="Show thumbnails" aria-label="Show thumbnails in the list">
-            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="7" height="5" rx="1"/><rect x="3" y="14" width="7" height="5" rx="1"/><path d="M13 7.5h8M13 16.5h8"/></svg>
-          </button>
-        </div>
-        <ul class="pb-file-list" id="pb-file-list"></ul>
-      </aside>
+
     </div>
 
     <div class="pb-transport" id="pb-transport">
@@ -173,24 +206,6 @@
       <p class="tl-hint">Click to play · scroll to zoom · drag to pan</p>
     </section>
   </main>
-
-  <aside class="ptz" id="ptz">
-    <button class="ptz-toggle" id="ptz-toggle" aria-label="Toggle PTZ panel" aria-expanded="true">
-      <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-    </button>
-    <div class="ptz-body">
-      <h2>PTZ</h2>
-      <p class="ptz-target" id="ptz-target">Select a live tile</p>
-      <div class="dpad" id="dpad">
-        <button data-dir="up" class="d-up" aria-label="Tilt up"><svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg></button>
-        <button data-dir="left" class="d-left" aria-label="Pan left"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
-        <span class="d-hub" aria-hidden="true"></span>
-        <button data-dir="right" class="d-right" aria-label="Pan right"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
-        <button data-dir="down" class="d-down" aria-label="Tilt down"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
-      </div>
-      <p class="ptz-hint">Press and hold to move.</p>
-    </div>
-  </aside>
 
   <dialog id="device-dialog">
     <form method="dialog" id="device-form">

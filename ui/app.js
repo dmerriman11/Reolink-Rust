@@ -24,6 +24,7 @@ let state = { devices: [], layout: 4, tiles: [], stream_base: "", token: "" };
 let selected = null; // tile index, or null when no tile is highlighted
 let solo = null;
 let ptzActive = null;
+const ptzEl = $("#ptz"); // held: it moves between tiles and is detached whenever its tile rebuilds
 const tiles = [];
 
 const device = (id) => state.devices.find((d) => d.id === id);
@@ -72,18 +73,23 @@ function renderDevices() {
   $("#empty-hint").hidden = state.devices.length > 0;
   const visible = state.tiles.slice(0, state.layout);
   // Rebuild only on change: re-inserting rows every poll restarts their fade-in and flickers.
-  const key = JSON.stringify([visible, state.devices.map((d) => [d.id, d.name, d.online, d.status, d.battery, d.charging, d.wifi_dbm])]);
+  const key = JSON.stringify([visible, PB.on, PB.cam, state.devices.map((d) => [d.id, d.name, d.online, d.status, d.battery, d.charging, d.wifi_dbm])]);
   if (key === devicesKey) return;
   const firstRender = devicesKey === null;
   devicesKey = key;
   list.classList.toggle("settled", !firstRender);
   list.replaceChildren(...state.devices.map((d, i) => {
-    const li = el("li", "device" + (visible.includes(d.id) ? " shown" : ""));
+    const shown = PB.on ? PB.cam === safeName(d.name) : visible.includes(d.id);
+    const li = el("li", "device" + (shown ? " shown" : ""));
     li.style.animationDelay = `${i * 40}ms`;
     li.tabIndex = 0;
     li.title = d.status;
-    li.append(el("span", "dot" + (d.online ? " on" : "")));
-    li.append(Object.assign(el("span", "device-name"), { textContent: d.name }));
+    const heading = el("div", "device-heading");
+    heading.append(el("span", "dot" + (d.online ? " on" : "")));
+    heading.append(Object.assign(el("span", "device-name"), { textContent: d.name }));
+    li.append(heading);
+    li.append(Object.assign(el("span", "device-connection"), { textContent: d.online ? "Online" : "Offline" }));
+    li.append(Object.assign(el("span", "device-view"), { textContent: PB.on ? (shown ? "Showing recordings" : "Show recordings") : (shown ? "In view" : "Show camera") }));
     const meta = el("span", "device-meta");
     if (d.online && d.wifi_level != null) {
       const w = el("span", `wifi lvl-${d.wifi_level}`, ICON.wifi);
@@ -114,13 +120,13 @@ function renderDevices() {
     menu.append(gear, edit, del);
     li.append(menu);
     const show = () => {
-      if (PB.on) { PB.cam = safeName(d.name); renderPlayback(); return; } // in playback, a device row picks its timeline
+      if (PB.on) { if (PB.source === "sd") { $("#pb-sd-camera").value = String(d.id); PB.sdId = d.id; resetPlaybackSource(); loadRecordings(); } else { PB.cam = safeName(d.name); renderPlayback(); } return; } // in playback, a device row picks its timeline
       const free = state.tiles.slice(0, state.layout).findIndex((t) => t == null);
       const tile = free >= 0 ? free : (selected ?? 0);
       call("assign_tile", { tile, id: d.id }).then(refresh);
     };
     li.onclick = show;
-    li.onkeydown = (e) => { if (e.key === "Enter") show(); };
+    li.onkeydown = (e) => { if (e.target === li && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); show(); } };
     return li;
   }));
 }
@@ -367,10 +373,10 @@ function makeTile(idx) {
   t.img.alt = "";
   t.img.draggable = false;
   t.root.tabIndex = 0;
-  t.root.onclick = () => { selected = idx; renderTiles(); renderPtz(); };
-  t.root.onfocus = () => { if (selected !== idx) { selected = idx; renderTiles(); renderPtz(); } };
+  t.root.onclick = () => { selected = idx; renderTiles(); };
+  t.root.onfocus = () => { if (selected !== idx) { selected = idx; renderTiles(); } };
   t.root.ondblclick = (e) => {
-    if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button")) return;
+    if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button, .ptz")) return;
     setSolo(solo === idx ? null : idx);
   };
   // Keyboard: Enter toggles single view (Esc leaves it), arrows move between tiles.
@@ -439,6 +445,7 @@ function renderTiles() {
   });
   // Drop streams for tiles hidden by a smaller layout.
   tiles.slice(l.n).forEach((t) => { stopVideo(t); t.key = null; });
+  renderPtz();
 }
 
 function buildTile(t, d, idx, key) {
@@ -497,10 +504,11 @@ function buildTile(t, d, idx, key) {
 }
 
 // ---------- PTZ ----------
+// The controls ride on the selected live feed; buildTile empties a tile, so re-attach after every render.
 function renderPtz() {
-  const d = device(state.tiles[selected]);
-  $("#ptz-target").textContent = d ? d.name : "Select a live tile";
-  $("#dpad").classList.toggle("disabled", !d || !d.online);
+  const d = selected == null ? null : device(state.tiles[selected]);
+  ptzEl.hidden = !d?.online;
+  if (d?.online && ptzEl.parentNode !== tiles[selected].root) tiles[selected].root.append(ptzEl);
 }
 
 // ---------- device panel and full screen ----------
@@ -513,7 +521,7 @@ function setupView() {
   };
   try { apply(localStorage.getItem("sidebarCollapsed") === "1"); } catch { /* storage unavailable */ }
   // Clicking anywhere in the device panel (device rows included) drops the tile highlight.
-  $(".sidebar").addEventListener("click", () => { selected = null; renderTiles(); renderPtz(); });
+  $(".sidebar").addEventListener("click", () => { selected = null; renderTiles(); });
   toggle.onclick = () => {
     const collapsed = !document.body.classList.contains("sidebar-collapsed");
     apply(collapsed);
@@ -539,11 +547,12 @@ function setupView() {
 }
 
 function setupPtz() {
-  const panel = $("#ptz");
+  const panel = ptzEl;
   const toggle = $("#ptz-toggle");
   const apply = (collapsed) => {
     panel.classList.toggle("collapsed", collapsed);
     toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.title = collapsed ? "Show PTZ controls" : "Hide PTZ controls";
   };
   try { apply(localStorage.getItem("ptzCollapsed") === "1"); } catch { /* storage unavailable */ }
   toggle.onclick = () => {
@@ -611,6 +620,7 @@ function prefsToView(p) {
   return {
     id: "app", title: "App settings",
     fields: [
+      { key: "playback_source", label: "Default playback source", kind: "choice", value: p.playback_source || "local", options: opt([["local", "Local storage"], ["sd", "Camera SD card"]]) },
       { key: "snapshot_dir", label: "Save snapshots to", kind: "folder", value: p.snapshot_dir },
       { key: "record_dir", label: "Save recordings to", kind: "folder", value: p.record_dir },
       { key: "segment_minutes", label: "Video file duration", kind: "choice", value: String(p.segment_minutes), options: opt(SEGMENTS) },
@@ -628,7 +638,7 @@ function prefsToView(p) {
 
 function viewToPrefs(values) {
   return {
-    snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
+    playback_source: values.playback_source || "local", snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
     segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
     hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
     run_at_startup: values.run_at_startup === "1",
@@ -1213,7 +1223,7 @@ const FRAME = 1 / 15; // shortcut: assumes Reolink's usual 15 fps; read the stre
 const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
 const TICKS = [10 * SEC, 30 * SEC, MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR];
 const NAME_RE = /^(.*)_(\d{4})-(\d\d)-(\d\d)_(\d\d)-(\d\d)-(\d\d)\.mp4$/i;
-const PB = { on: false, opened: false, dir: "", files: [], byCam: new Map(), listing: "", days: new Map(), cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
+const PB = { source: "local", defaultSource: "local", sdId: null, sdKey: null, generation: 0, on: false, opened: false, dir: "", files: [], byCam: new Map(), listing: "", days: new Map(), cams: [], cam: null, cur: null, day: 0, v0: 0, v1: 0, mark: [null, null], seek: 0, autoplay: false, speed: 1, timer: null, heads: [], listThumbs: false };
 const video = $("#pb-video");
 
 const safeName = (n) => n.replace(/[^\p{L}\p{N}-]/gu, "_"); // as device.rs names the files
@@ -1245,8 +1255,12 @@ function parseFile(f) {
 }
 
 async function loadRecordings() {
+  if (!PB.on) return;
+  if (PB.source === "sd") return loadSdRecordings();
+  const generation = PB.generation;
   let res;
   try { res = await invoke("list_recordings"); } catch { return; }
+  if (PB.source !== "local" || generation !== PB.generation || !PB.on) return;
   // The 10 s refresh usually finds nothing new: then there's nothing to reparse or redraw.
   const listing = res.dir + "\n" + res.files.map((f) => `${f.name}/${f.size}/${f.modified}`).join("\n");
   if (PB.opened && listing === PB.listing) return;
@@ -1265,17 +1279,21 @@ async function loadRecordings() {
   if (PB.cur) PB.cur = PB.files.find((f) => f.name === PB.cur.name) || PB.cur;
   if (!PB.opened) {
     PB.opened = true;
-    const last = PB.files.at(-1);
+    // Always open on today; the latest recording is cued only if it reaches into today.
+    const last = PB.files.at(-1), today = dayOf(Date.now());
     PB.cam = last?.cam ?? null;
-    setDay(dayOf(last ? last.start : Date.now()));
-    if (last) openFile(last, 0, false);
-    else showMsg("No recordings yet. Press Record on a live tile, or turn on Local recording in Settings.");
+    setDay(today);
+    if (last && last.end > today) openFile(last, Math.max(0, today - last.start) / SEC, false);
+    else showMsg(last ? "No recordings today. Pick an earlier day with the arrows or the day list."
+      : "No recordings yet. Press Record on a live tile, or turn on Local recording in Settings.");
   }
   renderPlayback();
 }
 
 function setDay(day, center = null) {
+  const changed = PB.day !== day;
   PB.day = day;
+  if (changed && PB.source === "sd" && PB.on) { PB.sdKey = null; loadRecordings(); }
   const span = PB.v1 - PB.v0 || Infinity;
   setViewWindow(center == null ? day : center - Math.min(span, addDays(day, 1) - day) / 2, span);
 }
@@ -1295,9 +1313,10 @@ function renderPlayback() {
   if (!PB.on) return;
   $("#pb-day").value = isoDay(PB.day);
   const today = PB.cams.flatMap(dayFiles);
-  $("#pb-summary").textContent = today.length ? `${today.length} recording${today.length > 1 ? "s" : ""} · ${fmtBytes(today.reduce((n, f) => n + f.size, 0))}` : "No recordings this day";
+  $("#pb-summary").textContent = today.length ? `${today.length} recording${today.length > 1 ? "s" : ""}${PB.source === "sd" ? " · Camera SD" : ` · ${fmtBytes(today.reduce((n, f) => n + f.size, 0))}`}` : "No recordings this day";
   $("#pb-cam").textContent = PB.cur ? camLabel(PB.cur.cam) : "";
-  $("#pb-export").disabled = exporting || !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
+  $("#pb-export").disabled = PB.source === "sd" || exporting || !(PB.cur && PB.mark[0] != null && PB.mark[1] > PB.mark[0]);
+  document.querySelector('[data-act="still"]').disabled = PB.source === "sd";
   renderDays();
   renderClip();
   renderFiles();
@@ -1322,8 +1341,9 @@ function renderDays() {
   sel.value = PB.days.has(PB.day) ? String(PB.day) : "";
   $("#pb-prev-day").disabled = !days.some((d) => d < PB.day);
   $("#pb-next-day").disabled = !days.some((d) => d > PB.day);
-  $("#pb-day").min = days.length ? isoDay(days[0]) : "";
-  $("#pb-day").max = days.length ? isoDay(days.at(-1)) : "";
+  if (PB.source === "sd") { $("#pb-prev-day").disabled = false; $("#pb-next-day").disabled = PB.day >= dayOf(Date.now()); }
+  $("#pb-day").min = PB.source === "sd" ? "" : days.length ? isoDay(days[0]) : "";
+  $("#pb-day").max = isoDay(Date.now()); // today stays pickable even before anything is recorded
 }
 
 // "14:05:09", the value a time input takes.
@@ -1400,7 +1420,8 @@ const listThumbObserver = thumbWatcher();
 function watchThumb(card, observer) {
   const f = card._file;
   if (thumbs.has(thumbKey(f))) showThumb(card, thumbs.get(thumbKey(f)));
-  else observer.observe(card);
+  else if (PB.source === "local") observer.observe(card);
+  else card.querySelector(".pb-thumb").textContent = "Camera SD";
 }
 
 function pumpThumbs() {
@@ -1469,19 +1490,22 @@ function renderFiles() {
   const key = JSON.stringify([PB.cam, PB.day, files.map((f) => [thumbKey(f), f.end]), PB.cur?.name, PB.listThumbs]);
   if (key === filesKey) return;
   filesKey = key;
-  list.classList.toggle("thumbs", PB.listThumbs);
+  list.classList.toggle("thumbs", PB.listThumbs && PB.source === "local");
   listThumbObserver.disconnect();
   if (!files.length) { list.replaceChildren(el("li", "pb-empty", "Nothing recorded this day.")); return; }
-  list.replaceChildren(...files.map((f) => {
+  const counts = new Map();
+  for (const f of files) { const h = new Date(f.start).getHours(); counts.set(h, (counts.get(h) || 0) + 1); }
+  let previousHour = null;
+  list.replaceChildren(...files.flatMap((f) => {
     const li = el("li", "pb-file" + (f === PB.cur ? " current" : ""));
     li.tabIndex = 0;
     li._file = f;
-    if (PB.listThumbs) {
+    if (PB.listThumbs && PB.source === "local") {
       li.append(el("span", "pb-thumb"));
       watchThumb(li, listThumbObserver);
     }
-    li.append(Object.assign(el("span", "pb-file-time"), { textContent: `${fmtTime(f.start)} – ${fmtTime(f.end)}` }));
-    li.append(Object.assign(el("span", "pb-file-meta"), { textContent: `${fmtDur(f.end - f.start)} · ${fmtBytes(f.size)}` }));
+    li.append(Object.assign(el("span", "pb-file-time"), { textContent: fmtTime(f.start) }));
+    li.append(Object.assign(el("span", "pb-file-meta"), { textContent: `Until ${fmtTime(f.end)} · ${fmtDur(f.end - f.start)}${f.sd ? " · SD" : ` · ${fmtBytes(f.size)}`}` }));
     const menu = el("span", "device-menu");
     const reveal = Object.assign(el("button"), { textContent: "Show in folder" });
     reveal.onclick = (e) => { e.stopPropagation(); call("reveal_recording", { name: f.name }); };
@@ -1493,10 +1517,15 @@ function renderFiles() {
       call("delete_recording", { name: f.name }).finally(loadRecordings);
     };
     menu.append(reveal, del);
-    li.append(menu);
+    if (PB.source === "local") li.append(menu);
     li.onclick = () => openFile(f, 0, true);
-    li.onkeydown = (e) => { if (e.key === "Enter") openFile(f, 0, true); };
-    return li;
+    li.onkeydown = (e) => { if (e.target === li && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openFile(f, 0, true); } };
+    const hour = new Date(f.start).getHours();
+    if (hour === previousHour) return [li];
+    previousHour = hour;
+    const header = el("li", "pb-hour");
+    header.append(Object.assign(el("strong"), { textContent: `${String(hour).padStart(2, "0")}:00` }), Object.assign(el("span"), { textContent: `${counts.get(hour)} recording${counts.get(hour) === 1 ? "" : "s"}` }));
+    return [header, li];
   }));
   list.querySelector(".current")?.scrollIntoView({ block: "nearest" });
 }
@@ -1612,10 +1641,21 @@ function playAt(cam, t, play = true) {
   openFile(f, Math.max(0, (t - f.start) / SEC), play);
 }
 
-function openFile(f, offset, play) {
+async function openFile(f, offset, play) {
+  const generation = ++PB.generation;
+  if (f.sd && !f.src) {
+    PB.cur = f; video.pause(); video.removeAttribute("src"); video.load();
+    showMsg("Downloading from camera SD card… playback starts when the clip is ready.");
+    renderPlayback();
+    try {
+      const path = await invoke("sd_recording_file", { id: f.sdId, start: f.sdStart, end: f.sdEnd });
+      if (generation !== PB.generation || PB.source !== "sd" || !PB.on) return;
+      f.src = window.__TAURI__ ? window.__TAURI__.core.convertFileSrc(path) : path;
+    } catch(e) { if (generation === PB.generation) showMsg(`Camera SD: ${e}`); return; }
+  }
   PB.cam = f.cam;
   const at = f.start + offset * SEC;
-  if (dayOf(at) !== PB.day) setDay(dayOf(at), at);
+  if (dayOf(at) !== PB.day && !f.sd) setDay(dayOf(at), at);
   if (PB.cur === f && video.readyState > 0) {
     video.currentTime = offset;
     if (play) video.play().catch(() => {});
@@ -1625,7 +1665,7 @@ function openFile(f, offset, play) {
     PB.seek = offset;
     PB.autoplay = play;
     showMsg("");
-    video.src = fileSrc(f.name);
+    video.src = f.src || fileSrc(f.name);
   }
   renderPlayback();
 }
@@ -1748,8 +1788,8 @@ function act(a) {
     case "next": { const n = nextFile(f); if (n) openFile(n, 0, !video.paused); break; }
     case "in": PB.mark = [video.currentTime, PB.mark[1] > video.currentTime ? PB.mark[1] : null]; renderPlayback(); break;
     case "out": PB.mark = [PB.mark[0] != null && PB.mark[0] < video.currentTime ? PB.mark[0] : 0, video.currentTime]; renderPlayback(); break;
-    case "export": if (!exporting) exportClip(f); break;
-    case "still": call("recording_still", { name: f.name, at: video.currentTime }).then((p) => toast(`Snapshot saved: ${p}`)); break;
+    case "export": if (PB.source === "sd") break; if (!exporting) exportClip(f); break;
+    case "still": if (PB.source === "sd") break; call("recording_still", { name: f.name, at: video.currentTime }).then((p) => toast(`Snapshot saved: ${p}`)); break;
     case "full":
       if (document.fullscreenElement) document.exitFullscreen();
       else $("#pb-player").requestFullscreen?.().catch(() => {});
@@ -1822,16 +1862,69 @@ function setView(playback) {
   invoke("set_live_paused", { paused: playback }).catch(() => {});
   clearInterval(PB.timer);
   if (playback) {
-    loadRecordings();
+    const entryGeneration = ++PB.generation;
+    invoke("get_prefs").then(p => {
+      if (!PB.on || entryGeneration !== PB.generation) return;
+      PB.defaultSource = p.playback_source || "local";
+      PB.source = PB.defaultSource;
+      $("#pb-source").value = PB.source;
+      PB.day = dayOf(Date.now());
+      resetPlaybackSource(); loadRecordings();
+    }).catch(e => showMsg(String(e)));
     PB.timer = setInterval(loadRecordings, 10_000); // new segments show up while cameras record
   } else {
+    PB.generation++;
     video.pause();
     if (document.fullscreenElement) document.exitFullscreen();
   }
   try { localStorage.setItem("view", playback ? "playback" : "live"); } catch { /* ignore */ }
 }
 
+function resetPlaybackSource() {
+  PB.generation++; PB.sdKey = null; PB.opened = false; PB.listing = null;
+  PB.files = []; PB.byCam = new Map(); PB.cams = []; PB.days = new Map(); PB.cur = null; PB.cam = null;
+  video.pause(); video.removeAttribute("src"); video.load();
+  if (!PB.day) PB.day = dayOf(Date.now());
+  const sd = PB.source === "sd";
+  $("#pb-sd-camera-label").hidden = !sd; $("#pb-sd-refresh").hidden = !sd;
+  $("#pb-list-thumbs").disabled = sd;
+  $("#pb-source-default").disabled = PB.source === PB.defaultSource;
+  $("#pb-source-default").textContent = PB.source === PB.defaultSource ? "Default source" : "Make default";
+  const select = $("#pb-sd-camera");
+  select.replaceChildren(...state.devices.map(d => Object.assign(el("option"), { value: d.id, textContent: d.name })));
+  if (!state.devices.some(d => d.id === PB.sdId)) PB.sdId = state.devices[0]?.id ?? null;
+  select.value = String(PB.sdId);
+  $("#pb-source-status").textContent = sd ? "Browse a camera and date. Clips download to a playback cache." : "Recordings saved on this computer.";
+  showMsg(sd ? "Select a camera and date to browse its SD recordings." : "Loading local recordings…");
+  renderPlayback();
+}
+async function loadSdRecordings() {
+  if (!PB.sdId) { showMsg("Add a camera to browse its SD card."); return; }
+  const key = `${PB.sdId}/${isoDay(PB.day)}`;
+  if (key === PB.sdKey) return;
+  PB.sdKey = key;
+  const generation = ++PB.generation, id = PB.sdId;
+  PB.cur = null; PB.files = []; PB.byCam = new Map(); PB.days = new Map(); PB.cams = [];
+  video.pause(); video.removeAttribute("src"); video.load();
+  renderPlayback(); showMsg("Searching camera SD recordings…");
+  try {
+    const clips = await invoke("sd_recordings", { id, day: isoDay(PB.day) });
+    if (!PB.on || generation !== PB.generation || PB.source !== "sd") return;
+    const cam = safeName(device(id)?.name || "Camera");
+    PB.files = clips.map(c => ({ name: c.name, cam, start: new Date(c.start).getTime(), end: new Date(c.end).getTime(), size: 0, sd: true, sdId: id, sdStart: c.start, sdEnd: c.end })).sort((a,b) => a.start-b.start);
+    PB.cam = cam; PB.cams = [cam]; PB.byCam.set(cam, PB.files); PB.days.set(PB.day, clips.length);
+    showMsg(clips.length ? "Pick a recording to download and play." : "No SD recordings found for this camera and date.");
+    renderPlayback();
+  } catch(e) { if (generation === PB.generation) { showMsg(`Camera SD unavailable: ${e}. Try Refresh, another date, or Local storage.`); } }
+}
 function setupPlayback() {
+  $("#pb-source").onchange = e => { PB.source = e.target.value; resetPlaybackSource(); loadRecordings(); };
+  $("#pb-sd-camera").onchange = e => { PB.sdId = +e.target.value; resetPlaybackSource(); loadRecordings(); };
+  $("#pb-sd-refresh").onclick = () => { PB.sdKey = null; loadRecordings(); };
+  $("#pb-source-default").onclick = async () => {
+    const source = PB.source;
+    try { await call("set_playback_default", { source }); PB.defaultSource = source; $("#pb-source-default").disabled = PB.source === source; $("#pb-source-default").textContent = PB.source === source ? "Default source" : "Make default"; toast("Default playback source saved"); } catch {}
+  };
   $("#view-live").onclick = (e) => { e.stopPropagation(); setView(false); };
   $("#view-playback").onclick = (e) => { e.stopPropagation(); setView(true); };
   $("#pb-media").onclick = () => call("open_media_folder");
@@ -1863,8 +1956,8 @@ function setupPlayback() {
     renderPlayback();
   };
   // The arrows skip days with nothing recorded.
-  $("#pb-prev-day").onclick = () => { const d = recordedDays().findLast((d) => d < PB.day); if (d != null) { setDay(d); renderPlayback(); } };
-  $("#pb-next-day").onclick = () => { const d = recordedDays().find((d) => d > PB.day); if (d != null) { setDay(d); renderPlayback(); } };
+  $("#pb-prev-day").onclick = () => { const d = PB.source === "sd" ? addDays(PB.day, -1) : recordedDays().findLast((d) => d < PB.day); if (d != null) { setDay(d); renderPlayback(); } };
+  $("#pb-next-day").onclick = () => { const d = PB.source === "sd" ? addDays(PB.day, 1) : recordedDays().find((d) => d > PB.day); if (d != null) { setDay(d); renderPlayback(); } };
   $("#pb-days").onchange = (e) => { if (e.target.value) { setDay(+e.target.value); renderPlayback(); } };
   // Go to a time on the shown day, on the selected camera's timeline (a gap plays the next recording, and says so).
   let timeTimer;
@@ -1935,7 +2028,6 @@ async function refresh() {
   }
   renderDevices();
   renderTiles();
-  renderPtz();
 }
 
 document.addEventListener("keydown", (e) => {

@@ -66,6 +66,8 @@ pub struct DeviceConfig {
 pub type Reply<T> = tokio::sync::oneshot::Sender<Result<T, String>>;
 
 pub enum Cmd {
+    SdSearch { day: String, reply: Reply<Vec<crate::sd::Clip>> },
+    SdDownload { start: String, end: String, cache: PathBuf, reply: Reply<PathBuf> },
     /// Read (`set: None`) or write a settings message; replies with the camera's XML (empty for writes).
     Xml { msg: crate::settings::Msg, set: Option<String>, reply: Reply<String> },
     Reboot(Reply<()>),
@@ -214,6 +216,8 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     Some(Cmd::Live(k)) => { wanted.live = k; state.lock().unwrap().live = k; }
                     Some(Cmd::Record(r)) => wanted.record = r,
                     Some(Cmd::View(b)) => wanted.jpeg_box = b,
+                    Some(Cmd::SdSearch { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::SdDownload { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Xml { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Reboot(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::SnapshotJpeg(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
@@ -535,6 +539,14 @@ async fn session(
                 if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, views).await? {
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
+            }
+            Cmd::SdSearch { day, reply } => {
+                let cam=cam.clone(); let channel=cfg.channel;
+                tokio::spawn(async move { let result=tokio::time::timeout(Duration::from_secs(80),crate::sd::search(&cam,channel,&day)).await.unwrap_or_else(|_|Err("SD search timed out".into())); let _=reply.send(result); });
+            }
+            Cmd::SdDownload { start, end, cache, reply } => {
+                let cam=cam.clone();let channel=cfg.channel;
+                tokio::spawn(async move { let _=reply.send(crate::sd::download(&cam,channel,&start,&end,&cache).await); });
             }
             Cmd::Xml { msg, set, reply } => {
                 let cam = cam.clone();
