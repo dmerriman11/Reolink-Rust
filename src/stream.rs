@@ -46,6 +46,7 @@ pub async fn serve(feeds: Feeds, token: String) -> std::io::Result<u16> {
 }
 
 /// Parses "GET /live/<id>?t=<token> HTTP/1.1" (or /raw/) and returns the route if the token matches.
+/// /raw sends: 1-byte flags, 4-byte timestamp_us, 4-byte length, data
 fn route(request: &str, token: &str) -> Option<Route> {
     let path = request.lines().next()?.strip_prefix("GET ")?.split(' ').next()?;
     let (path, query) = path.split_once('?')?;
@@ -115,8 +116,10 @@ async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Resu
 }
 
 async fn write_raw(sock: &mut TcpStream, f: &Raw) -> std::io::Result<()> {
-    let mut head = [f.key as u8 | (f.hevc as u8) << 1, 0, 0, 0, 0];
-    head[1..].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
+    let mut head = [0u8; 9];
+    head[0] = f.key as u8 | (f.hevc as u8) << 1;
+    head[1..5].copy_from_slice(&f.timestamp_us.to_be_bytes());
+    head[5..9].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
     sock.write_all(&head).await?;
     sock.write_all(&f.data).await
 }
@@ -138,16 +141,34 @@ async fn raw(
     for f in &gop {
         write_raw(&mut sock, f).await?;
     }
-    let mut resync = false; // fell behind: skip to the next keyframe so the decoder never sees a gap
+    // Network bursts are tolerated: only resync if truly far behind (multiple seconds).
+    let mut lag_count = 0;
     loop {
         match rx.recv().await {
             Ok(f) => {
-                resync &= !f.key;
-                if !resync {
-                    write_raw(&mut sock, &f).await?;
+                lag_count = 0;
+                write_raw(&mut sock, &f).await?;
+            }
+            Err(RecvError::Lagged(n)) => {
+                lag_count += n as u32;
+                // At 15 fps, 45 frames ≈ 3 seconds behind. Only then resync to next keyframe.
+                if lag_count > 45 {
+                    log::warn!("Live viewer lagged {} frames, resyncing to next keyframe", lag_count);
+                    lag_count = 0;
+                    // Skip to next keyframe
+                    loop {
+                        match rx.recv().await {
+                            Ok(f) if f.key => {
+                                write_raw(&mut sock, &f).await?;
+                                break;
+                            }
+                            Ok(_) => continue,
+                            Err(RecvError::Closed) => return Ok(()),
+                            Err(RecvError::Lagged(_)) => continue,
+                        }
+                    }
                 }
             }
-            Err(RecvError::Lagged(_)) => resync = true,
             Err(RecvError::Closed) => return Ok(()), // device removed
         }
     }

@@ -121,9 +121,10 @@ impl Inner {
             (false, None) => self.tiles[..self.layout].iter().flatten().copied().collect(),
         };
         let big = self.solo.is_some() || self.layout <= 2;
+        let use_sub = prefs::get().live_view_substream;
         for d in &self.devices {
             let want = if visible.contains(&d.id) {
-                Some(if big && self.clear.contains(&d.id) { StreamKind::Main } else { StreamKind::Sub })
+                Some(if !use_sub && big && self.clear.contains(&d.id) { StreamKind::Main } else { StreamKind::Sub })
             } else if d.state.lock().unwrap().recording.is_some() {
                 // Off screen but recording: keep the stream as it is.
                 self.sent.get(&d.id).copied().flatten()
@@ -611,6 +612,16 @@ fn get_prefs() -> prefs::Prefs {
     prefs::get()
 }
 
+#[tauri::command]
+fn log_from_webview(level: String, message: String) {
+    match level.as_str() {
+        "error" => log::error!("{}", message),
+        "warn" => log::warn!("{}", message),
+        "info" => log::info!("{}", message),
+        _ => log::debug!("{}", message),
+    }
+}
+
 #[tauri::command(async)]
 fn save_prefs(app: State<App>, prefs: prefs::Prefs) -> Result<prefs::Prefs, String> {
     prefs.validate()?;
@@ -864,8 +875,65 @@ fn tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Set up file-based logging to %APPDATA%\Reolink-rs\logs with rotation.
+fn setup_logging() {
+    use std::fs;
+    use std::sync::Mutex;
+    
+    let log_dir = dirs::config_dir()
+        .unwrap_or_default()
+        .join("Reolink-rs")
+        .join("logs");
+    
+    if let Err(e) = fs::create_dir_all(&log_dir) {
+        eprintln!("Failed to create log directory: {e}");
+        return;
+    }
+    
+    let log_file = log_dir.join("reolink-rs.log");
+    
+    // Rotate if existing log is >2MB
+    if let Ok(meta) = fs::metadata(&log_file) && meta.len() > 2 * 1024 * 1024 {
+        let backup = log_dir.join("reolink-rs.log.1");
+        let _ = fs::rename(&log_file, backup);
+    }
+    
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to open log file: {e}");
+            return;
+        }
+    };
+    
+    let logger = Mutex::new(file);
+    
+    env_logger::Builder::from_default_env()
+        .format(move |buf, record| {
+            use std::io::Write;
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let msg = format!("{} [{}] {}\n", timestamp, record.level(), record.args());
+            
+            // Write to file
+            if let Ok(mut file) = logger.lock() {
+                let _ = file.write_all(msg.as_bytes());
+                let _ = file.flush();
+            }
+            
+            // Also write to buf for env_logger (stderr in debug builds)
+            writeln!(buf, "{} [{}] {}", timestamp, record.level(), record.args())
+        })
+        .init();
+    
+    log::info!("Logging initialized to {}", log_file.display());
+}
+
 fn main() {
-    env_logger::init();
+    setup_logging();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let feeds = stream::Feeds::default();
     let token = stream::token();
@@ -909,7 +977,7 @@ fn main() {
             set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
-            get_prefs, save_prefs, pick_folder, add_found,
+            get_prefs, save_prefs, pick_folder, add_found, log_from_webview,
             set_playback_default, sd_recordings, sd_recording_file, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
         ])
         .setup(|app| Ok(tray(app)?))

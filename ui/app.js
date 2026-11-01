@@ -247,9 +247,50 @@ function streamInfo(frame, hevc) {
 function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const ctx = canvas.getContext("2d");
   const abort = new AbortController();
-  let dec = null, sig = null, waitKey = true, ts = 0, shown = false, size = null;
-  const stop = () => { abort.abort(); try { dec?.close(); } catch { /* already closed */ } dec = null; };
+  let dec = null, sig = null, waitKey = true, shown = false, size = null;
+  
+  // Jitter buffer with media-timeline-based scheduling
+  let jitterBufferMs = 700; // target buffer depth (loaded synchronously below)
+  let frameBuffer = []; // { frame: VideoFrame, presentAt: DOMHighResTimeStamp, mediaTs: number }
+  let frameIdx = 0; // monotonic frame counter for decoder
+  let schedulerRunning = false;
+  let prefsLoaded = false;
+  
+  // Media timeline (from camera timestamps with u32 wrap handling)
+  let playoutAnchor = null; // { wallTime: DOMHighResTimeStamp, mediaTs: microseconds (extended) }
+  let firstMediaTs = null; // first frame's camera timestamp (extended, microseconds)
+  let useCameraTs = true; // whether camera timestamps are currently usable
+  let lastRawCameraTs = 0; // last raw u32 timestamp from camera
+  let cameraEpoch = 0; // offset added for u32 wraps (multiples of 2^32)
+  let badTimestampCount = 0; // consecutive bad timestamps
+  
+  // Derived timeline (fallback if camera timestamps aren't usable)
+  let lastGoodMediaTs = 0; // last valid media timestamp (for stable fallback)
+  let nominalFrameStep = 66667; // microseconds at 15 fps (updated from stream)
+  let measuredFps = 15; // measured frame rate
+  let frameTimestamps = []; // recent arrival times for fps measurement
+  
+  // Buffer depth tracking
+  let lastDepthLog = 0;
+  let underrunCount = 0;
+  let overflowCount = 0;
+  let totalFrames = 0;
+  
+  const stop = () => { 
+    abort.abort(); 
+    schedulerRunning = false;
+    // Close all buffered frames
+    for (const { frame } of frameBuffer) frame.close();
+    frameBuffer = [];
+    try { dec?.close(); } catch { /* already closed */ } 
+    dec = null; 
+  };
   const fail = (why) => { if (abort.signal.aborted) return; console.warn("WebCodecs, using MJPEG:", why); stop(); onFail(); };
+  
+  const logToBackend = (level, msg) => {
+    invoke("log_from_webview", { level, message: `[WebView/${url.split('/').pop()?.split('?')[0]}] ${msg}` }).catch(() => {});
+  };
+  
   const draw = (frame) => {
     // WebView2's hardware HEVC decoder can report Chromium's default 1280x720 as the visible area of a larger
     // picture; crop to the size the SPS gives instead, so the tile isn't just the top-left corner.
@@ -266,7 +307,196 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     frame.close();
     if (!shown) { shown = true; onFirst(); }
   };
-  async function onFrame(flags, data) {
+  
+  // Load jitter buffer setting SYNCHRONOUSLY before any frames arrive
+  const loadPrefs = async () => {
+    try {
+      const prefs = await invoke("get_prefs");
+      if (prefs?.jitter_buffer_ms) {
+        jitterBufferMs = prefs.jitter_buffer_ms;
+        logToBackend("info", `Jitter buffer configured: ${jitterBufferMs}ms`);
+      }
+    } catch (e) {
+      logToBackend("warn", `Failed to load prefs, using default ${jitterBufferMs}ms: ${e}`);
+    }
+    prefsLoaded = true;
+  };
+  
+  // Measure frame rate from arrival timestamps (fallback for derived timeline)
+  const updateFrameRate = (arrivalTime) => {
+    frameTimestamps.push(arrivalTime);
+    if (frameTimestamps.length > 30) frameTimestamps.shift();
+    if (frameTimestamps.length >= 10) {
+      const span = frameTimestamps[frameTimestamps.length - 1] - frameTimestamps[0];
+      measuredFps = (frameTimestamps.length - 1) / (span / 1000);
+    }
+  };
+  
+  // Unwrap camera timestamps and check monotonicity
+  // Returns extended timestamp (with epoch offset for u32 wraps)
+  const unwrapCameraTimestamp = (rawTs) => {
+    if (rawTs === 0) {
+      badTimestampCount++;
+      if (badTimestampCount > 10 && useCameraTs) {
+        logToBackend("warn", `Camera sending zero timestamps, switching to derived timeline`);
+        useCameraTs = false;
+      }
+      return null;
+    }
+    
+    // Detect u32 wrap: if raw value drops by more than 2^31, it wrapped
+    if (lastRawCameraTs > 0) {
+      const rawDelta = rawTs - lastRawCameraTs;
+      
+      // Wrap detected: raw timestamp decreased by ~4.29 billion
+      if (rawDelta < -0x80000000) {
+        cameraEpoch += 0x100000000; // add 2^32
+        logToBackend("info", `Camera timestamp wrapped at ${lastRawCameraTs}, epoch now ${cameraEpoch}`);
+      }
+      // Large forward jump without wrap (>10s) = suspicious
+      else if (rawDelta > 10000000) {
+        badTimestampCount++;
+        if (badTimestampCount > 3 && useCameraTs) {
+          logToBackend("warn", `Camera timestamp jumped forward ${rawDelta}µs, switching to derived`);
+          useCameraTs = false;
+        }
+        lastRawCameraTs = rawTs;
+        return null;
+      }
+      // Small backward jump (not a wrap) = corruption
+      else if (rawDelta < -1000) {
+        badTimestampCount++;
+        if (badTimestampCount > 3 && useCameraTs) {
+          logToBackend("warn", `Camera timestamp went backwards ${rawDelta}µs, switching to derived`);
+          useCameraTs = false;
+        }
+        lastRawCameraTs = rawTs;
+        return null;
+      }
+      // Good timestamp
+      else {
+        badTimestampCount = 0;
+        // Try to recover to camera timestamps if they become good again
+        if (!useCameraTs && badTimestampCount === 0) {
+          logToBackend("info", `Camera timestamps recovered, switching back to camera source`);
+          useCameraTs = true;
+        }
+      }
+    }
+    
+    lastRawCameraTs = rawTs;
+    return cameraEpoch + rawTs;
+  };
+  
+  // Schedule frame presentation: media-timeline-based with adaptive re-anchoring
+  const scheduleFrames = () => {
+    if (!schedulerRunning || abort.signal.aborted) return;
+    
+    const now = performance.now();
+    
+    // Present frames whose presentAt time has arrived
+    while (frameBuffer.length > 0 && frameBuffer[0].presentAt <= now) {
+      const { frame } = frameBuffer.shift();
+      draw(frame);
+    }
+    
+    // Calculate current buffer depth in milliseconds
+    const bufferDepthMs = frameBuffer.length > 0 
+      ? (frameBuffer[frameBuffer.length - 1].presentAt - now)
+      : 0;
+    
+    // Adaptive playout: gently adjust anchor to maintain target buffer depth
+    if (playoutAnchor && frameBuffer.length > 2) {
+      const targetDepth = jitterBufferMs * 0.85; // aim for 85% of target
+      const error = bufferDepthMs - targetDepth;
+      // Adjust by up to ±3% to slowly correct drift
+      if (Math.abs(error) > 50) {
+        const adjustment = Math.max(-jitterBufferMs * 0.03, Math.min(jitterBufferMs * 0.03, error * 0.02));
+        playoutAnchor.wallTime += adjustment;
+      }
+    }
+    
+    // Log buffer stats periodically
+    if (now - lastDepthLog > 2000) {
+      lastDepthLog = now;
+      const depth = Math.round(bufferDepthMs);
+      const count = frameBuffer.length;
+      const fps = measuredFps.toFixed(1);
+      const target = jitterBufferMs;
+      const source = useCameraTs ? "camera" : "derived";
+      logToBackend("info", `Buffer: ${depth}ms/${target}ms (${count} frames, ${fps} fps ${source}), frames: ${totalFrames}, underruns: ${underrunCount}, overflows: ${overflowCount}`);
+      underrunCount = 0;
+      overflowCount = 0;
+    }
+    
+    // Underrun: buffer empty while stream is live
+    if (frameBuffer.length === 0 && totalFrames > 10 && playoutAnchor) {
+      underrunCount++;
+      logToBackend("warn", `Buffer underrun (empty), will re-anchor on next frame at mediaTs ${lastGoodMediaTs}`);
+      // Re-anchor on next frame with full target delay, but keep timeline continuous
+      playoutAnchor = null;
+    }
+    
+    // Overflow: buffer accumulated >2.5x target (skip ahead to stay live)
+    const overflowThreshold = jitterBufferMs * 2.5;
+    if (bufferDepthMs > overflowThreshold) {
+      overflowCount++;
+      logToBackend("warn", `Buffer overflow: ${Math.round(bufferDepthMs)}ms (>${overflowThreshold}ms), skipping to stay live`);
+      // Drop frames until depth is back to target
+      while (frameBuffer.length > 0 && (frameBuffer[frameBuffer.length - 1].presentAt - now) > jitterBufferMs * 1.2) {
+        const { frame } = frameBuffer.shift();
+        frame.close();
+      }
+      // Re-anchor to recover
+      if (frameBuffer.length > 0) {
+        const nextFrame = frameBuffer[0];
+        playoutAnchor = { wallTime: now + jitterBufferMs, mediaTs: nextFrame.mediaTs };
+        logToBackend("info", `Re-anchored after overflow, new depth ~${jitterBufferMs}ms`);
+      }
+    }
+    
+    requestAnimationFrame(scheduleFrames);
+  };
+  
+  // Decode on arrival and buffer the decoded VideoFrame
+  // frame.timestamp carries the media timestamp (microseconds, extended for u32 wraps)
+  const onDecodedFrame = (frame) => {
+    const now = performance.now();
+    updateFrameRate(now);
+    totalFrames++;
+    
+    const mediaTs = frame.timestamp; // microseconds, extended, from camera or derived
+    lastGoodMediaTs = mediaTs; // track last valid timestamp for fallback
+    
+    // Initialize playout anchor on first frame
+    if (!playoutAnchor) {
+      playoutAnchor = { wallTime: now + jitterBufferMs, mediaTs };
+      firstMediaTs = mediaTs;
+      logToBackend("info", `Playout anchor set: ${jitterBufferMs}ms delay, mediaTs source: ${useCameraTs ? "camera" : "derived"}`);
+    }
+    
+    // Calculate presentation time from media timeline
+    // presentAt = anchor.wallTime + (thisMediaTs - anchor.mediaTs) / 1000
+    const mediaDeltaUs = mediaTs - playoutAnchor.mediaTs;
+    const mediaDeltaMs = mediaDeltaUs / 1000;
+    const presentAt = playoutAnchor.wallTime + mediaDeltaMs;
+    
+    frameBuffer.push({ frame, presentAt, mediaTs });
+    
+    // Log first few frames to verify media timeline scheduling
+    if (totalFrames <= 5) {
+      const delayMs = Math.round(presentAt - now);
+      logToBackend("info", `Frame ${totalFrames}: mediaTs=${mediaTs}µs, presentIn=${delayMs}ms`);
+    }
+    
+    // Start scheduler on first frame
+    if (!schedulerRunning) {
+      schedulerRunning = true;
+      requestAnimationFrame(scheduleFrames);
+    }
+  };
+  
+  async function onFrame(flags, cameraTimestampUs, data) {
     const key = (flags & 1) !== 0;
     if (key) {
       const hevc = (flags & 2) !== 0;
@@ -281,16 +511,77 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
         const config = { codec, optimizeForLatency: true, ...(size && { codedWidth: size.width, codedHeight: size.height }) };
         const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
         if (!supported) return fail(`${codec} not supported`);
-        dec ||= new VideoDecoder({ output: draw, error: fail });
+        // Wait for prefs to load before configuring decoder
+        if (!prefsLoaded) {
+          await loadPrefs();
+        }
+        
+        dec ||= new VideoDecoder({ output: onDecodedFrame, error: fail });
         dec.configure(config);
         sig = s;
         waitKey = true;
+        for (const { frame } of frameBuffer) frame.close();
+        frameBuffer = [];
+        frameIdx = 0;
+        frameTimestamps = [];
+        totalFrames = 0;
+        playoutAnchor = null;
+        firstMediaTs = null;
+        lastRawCameraTs = 0;
+        cameraEpoch = 0;
+        badTimestampCount = 0;
+        lastGoodMediaTs = 0;
+        useCameraTs = true;
+        // Update nominal frame step from stream info if available
+        if (info?.width) {
+          const streamFps = 15; // TODO: extract from stream if available
+          nominalFrameStep = Math.round(1000000 / streamFps);
+        }
+        logToBackend("info", `Decoder configured: ${codec}, jitter buffer: ${jitterBufferMs}ms`);
       }
     }
     if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
-    if (dec.decodeQueueSize > 8) { waitKey = true; return; } // falling behind: drop to the next keyframe
-    waitKey = false;
-    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 1000), data }));
+    
+    // Unwrap camera timestamp (handles u32 wraps)
+    const unwrappedTs = unwrapCameraTimestamp(cameraTimestampUs);
+    
+    // Reset on keyframe after waiting
+    if (key && waitKey) {
+      waitKey = false;
+      frameIdx = 0;
+      // Don't reset playoutAnchor - keep timeline continuous
+      logToBackend("info", `Keyframe received, resuming from frame ${totalFrames}`);
+    }
+    
+    // Determine media timestamp: use camera timestamp if valid and enabled, else derive
+    let mediaTimestamp;
+    if (useCameraTs && unwrappedTs !== null) {
+      mediaTimestamp = unwrappedTs;
+      if (frameIdx === 0) {
+        firstMediaTs = mediaTimestamp;
+      }
+    } else {
+      // Fallback: continue from last good timestamp + nominal step
+      // This stays stable even over long sessions
+      if (frameIdx === 0 || !firstMediaTs) {
+        // First frame in fallback mode: use last known good timestamp or start fresh
+        mediaTimestamp = lastGoodMediaTs > 0 ? lastGoodMediaTs + nominalFrameStep : 0;
+        firstMediaTs = mediaTimestamp;
+      } else {
+        // Subsequent frames: steady increments
+        mediaTimestamp = lastGoodMediaTs + nominalFrameStep;
+      }
+    }
+    
+    // Decode immediately on arrival (output goes to onDecodedFrame which buffers it)
+    // The timestamp we pass becomes frame.timestamp in the decoded callback
+    const chunk = new EncodedVideoChunk({ 
+      type: key ? "key" : "delta", 
+      timestamp: mediaTimestamp, // microseconds: camera timestamp (extended) or derived
+      data 
+    });
+    dec.decode(chunk);
+    frameIdx++;
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
@@ -304,10 +595,10 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   return { stop };
 }
 
-// Split /raw's byte stream (1 flag byte, 4-byte big-endian length, payload) into frames, however the chunks fall.
-// Each payload is allocated once and every byte copied once, so big keyframes spread over many chunks stay cheap.
+// Split /raw's byte stream (1 flag byte, 4-byte timestamp_us, 4-byte big-endian length, payload) into frames.
+// Header is now 9 bytes: flags, timestamp_us, length.
 function framer(onFrame) {
-  const head = new Uint8Array(5);
+  const head = new Uint8Array(9);
   let have = 0; // header bytes so far
   let body = null; // payload being filled
   let filled = 0;
@@ -315,12 +606,13 @@ function framer(onFrame) {
     let at = 0;
     while (at < chunk.length) {
       if (!body) {
-        const n = Math.min(5 - have, chunk.length - at);
+        const n = Math.min(9 - have, chunk.length - at);
         head.set(chunk.subarray(at, at + n), have);
         have += n;
         at += n;
-        if (have < 5) return;
-        body = new Uint8Array(((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4]);
+        if (have < 9) return;
+        const timestampUs = ((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4];
+        body = new Uint8Array(((head[5] << 24) >>> 0) + (head[6] << 16) + (head[7] << 8) + head[8]);
         filled = 0;
       }
       const n = Math.min(body.length - filled, chunk.length - at);
@@ -329,9 +621,10 @@ function framer(onFrame) {
       at += n;
       if (filled === body.length) {
         const frame = body;
+        const timestampUs = ((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4];
         body = null;
         have = 0;
-        await onFrame(head[0], frame);
+        await onFrame(head[0], timestampUs, frame);
       }
     }
   };
@@ -625,6 +918,8 @@ function prefsToView(p) {
       { key: "record_dir", label: "Save recordings to", kind: "folder", value: p.record_dir },
       { key: "segment_minutes", label: "Video file duration", kind: "choice", value: String(p.segment_minutes), options: opt(SEGMENTS) },
       { key: "space_warning_gb", label: "Warn when free space is below (GB, 0 = off)", kind: "number", value: String(p.space_warning_gb), min: 0, max: 10000 },
+      { key: "live_view_substream", label: "Use low-res stream for live view (saves bandwidth)", kind: "toggle", value: (p.live_view_substream ?? true) ? "1" : "0" },
+      { key: "jitter_buffer_ms", label: "Live view smoothing buffer (ms, 500-1000 recommended)", kind: "number", value: String(p.jitter_buffer_ms || 700), min: 100, max: 3000 },
       { key: "hardware_decode", label: "Hardware video decoding", kind: "toggle", value: p.hardware_decode ? "1" : "0" },
       { key: "scan_network", label: "Find new cameras on the network", kind: "toggle", value: p.scan_network ? "1" : "0" },
       { key: "run_at_startup", label: "Run at Windows startup", kind: "toggle", value: p.run_at_startup ? "1" : "0" },
@@ -640,6 +935,8 @@ function viewToPrefs(values) {
   return {
     playback_source: values.playback_source || "local", snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
     segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
+    live_view_substream: values.live_view_substream === "1",
+    jitter_buffer_ms: Math.max(100, Math.min(3000, Math.round(+values.jitter_buffer_ms || 700))),
     hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
     run_at_startup: values.run_at_startup === "1",
     alarm_beep: values.alarm_beep === "1", alarm_volume: Math.round(+values.alarm_volume || 0),
