@@ -249,16 +249,22 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const abort = new AbortController();
   let dec = null, sig = null, waitKey = true, shown = false, size = null;
   
-  // Jitter buffer: decode on arrival, buffer decoded frames, present with fixed delay
+  // Jitter buffer with media-timeline-based scheduling
   let jitterBufferMs = 700; // target buffer depth (loaded synchronously below)
-  let frameBuffer = []; // { frame: VideoFrame, presentAt: DOMHighResTimeStamp }
-  let frameIdx = 0; // monotonic frame counter
+  let frameBuffer = []; // { frame: VideoFrame, presentAt: DOMHighResTimeStamp, mediaTs: number }
+  let frameIdx = 0; // monotonic frame counter for decoder
   let schedulerRunning = false;
   let prefsLoaded = false;
   
-  // Frame rate measurement
-  let frameTimestamps = []; // recent arrival times for rate measurement
+  // Media timeline (from camera timestamps)
+  let playoutAnchor = null; // { wallTime: DOMHighResTimeStamp, mediaTs: microseconds }
+  let firstMediaTs = null; // first frame's camera timestamp (microseconds)
+  let useCameraTs = true; // whether camera timestamps are monotonic
+  let lastCameraTs = 0;
+  
+  // Derived timeline (fallback if camera timestamps aren't usable)
   let measuredFps = 15; // measured frame rate
+  let frameTimestamps = []; // recent arrival times for fps measurement
   
   // Buffer depth tracking
   let lastDepthLog = 0;
@@ -312,7 +318,7 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     prefsLoaded = true;
   };
   
-  // Measure frame rate from arrival timestamps
+  // Measure frame rate from arrival timestamps (fallback for derived timeline)
   const updateFrameRate = (arrivalTime) => {
     frameTimestamps.push(arrivalTime);
     if (frameTimestamps.length > 30) frameTimestamps.shift();
@@ -322,7 +328,26 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     }
   };
   
-  // Schedule frame presentation: simple fixed-delay playout
+  // Check if camera timestamps are usable (monotonic)
+  const checkCameraTimestamp = (cameraTs) => {
+    if (cameraTs === 0) {
+      useCameraTs = false;
+      return;
+    }
+    // Check for backwards jumps or excessive forward jumps (>5s = likely wrap or corruption)
+    if (lastCameraTs > 0) {
+      const delta = cameraTs - lastCameraTs;
+      if (delta < -1000 || delta > 5000000) {
+        if (useCameraTs) {
+          logToBackend("warn", `Camera timestamp non-monotonic (delta ${delta}µs), switching to derived timeline`);
+        }
+        useCameraTs = false;
+      }
+    }
+    lastCameraTs = cameraTs;
+  };
+  
+  // Schedule frame presentation: media-timeline-based with adaptive re-anchoring
   const scheduleFrames = () => {
     if (!schedulerRunning || abort.signal.aborted) return;
     
@@ -339,6 +364,17 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
       ? (frameBuffer[frameBuffer.length - 1].presentAt - now)
       : 0;
     
+    // Adaptive playout: gently adjust anchor to maintain target buffer depth
+    if (playoutAnchor && frameBuffer.length > 2) {
+      const targetDepth = jitterBufferMs * 0.85; // aim for 85% of target
+      const error = bufferDepthMs - targetDepth;
+      // Adjust by up to ±3% to slowly correct drift
+      if (Math.abs(error) > 50) {
+        const adjustment = Math.max(-jitterBufferMs * 0.03, Math.min(jitterBufferMs * 0.03, error * 0.02));
+        playoutAnchor.wallTime += adjustment;
+      }
+    }
+    
     // Log buffer stats periodically
     if (now - lastDepthLog > 2000) {
       lastDepthLog = now;
@@ -346,57 +382,79 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
       const count = frameBuffer.length;
       const fps = measuredFps.toFixed(1);
       const target = jitterBufferMs;
-      logToBackend("info", `Buffer: ${depth}ms/${target}ms target (${count} frames, ${fps} fps), total: ${totalFrames}, underruns: ${underrunCount}, overflows: ${overflowCount}`);
+      const source = useCameraTs ? "camera" : "derived";
+      logToBackend("info", `Buffer: ${depth}ms/${target}ms (${count} frames, ${fps} fps ${source}), frames: ${totalFrames}, underruns: ${underrunCount}, overflows: ${overflowCount}`);
       underrunCount = 0;
       overflowCount = 0;
     }
     
-    // Underrun detection
-    if (frameBuffer.length === 0 && totalFrames > 10) {
+    // Underrun: buffer empty while stream is live
+    if (frameBuffer.length === 0 && totalFrames > 10 && playoutAnchor) {
       underrunCount++;
-      logToBackend("warn", `Buffer underrun (empty after ${totalFrames} frames)`);
+      logToBackend("warn", `Buffer underrun (empty), will re-anchor on next frame`);
+      // Re-anchor on next frame with full target delay
+      playoutAnchor = null;
     }
     
-    // Overflow: buffer accumulated >3s latency (something is wrong)
-    if (bufferDepthMs > 3000) {
+    // Overflow: buffer accumulated >2.5x target (skip ahead to stay live)
+    const overflowThreshold = jitterBufferMs * 2.5;
+    if (bufferDepthMs > overflowThreshold) {
       overflowCount++;
-      logToBackend("warn", `Buffer overflow: ${Math.round(bufferDepthMs)}ms accumulated, dropping to keyframe`);
-      // Clear and wait for next keyframe
-      for (const { frame } of frameBuffer) frame.close();
-      frameBuffer = [];
-      waitKey = true;
-      frameIdx = 0;
-      totalFrames = 0;
+      logToBackend("warn", `Buffer overflow: ${Math.round(bufferDepthMs)}ms (>${overflowThreshold}ms), skipping to stay live`);
+      // Drop frames until depth is back to target
+      while (frameBuffer.length > 0 && (frameBuffer[frameBuffer.length - 1].presentAt - now) > jitterBufferMs * 1.2) {
+        const { frame } = frameBuffer.shift();
+        frame.close();
+      }
+      // Re-anchor to recover
+      if (frameBuffer.length > 0) {
+        const nextFrame = frameBuffer[0];
+        playoutAnchor = { wallTime: now + jitterBufferMs, mediaTs: nextFrame.mediaTs };
+        logToBackend("info", `Re-anchored after overflow, new depth ~${jitterBufferMs}ms`);
+      }
     }
     
     requestAnimationFrame(scheduleFrames);
   };
   
-  // Decode on arrival and buffer the decoded VideoFrame with fixed presentation delay
+  // Decode on arrival and buffer the decoded VideoFrame
+  // frame.timestamp carries the media timestamp (microseconds)
   const onDecodedFrame = (frame) => {
     const now = performance.now();
     updateFrameRate(now);
     totalFrames++;
     
-    // Present this frame at: now + jitterBufferMs
-    // This creates a fixed delay that absorbs network jitter
-    const presentAt = now + jitterBufferMs;
-    frameBuffer.push({ frame, presentAt });
+    const mediaTs = frame.timestamp; // microseconds, from camera or derived
     
-    // Log first few frames to verify buffering is working
+    // Initialize playout anchor on first frame
+    if (!playoutAnchor) {
+      playoutAnchor = { wallTime: now + jitterBufferMs, mediaTs };
+      firstMediaTs = mediaTs;
+      logToBackend("info", `Playout anchor set: ${jitterBufferMs}ms delay, mediaTs source: ${useCameraTs ? "camera" : "derived"}`);
+    }
+    
+    // Calculate presentation time from media timeline
+    // presentAt = anchor.wallTime + (thisMediaTs - anchor.mediaTs) / 1000
+    const mediaDeltaUs = mediaTs - playoutAnchor.mediaTs;
+    const mediaDeltaMs = mediaDeltaUs / 1000;
+    const presentAt = playoutAnchor.wallTime + mediaDeltaMs;
+    
+    frameBuffer.push({ frame, presentAt, mediaTs });
+    
+    // Log first few frames to verify media timeline scheduling
     if (totalFrames <= 5) {
-      logToBackend("info", `Frame ${totalFrames}: buffered for ${jitterBufferMs}ms (presentAt in ${Math.round(presentAt - now)}ms)`);
+      const delayMs = Math.round(presentAt - now);
+      logToBackend("info", `Frame ${totalFrames}: mediaTs=${mediaTs}µs, presentIn=${delayMs}ms`);
     }
     
     // Start scheduler on first frame
     if (!schedulerRunning) {
       schedulerRunning = true;
-      logToBackend("info", `Playout scheduler started with ${jitterBufferMs}ms target delay`);
       requestAnimationFrame(scheduleFrames);
     }
   };
   
-  async function onFrame(flags, data) {
+  async function onFrame(flags, cameraTimestampUs, data) {
     const key = (flags & 1) !== 0;
     if (key) {
       const hevc = (flags & 2) !== 0;
@@ -425,25 +483,41 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
         frameIdx = 0;
         frameTimestamps = [];
         totalFrames = 0;
+        playoutAnchor = null;
+        firstMediaTs = null;
+        lastCameraTs = 0;
+        useCameraTs = true;
         logToBackend("info", `Decoder configured: ${codec}, jitter buffer: ${jitterBufferMs}ms`);
       }
     }
     if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
     
+    // Check camera timestamp validity
+    checkCameraTimestamp(cameraTimestampUs);
+    
     // Reset on keyframe after waiting
     if (key && waitKey) {
       waitKey = false;
       frameIdx = 0;
+      playoutAnchor = null;
+      firstMediaTs = null;
       logToBackend("info", `Keyframe received, resuming from frame ${totalFrames}`);
     }
     
+    // Determine media timestamp: use camera timestamp if valid, else derive from frame index
+    const mediaTimestamp = useCameraTs && cameraTimestampUs > 0 
+      ? cameraTimestampUs 
+      : (firstMediaTs || 0) + (frameIdx * 1000000 / measuredFps);
+    
     // Decode immediately on arrival (output goes to onDecodedFrame which buffers it)
+    // The timestamp we pass becomes frame.timestamp in the decoded callback
     const chunk = new EncodedVideoChunk({ 
       type: key ? "key" : "delta", 
-      timestamp: (frameIdx++) * 1000, // microseconds for decoder
+      timestamp: mediaTimestamp, // microseconds: camera timestamp or derived
       data 
     });
     dec.decode(chunk);
+    frameIdx++;
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
@@ -457,10 +531,10 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   return { stop };
 }
 
-// Split /raw's byte stream (1 flag byte, 4-byte big-endian length, payload) into frames, however the chunks fall.
-// Each payload is allocated once and every byte copied once, so big keyframes spread over many chunks stay cheap.
+// Split /raw's byte stream (1 flag byte, 4-byte timestamp_us, 4-byte big-endian length, payload) into frames.
+// Header is now 9 bytes: flags, timestamp_us, length.
 function framer(onFrame) {
-  const head = new Uint8Array(5);
+  const head = new Uint8Array(9);
   let have = 0; // header bytes so far
   let body = null; // payload being filled
   let filled = 0;
@@ -468,12 +542,13 @@ function framer(onFrame) {
     let at = 0;
     while (at < chunk.length) {
       if (!body) {
-        const n = Math.min(5 - have, chunk.length - at);
+        const n = Math.min(9 - have, chunk.length - at);
         head.set(chunk.subarray(at, at + n), have);
         have += n;
         at += n;
-        if (have < 5) return;
-        body = new Uint8Array(((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4]);
+        if (have < 9) return;
+        const timestampUs = ((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4];
+        body = new Uint8Array(((head[5] << 24) >>> 0) + (head[6] << 16) + (head[7] << 8) + head[8]);
         filled = 0;
       }
       const n = Math.min(body.length - filled, chunk.length - at);
@@ -482,9 +557,10 @@ function framer(onFrame) {
       at += n;
       if (filled === body.length) {
         const frame = body;
+        const timestampUs = ((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4];
         body = null;
         have = 0;
-        await onFrame(head[0], frame);
+        await onFrame(head[0], timestampUs, frame);
       }
     }
   };

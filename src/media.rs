@@ -175,6 +175,8 @@ pub struct Raw {
     pub hevc: bool,
     pub key: bool,
     pub data: Vec<u8>,
+    /// Camera timestamp in microseconds (from BC media packet).
+    pub timestamp_us: u32,
 }
 
 /// Broadcast channel capacity: sized to handle network bursts (~6 frames @ 200-400KB each ≈ 2MB).
@@ -372,7 +374,7 @@ mod tests {
     #[test]
     fn raw_viewers_start_at_the_last_keyframe() {
         let feed = RawFeed::default();
-        let f = |key, n: u8| Raw { hevc: true, key, data: vec![n] };
+        let f = |key, n: u8| Raw { hevc: true, key, data: vec![n], timestamp_us: n as u32 * 66667 };
         feed.push(f(false, 0)); // before any keyframe: nothing to start from
         assert!(feed.subscribe().0.is_empty());
         feed.push(f(true, 1));
