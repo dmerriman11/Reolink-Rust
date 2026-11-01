@@ -138,16 +138,34 @@ async fn raw(
     for f in &gop {
         write_raw(&mut sock, f).await?;
     }
-    let mut resync = false; // fell behind: skip to the next keyframe so the decoder never sees a gap
+    // Network bursts are tolerated: only resync if truly far behind (multiple seconds).
+    let mut lag_count = 0;
     loop {
         match rx.recv().await {
             Ok(f) => {
-                resync &= !f.key;
-                if !resync {
-                    write_raw(&mut sock, &f).await?;
+                lag_count = 0;
+                write_raw(&mut sock, &f).await?;
+            }
+            Err(RecvError::Lagged(n)) => {
+                lag_count += n as u32;
+                // At 15 fps, 45 frames ≈ 3 seconds behind. Only then resync to next keyframe.
+                if lag_count > 45 {
+                    log::warn!("Live viewer lagged {} frames, resyncing to next keyframe", lag_count);
+                    lag_count = 0;
+                    // Skip to next keyframe
+                    loop {
+                        match rx.recv().await {
+                            Ok(f) if f.key => {
+                                write_raw(&mut sock, &f).await?;
+                                break;
+                            }
+                            Ok(_) => continue,
+                            Err(RecvError::Closed) => return Ok(()),
+                            Err(RecvError::Lagged(_)) => continue,
+                        }
+                    }
                 }
             }
-            Err(RecvError::Lagged(_)) => resync = true,
             Err(RecvError::Closed) => return Ok(()), // device removed
         }
     }

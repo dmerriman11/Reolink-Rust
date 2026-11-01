@@ -247,9 +247,34 @@ function streamInfo(frame, hevc) {
 function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const ctx = canvas.getContext("2d");
   const abort = new AbortController();
-  let dec = null, sig = null, waitKey = true, ts = 0, shown = false, size = null;
-  const stop = () => { abort.abort(); try { dec?.close(); } catch { /* already closed */ } dec = null; };
+  let dec = null, sig = null, waitKey = true, shown = false, size = null;
+  
+  // Jitter buffer: queue frames and schedule presentation based on steady timestamps
+  const FPS = 15; // Reolink cameras typically stream at 15 fps
+  const FRAME_DURATION_MS = 1000 / FPS;
+  let jitterBufferMs = 400; // default, will be loaded from prefs
+  let frameBuffer = []; // { chunk, presentationTime }
+  let baseTime = null; // DOMHighResTimeStamp when first frame should present
+  let nextFrameIndex = 0;
+  let schedulerRunning = false;
+  
+  // Load jitter buffer setting from app prefs
+  (async () => {
+    try {
+      const prefs = await invoke("get_prefs");
+      if (prefs?.jitter_buffer_ms) jitterBufferMs = prefs.jitter_buffer_ms;
+    } catch { /* use default */ }
+  })();
+  
+  const stop = () => { 
+    abort.abort(); 
+    schedulerRunning = false;
+    frameBuffer = [];
+    try { dec?.close(); } catch { /* already closed */ } 
+    dec = null; 
+  };
   const fail = (why) => { if (abort.signal.aborted) return; console.warn("WebCodecs, using MJPEG:", why); stop(); onFail(); };
+  
   const draw = (frame) => {
     // WebView2's hardware HEVC decoder can report Chromium's default 1280x720 as the visible area of a larger
     // picture; crop to the size the SPS gives instead, so the tile isn't just the top-left corner.
@@ -266,6 +291,38 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     frame.close();
     if (!shown) { shown = true; onFirst(); }
   };
+  
+  // Schedule frame presentation based on timestamps
+  const scheduleFrames = () => {
+    if (!schedulerRunning || abort.signal.aborted) return;
+    
+    const now = performance.now();
+    
+    // Present any frames that are due
+    while (frameBuffer.length > 0 && frameBuffer[0].presentationTime <= now) {
+      const { chunk } = frameBuffer.shift();
+      if (dec && dec.state === "configured") {
+        dec.decode(chunk);
+      }
+    }
+    
+    // Check if we're too far behind (>2.5s buffered = truly stuck)
+    if (frameBuffer.length > 0) {
+      const latency = frameBuffer[frameBuffer.length - 1].presentationTime - now;
+      if (latency > 2500) {
+        console.warn(`Live view buffer overflow: ${Math.round(latency)}ms behind, dropping to keyframe`);
+        // Clear buffer and wait for next keyframe
+        frameBuffer = [];
+        waitKey = true;
+        baseTime = null;
+        nextFrameIndex = 0;
+      }
+    }
+    
+    // Schedule next check
+    requestAnimationFrame(scheduleFrames);
+  };
+  
   async function onFrame(flags, data) {
     const key = (flags & 1) !== 0;
     if (key) {
@@ -285,12 +342,41 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
         dec.configure(config);
         sig = s;
         waitKey = true;
+        frameBuffer = [];
+        baseTime = null;
+        nextFrameIndex = 0;
       }
     }
     if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
-    if (dec.decodeQueueSize > 8) { waitKey = true; return; } // falling behind: drop to the next keyframe
-    waitKey = false;
-    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 1000), data }));
+    
+    // Reset buffer on keyframe after waiting
+    if (key && waitKey) {
+      waitKey = false;
+      frameBuffer = [];
+      baseTime = null;
+      nextFrameIndex = 0;
+      if (!schedulerRunning) {
+        schedulerRunning = true;
+        requestAnimationFrame(scheduleFrames);
+      }
+    }
+    
+    // Derive presentation time: first frame establishes base, rest use steady frame clock
+    const now = performance.now();
+    if (baseTime === null) {
+      baseTime = now + jitterBufferMs; // Start presenting after jitter buffer fills
+      nextFrameIndex = 0;
+    }
+    const presentationTime = baseTime + (nextFrameIndex * FRAME_DURATION_MS);
+    nextFrameIndex++;
+    
+    // Buffer the frame
+    const chunk = new EncodedVideoChunk({ 
+      type: key ? "key" : "delta", 
+      timestamp: nextFrameIndex * 1000, // microseconds for decoder
+      data 
+    });
+    frameBuffer.push({ chunk, presentationTime });
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
@@ -625,6 +711,7 @@ function prefsToView(p) {
       { key: "record_dir", label: "Save recordings to", kind: "folder", value: p.record_dir },
       { key: "segment_minutes", label: "Video file duration", kind: "choice", value: String(p.segment_minutes), options: opt(SEGMENTS) },
       { key: "space_warning_gb", label: "Warn when free space is below (GB, 0 = off)", kind: "number", value: String(p.space_warning_gb), min: 0, max: 10000 },
+      { key: "jitter_buffer_ms", label: "Live view smoothing buffer (ms, 300-1000 recommended)", kind: "number", value: String(p.jitter_buffer_ms || 400), min: 100, max: 2000 },
       { key: "hardware_decode", label: "Hardware video decoding", kind: "toggle", value: p.hardware_decode ? "1" : "0" },
       { key: "scan_network", label: "Find new cameras on the network", kind: "toggle", value: p.scan_network ? "1" : "0" },
       { key: "run_at_startup", label: "Run at Windows startup", kind: "toggle", value: p.run_at_startup ? "1" : "0" },
@@ -640,6 +727,7 @@ function viewToPrefs(values) {
   return {
     playback_source: values.playback_source || "local", snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
     segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
+    jitter_buffer_ms: Math.max(100, Math.min(2000, Math.round(+values.jitter_buffer_ms || 400))),
     hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
     run_at_startup: values.run_at_startup === "1",
     alarm_beep: values.alarm_beep === "1", alarm_volume: Math.round(+values.alarm_volume || 0),

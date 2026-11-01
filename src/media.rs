@@ -72,8 +72,9 @@ pub async fn run(args: &[&std::ffi::OsStr]) -> Result<(), String> {
 }
 
 /// Feeds Annex-B NAL units to a writer thread so a slow ffmpeg never stalls the network task.
+/// Capacity increased to handle network bursts without dropping frames.
 fn feeder(mut stdin: ChildStdin) -> SyncSender<Vec<u8>> {
-    let (tx, rx) = sync_channel::<Vec<u8>>(64);
+    let (tx, rx) = sync_channel::<Vec<u8>>(256);
     std::thread::spawn(move || {
         for buf in rx {
             if stdin.write_all(&buf).is_err() {
@@ -131,7 +132,8 @@ impl Decoder {
         if let Some(tx) = &self.tx
             && let Err(TrySendError::Full(_)) = tx.try_send(data)
         {
-            // Dropped a frame; resync on the next keyframe instead of decoding garbage.
+            // Queue full: ffmpeg is genuinely behind. Log and resync on next keyframe.
+            log::warn!("JPEG decoder queue full, resyncing to next keyframe");
             self.waiting_for_key = true;
         }
     }
@@ -175,8 +177,9 @@ pub struct Raw {
     pub data: Vec<u8>,
 }
 
-/// Frames a WebCodecs viewer falls this far behind on are dropped; it resyncs on the next keyframe.
-const RAW_QUEUE: usize = 64;
+/// Broadcast channel capacity: sized to handle network bursts (~6 frames @ 200-400KB each ≈ 2MB).
+/// At 15 fps, 256 frames ≈ 17 seconds of buffering before Lagged occurs.
+const RAW_QUEUE: usize = 256;
 /// Longest group of pictures kept for new viewers; beyond this, caching waits for the next keyframe.
 const GOP_MAX: usize = 600;
 
