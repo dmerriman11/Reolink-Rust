@@ -256,13 +256,17 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   let schedulerRunning = false;
   let prefsLoaded = false;
   
-  // Media timeline (from camera timestamps)
-  let playoutAnchor = null; // { wallTime: DOMHighResTimeStamp, mediaTs: microseconds }
-  let firstMediaTs = null; // first frame's camera timestamp (microseconds)
-  let useCameraTs = true; // whether camera timestamps are monotonic
-  let lastCameraTs = 0;
+  // Media timeline (from camera timestamps with u32 wrap handling)
+  let playoutAnchor = null; // { wallTime: DOMHighResTimeStamp, mediaTs: microseconds (extended) }
+  let firstMediaTs = null; // first frame's camera timestamp (extended, microseconds)
+  let useCameraTs = true; // whether camera timestamps are currently usable
+  let lastRawCameraTs = 0; // last raw u32 timestamp from camera
+  let cameraEpoch = 0; // offset added for u32 wraps (multiples of 2^32)
+  let badTimestampCount = 0; // consecutive bad timestamps
   
   // Derived timeline (fallback if camera timestamps aren't usable)
+  let lastGoodMediaTs = 0; // last valid media timestamp (for stable fallback)
+  let nominalFrameStep = 66667; // microseconds at 15 fps (updated from stream)
   let measuredFps = 15; // measured frame rate
   let frameTimestamps = []; // recent arrival times for fps measurement
   
@@ -328,23 +332,60 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     }
   };
   
-  // Check if camera timestamps are usable (monotonic)
-  const checkCameraTimestamp = (cameraTs) => {
-    if (cameraTs === 0) {
-      useCameraTs = false;
-      return;
-    }
-    // Check for backwards jumps or excessive forward jumps (>5s = likely wrap or corruption)
-    if (lastCameraTs > 0) {
-      const delta = cameraTs - lastCameraTs;
-      if (delta < -1000 || delta > 5000000) {
-        if (useCameraTs) {
-          logToBackend("warn", `Camera timestamp non-monotonic (delta ${delta}µs), switching to derived timeline`);
-        }
+  // Unwrap camera timestamps and check monotonicity
+  // Returns extended timestamp (with epoch offset for u32 wraps)
+  const unwrapCameraTimestamp = (rawTs) => {
+    if (rawTs === 0) {
+      badTimestampCount++;
+      if (badTimestampCount > 10 && useCameraTs) {
+        logToBackend("warn", `Camera sending zero timestamps, switching to derived timeline`);
         useCameraTs = false;
       }
+      return null;
     }
-    lastCameraTs = cameraTs;
+    
+    // Detect u32 wrap: if raw value drops by more than 2^31, it wrapped
+    if (lastRawCameraTs > 0) {
+      const rawDelta = rawTs - lastRawCameraTs;
+      
+      // Wrap detected: raw timestamp decreased by ~4.29 billion
+      if (rawDelta < -0x80000000) {
+        cameraEpoch += 0x100000000; // add 2^32
+        logToBackend("info", `Camera timestamp wrapped at ${lastRawCameraTs}, epoch now ${cameraEpoch}`);
+      }
+      // Large forward jump without wrap (>10s) = suspicious
+      else if (rawDelta > 10000000) {
+        badTimestampCount++;
+        if (badTimestampCount > 3 && useCameraTs) {
+          logToBackend("warn", `Camera timestamp jumped forward ${rawDelta}µs, switching to derived`);
+          useCameraTs = false;
+        }
+        lastRawCameraTs = rawTs;
+        return null;
+      }
+      // Small backward jump (not a wrap) = corruption
+      else if (rawDelta < -1000) {
+        badTimestampCount++;
+        if (badTimestampCount > 3 && useCameraTs) {
+          logToBackend("warn", `Camera timestamp went backwards ${rawDelta}µs, switching to derived`);
+          useCameraTs = false;
+        }
+        lastRawCameraTs = rawTs;
+        return null;
+      }
+      // Good timestamp
+      else {
+        badTimestampCount = 0;
+        // Try to recover to camera timestamps if they become good again
+        if (!useCameraTs && badTimestampCount === 0) {
+          logToBackend("info", `Camera timestamps recovered, switching back to camera source`);
+          useCameraTs = true;
+        }
+      }
+    }
+    
+    lastRawCameraTs = rawTs;
+    return cameraEpoch + rawTs;
   };
   
   // Schedule frame presentation: media-timeline-based with adaptive re-anchoring
@@ -391,8 +432,8 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     // Underrun: buffer empty while stream is live
     if (frameBuffer.length === 0 && totalFrames > 10 && playoutAnchor) {
       underrunCount++;
-      logToBackend("warn", `Buffer underrun (empty), will re-anchor on next frame`);
-      // Re-anchor on next frame with full target delay
+      logToBackend("warn", `Buffer underrun (empty), will re-anchor on next frame at mediaTs ${lastGoodMediaTs}`);
+      // Re-anchor on next frame with full target delay, but keep timeline continuous
       playoutAnchor = null;
     }
     
@@ -418,13 +459,14 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   };
   
   // Decode on arrival and buffer the decoded VideoFrame
-  // frame.timestamp carries the media timestamp (microseconds)
+  // frame.timestamp carries the media timestamp (microseconds, extended for u32 wraps)
   const onDecodedFrame = (frame) => {
     const now = performance.now();
     updateFrameRate(now);
     totalFrames++;
     
-    const mediaTs = frame.timestamp; // microseconds, from camera or derived
+    const mediaTs = frame.timestamp; // microseconds, extended, from camera or derived
+    lastGoodMediaTs = mediaTs; // track last valid timestamp for fallback
     
     // Initialize playout anchor on first frame
     if (!playoutAnchor) {
@@ -485,35 +527,57 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
         totalFrames = 0;
         playoutAnchor = null;
         firstMediaTs = null;
-        lastCameraTs = 0;
+        lastRawCameraTs = 0;
+        cameraEpoch = 0;
+        badTimestampCount = 0;
+        lastGoodMediaTs = 0;
         useCameraTs = true;
+        // Update nominal frame step from stream info if available
+        if (info?.width) {
+          const streamFps = 15; // TODO: extract from stream if available
+          nominalFrameStep = Math.round(1000000 / streamFps);
+        }
         logToBackend("info", `Decoder configured: ${codec}, jitter buffer: ${jitterBufferMs}ms`);
       }
     }
     if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
     
-    // Check camera timestamp validity
-    checkCameraTimestamp(cameraTimestampUs);
+    // Unwrap camera timestamp (handles u32 wraps)
+    const unwrappedTs = unwrapCameraTimestamp(cameraTimestampUs);
     
     // Reset on keyframe after waiting
     if (key && waitKey) {
       waitKey = false;
       frameIdx = 0;
-      playoutAnchor = null;
-      firstMediaTs = null;
+      // Don't reset playoutAnchor - keep timeline continuous
       logToBackend("info", `Keyframe received, resuming from frame ${totalFrames}`);
     }
     
-    // Determine media timestamp: use camera timestamp if valid, else derive from frame index
-    const mediaTimestamp = useCameraTs && cameraTimestampUs > 0 
-      ? cameraTimestampUs 
-      : (firstMediaTs || 0) + (frameIdx * 1000000 / measuredFps);
+    // Determine media timestamp: use camera timestamp if valid and enabled, else derive
+    let mediaTimestamp;
+    if (useCameraTs && unwrappedTs !== null) {
+      mediaTimestamp = unwrappedTs;
+      if (frameIdx === 0) {
+        firstMediaTs = mediaTimestamp;
+      }
+    } else {
+      // Fallback: continue from last good timestamp + nominal step
+      // This stays stable even over long sessions
+      if (frameIdx === 0 || !firstMediaTs) {
+        // First frame in fallback mode: use last known good timestamp or start fresh
+        mediaTimestamp = lastGoodMediaTs > 0 ? lastGoodMediaTs + nominalFrameStep : 0;
+        firstMediaTs = mediaTimestamp;
+      } else {
+        // Subsequent frames: steady increments
+        mediaTimestamp = lastGoodMediaTs + nominalFrameStep;
+      }
+    }
     
     // Decode immediately on arrival (output goes to onDecodedFrame which buffers it)
     // The timestamp we pass becomes frame.timestamp in the decoded callback
     const chunk = new EncodedVideoChunk({ 
       type: key ? "key" : "delta", 
-      timestamp: mediaTimestamp, // microseconds: camera timestamp or derived
+      timestamp: mediaTimestamp, // microseconds: camera timestamp (extended) or derived
       data 
     });
     dec.decode(chunk);

@@ -11,8 +11,6 @@ mod secrets;
 mod settings;
 mod stream;
 
-use std::io::Write;
-
 use device::{Cmd, Device, DeviceConfig};
 use neolink_core::bc_protocol::{Direction, StreamKind};
 use serde::{Deserialize, Serialize};
@@ -895,11 +893,9 @@ fn setup_logging() {
     let log_file = log_dir.join("reolink-rs.log");
     
     // Rotate if existing log is >2MB
-    if let Ok(meta) = fs::metadata(&log_file) {
-        if meta.len() > 2 * 1024 * 1024 {
-            let backup = log_dir.join("reolink-rs.log.1");
-            let _ = fs::rename(&log_file, backup);
-        }
+    if let Ok(meta) = fs::metadata(&log_file) && meta.len() > 2 * 1024 * 1024 {
+        let backup = log_dir.join("reolink-rs.log.1");
+        let _ = fs::rename(&log_file, backup);
     }
     
     let file = match fs::OpenOptions::new()

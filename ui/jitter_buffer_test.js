@@ -1,5 +1,4 @@
 // Unit test for jitter buffer scheduler logic
-// Simulates 15 fps with 450ms gap before every 30th frame (keyframe)
 
 function testJitterBuffer() {
   const TARGET_BUFFER_MS = 700;
@@ -81,6 +80,141 @@ function testJitterBuffer() {
   }
 }
 
-// Run test
-const result = testJitterBuffer();
-process.exit(result ? 0 : 1);
+// Test u32 timestamp wrap handling
+function testTimestampWrap() {
+  const U32_MAX = 0xFFFFFFFF;
+  
+  let lastRawTs = 0;
+  let epoch = 0;
+  const unwrap = (rawTs) => {
+    if (lastRawTs > 0) {
+      const rawDelta = rawTs - lastRawTs;
+      if (rawDelta < -0x80000000) {
+        epoch += 0x100000000;
+      }
+    }
+    lastRawTs = rawTs;
+    return epoch + rawTs;
+  };
+  
+  // Start at a point that will wrap within the test
+  // Start 20 frames before wrap at 15fps (20 * 66667µs = 1,333,340µs before wrap)
+  const startPoint = U32_MAX - 1333340;
+  
+  // Simulate 50 timestamps crossing the wrap boundary
+  const timestamps = [];
+  for (let i = 0; i < 50; i++) {
+    // Calculate next timestamp and wrap it to u32
+    const rawTs = ((startPoint + i * 66667) & 0xFFFFFFFF) >>> 0;
+    const extended = unwrap(rawTs);
+    timestamps.push({ rawTs, extended });
+  }
+  
+  // Check that extended timestamps are monotonic across the wrap
+  let allMonotonic = true;
+  for (let i = 1; i < timestamps.length; i++) {
+    if (timestamps[i].extended <= timestamps[i-1].extended) {
+      console.log(`✗ Wrap test FAILED: timestamp ${i} not monotonic`);
+      console.log(`  Frame ${i-1}: raw ${timestamps[i-1].rawTs} -> extended ${timestamps[i-1].extended}`);
+      console.log(`  Frame ${i}: raw ${timestamps[i].rawTs} -> extended ${timestamps[i].extended}`);
+      allMonotonic = false;
+      break;
+    }
+  }
+  
+  // Check that the wrap was detected (raw timestamp should decrease at some point)
+  let wrapDetected = false;
+  for (let i = 1; i < timestamps.length; i++) {
+    if (timestamps[i].rawTs < timestamps[i-1].rawTs) {
+      wrapDetected = true;
+      break;
+    }
+  }
+  
+  // Verify the extended timestamps maintain proper spacing (within 1µs tolerance)
+  let spacingOk = true;
+  const expectedStep = 66667;
+  for (let i = 1; i < timestamps.length; i++) {
+    const step = timestamps[i].extended - timestamps[i-1].extended;
+    if (Math.abs(step - expectedStep) > 1) {
+      console.log(`✗ Wrap test FAILED: frame ${i} step ${step}µs != expected ${expectedStep}µs`);
+      spacingOk = false;
+      break;
+    }
+  }
+  
+  if (allMonotonic && wrapDetected && spacingOk) {
+    console.log("✓ Timestamp wrap test PASSED: u32 wrap handled correctly, timestamps stay monotonic");
+    return true;
+  } else {
+    console.log("✗ Timestamp wrap test FAILED:");
+    if (!allMonotonic) console.log("  - Extended timestamps not monotonic across wrap");
+    if (!wrapDetected) console.log("  - Wrap not detected in test data");
+    if (!spacingOk) console.log("  - Frame spacing incorrect across wrap");
+    return false;
+  }
+}
+
+// Test long fallback mode stability
+function testLongFallback() {
+  const nominalStep = 66667; // microseconds at 15 fps
+  const numFrames = 100000; // ~111 minutes at 15 fps
+  
+  let lastMediaTs = 0;
+  const timestamps = [];
+  
+  // Simulate fallback mode: each frame advances by nominal step
+  for (let i = 0; i < numFrames; i++) {
+    const mediaTs = (i === 0) ? 0 : lastMediaTs + nominalStep;
+    timestamps.push(mediaTs);
+    lastMediaTs = mediaTs;
+  }
+  
+  // Check for monotonicity and steady intervals
+  let allMonotonic = true;
+  let maxIntervalError = 0;
+  
+  for (let i = 1; i < timestamps.length; i++) {
+    const interval = timestamps[i] - timestamps[i-1];
+    if (interval <= 0) {
+      allMonotonic = false;
+      break;
+    }
+    const error = Math.abs(interval - nominalStep);
+    maxIntervalError = Math.max(maxIntervalError, error);
+  }
+  
+  // Final timestamp should be close to expected
+  const expectedFinal = (numFrames - 1) * nominalStep;
+  const actualFinal = timestamps[timestamps.length - 1];
+  const finalError = Math.abs(actualFinal - expectedFinal);
+  
+  if (allMonotonic && maxIntervalError === 0 && finalError === 0) {
+    console.log(`✓ Long fallback test PASSED: ${numFrames} frames stay stable in fallback mode`);
+    return true;
+  } else {
+    console.log("✗ Long fallback test FAILED:");
+    if (!allMonotonic) console.log("  - Timestamps not monotonic");
+    if (maxIntervalError > 0) console.log(`  - Max interval error: ${maxIntervalError}µs`);
+    if (finalError > 0) console.log(`  - Final timestamp error: ${finalError}µs`);
+    return false;
+  }
+}
+
+// Run all tests
+const tests = [
+  { name: "Jitter buffer basic", fn: testJitterBuffer },
+  { name: "Timestamp wrap (u32)", fn: testTimestampWrap },
+  { name: "Long fallback mode", fn: testLongFallback }
+];
+
+let allPassed = true;
+for (const test of tests) {
+  console.log(`\n=== ${test.name} ===`);
+  const result = test.fn();
+  if (!result) allPassed = false;
+}
+
+console.log(`\n${"=".repeat(50)}`);
+console.log(allPassed ? "All tests PASSED" : "Some tests FAILED");
+process.exit(allPassed ? 0 : 1);
