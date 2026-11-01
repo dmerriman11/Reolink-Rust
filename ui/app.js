@@ -249,31 +249,37 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const abort = new AbortController();
   let dec = null, sig = null, waitKey = true, shown = false, size = null;
   
-  // Jitter buffer: queue frames and schedule presentation based on steady timestamps
-  const FPS = 15; // Reolink cameras typically stream at 15 fps
-  const FRAME_DURATION_MS = 1000 / FPS;
-  let jitterBufferMs = 400; // default, will be loaded from prefs
-  let frameBuffer = []; // { chunk, presentationTime }
-  let baseTime = null; // DOMHighResTimeStamp when first frame should present
-  let nextFrameIndex = 0;
+  // Jitter buffer: decode on arrival, buffer decoded frames, present with fixed delay
+  let jitterBufferMs = 700; // target buffer depth (loaded synchronously below)
+  let frameBuffer = []; // { frame: VideoFrame, presentAt: DOMHighResTimeStamp }
+  let frameIdx = 0; // monotonic frame counter
   let schedulerRunning = false;
+  let prefsLoaded = false;
   
-  // Load jitter buffer setting from app prefs
-  (async () => {
-    try {
-      const prefs = await invoke("get_prefs");
-      if (prefs?.jitter_buffer_ms) jitterBufferMs = prefs.jitter_buffer_ms;
-    } catch { /* use default */ }
-  })();
+  // Frame rate measurement
+  let frameTimestamps = []; // recent arrival times for rate measurement
+  let measuredFps = 15; // measured frame rate
+  
+  // Buffer depth tracking
+  let lastDepthLog = 0;
+  let underrunCount = 0;
+  let overflowCount = 0;
+  let totalFrames = 0;
   
   const stop = () => { 
     abort.abort(); 
     schedulerRunning = false;
+    // Close all buffered frames
+    for (const { frame } of frameBuffer) frame.close();
     frameBuffer = [];
     try { dec?.close(); } catch { /* already closed */ } 
     dec = null; 
   };
   const fail = (why) => { if (abort.signal.aborted) return; console.warn("WebCodecs, using MJPEG:", why); stop(); onFail(); };
+  
+  const logToBackend = (level, msg) => {
+    invoke("log_from_webview", { level, message: `[WebView/${url.split('/').pop()?.split('?')[0]}] ${msg}` }).catch(() => {});
+  };
   
   const draw = (frame) => {
     // WebView2's hardware HEVC decoder can report Chromium's default 1280x720 as the visible area of a larger
@@ -292,35 +298,102 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     if (!shown) { shown = true; onFirst(); }
   };
   
-  // Schedule frame presentation based on timestamps
+  // Load jitter buffer setting SYNCHRONOUSLY before any frames arrive
+  const loadPrefs = async () => {
+    try {
+      const prefs = await invoke("get_prefs");
+      if (prefs?.jitter_buffer_ms) {
+        jitterBufferMs = prefs.jitter_buffer_ms;
+        logToBackend("info", `Jitter buffer configured: ${jitterBufferMs}ms`);
+      }
+    } catch (e) {
+      logToBackend("warn", `Failed to load prefs, using default ${jitterBufferMs}ms: ${e}`);
+    }
+    prefsLoaded = true;
+  };
+  
+  // Measure frame rate from arrival timestamps
+  const updateFrameRate = (arrivalTime) => {
+    frameTimestamps.push(arrivalTime);
+    if (frameTimestamps.length > 30) frameTimestamps.shift();
+    if (frameTimestamps.length >= 10) {
+      const span = frameTimestamps[frameTimestamps.length - 1] - frameTimestamps[0];
+      measuredFps = (frameTimestamps.length - 1) / (span / 1000);
+    }
+  };
+  
+  // Schedule frame presentation: simple fixed-delay playout
   const scheduleFrames = () => {
     if (!schedulerRunning || abort.signal.aborted) return;
     
     const now = performance.now();
     
-    // Present any frames that are due
-    while (frameBuffer.length > 0 && frameBuffer[0].presentationTime <= now) {
-      const { chunk } = frameBuffer.shift();
-      if (dec && dec.state === "configured") {
-        dec.decode(chunk);
-      }
+    // Present frames whose presentAt time has arrived
+    while (frameBuffer.length > 0 && frameBuffer[0].presentAt <= now) {
+      const { frame } = frameBuffer.shift();
+      draw(frame);
     }
     
-    // Check if we're too far behind (>2.5s buffered = truly stuck)
-    if (frameBuffer.length > 0) {
-      const latency = frameBuffer[frameBuffer.length - 1].presentationTime - now;
-      if (latency > 2500) {
-        console.warn(`Live view buffer overflow: ${Math.round(latency)}ms behind, dropping to keyframe`);
-        // Clear buffer and wait for next keyframe
-        frameBuffer = [];
-        waitKey = true;
-        baseTime = null;
-        nextFrameIndex = 0;
-      }
+    // Calculate current buffer depth in milliseconds
+    const bufferDepthMs = frameBuffer.length > 0 
+      ? (frameBuffer[frameBuffer.length - 1].presentAt - now)
+      : 0;
+    
+    // Log buffer stats periodically
+    if (now - lastDepthLog > 2000) {
+      lastDepthLog = now;
+      const depth = Math.round(bufferDepthMs);
+      const count = frameBuffer.length;
+      const fps = measuredFps.toFixed(1);
+      const target = jitterBufferMs;
+      logToBackend("info", `Buffer: ${depth}ms/${target}ms target (${count} frames, ${fps} fps), total: ${totalFrames}, underruns: ${underrunCount}, overflows: ${overflowCount}`);
+      underrunCount = 0;
+      overflowCount = 0;
     }
     
-    // Schedule next check
+    // Underrun detection
+    if (frameBuffer.length === 0 && totalFrames > 10) {
+      underrunCount++;
+      logToBackend("warn", `Buffer underrun (empty after ${totalFrames} frames)`);
+    }
+    
+    // Overflow: buffer accumulated >3s latency (something is wrong)
+    if (bufferDepthMs > 3000) {
+      overflowCount++;
+      logToBackend("warn", `Buffer overflow: ${Math.round(bufferDepthMs)}ms accumulated, dropping to keyframe`);
+      // Clear and wait for next keyframe
+      for (const { frame } of frameBuffer) frame.close();
+      frameBuffer = [];
+      waitKey = true;
+      frameIdx = 0;
+      totalFrames = 0;
+    }
+    
     requestAnimationFrame(scheduleFrames);
+  };
+  
+  // Decode on arrival and buffer the decoded VideoFrame with fixed presentation delay
+  const onDecodedFrame = (frame) => {
+    const now = performance.now();
+    updateFrameRate(now);
+    totalFrames++;
+    
+    // Present this frame at: now + jitterBufferMs
+    // This creates a fixed delay that absorbs network jitter
+    const presentAt = now + jitterBufferMs;
+    frameBuffer.push({ frame, presentAt });
+    
+    // Log first few frames to verify buffering is working
+    if (totalFrames <= 5) {
+      logToBackend("info", `Frame ${totalFrames}: buffered for ${jitterBufferMs}ms (presentAt in ${Math.round(presentAt - now)}ms)`);
+    }
+    
+    // Start scheduler on first frame
+    if (!schedulerRunning) {
+      schedulerRunning = true;
+      logToBackend("info", `Playout scheduler started with ${jitterBufferMs}ms target delay`);
+      requestAnimationFrame(scheduleFrames);
+    }
   };
   
   async function onFrame(flags, data) {
@@ -338,45 +411,39 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
         const config = { codec, optimizeForLatency: true, ...(size && { codedWidth: size.width, codedHeight: size.height }) };
         const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
         if (!supported) return fail(`${codec} not supported`);
-        dec ||= new VideoDecoder({ output: draw, error: fail });
+        // Wait for prefs to load before configuring decoder
+        if (!prefsLoaded) {
+          await loadPrefs();
+        }
+        
+        dec ||= new VideoDecoder({ output: onDecodedFrame, error: fail });
         dec.configure(config);
         sig = s;
         waitKey = true;
+        for (const { frame } of frameBuffer) frame.close();
         frameBuffer = [];
-        baseTime = null;
-        nextFrameIndex = 0;
+        frameIdx = 0;
+        frameTimestamps = [];
+        totalFrames = 0;
+        logToBackend("info", `Decoder configured: ${codec}, jitter buffer: ${jitterBufferMs}ms`);
       }
     }
     if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
     
-    // Reset buffer on keyframe after waiting
+    // Reset on keyframe after waiting
     if (key && waitKey) {
       waitKey = false;
-      frameBuffer = [];
-      baseTime = null;
-      nextFrameIndex = 0;
-      if (!schedulerRunning) {
-        schedulerRunning = true;
-        requestAnimationFrame(scheduleFrames);
-      }
+      frameIdx = 0;
+      logToBackend("info", `Keyframe received, resuming from frame ${totalFrames}`);
     }
     
-    // Derive presentation time: first frame establishes base, rest use steady frame clock
-    const now = performance.now();
-    if (baseTime === null) {
-      baseTime = now + jitterBufferMs; // Start presenting after jitter buffer fills
-      nextFrameIndex = 0;
-    }
-    const presentationTime = baseTime + (nextFrameIndex * FRAME_DURATION_MS);
-    nextFrameIndex++;
-    
-    // Buffer the frame
+    // Decode immediately on arrival (output goes to onDecodedFrame which buffers it)
     const chunk = new EncodedVideoChunk({ 
       type: key ? "key" : "delta", 
-      timestamp: nextFrameIndex * 1000, // microseconds for decoder
+      timestamp: (frameIdx++) * 1000, // microseconds for decoder
       data 
     });
-    frameBuffer.push({ chunk, presentationTime });
+    dec.decode(chunk);
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
@@ -711,7 +778,8 @@ function prefsToView(p) {
       { key: "record_dir", label: "Save recordings to", kind: "folder", value: p.record_dir },
       { key: "segment_minutes", label: "Video file duration", kind: "choice", value: String(p.segment_minutes), options: opt(SEGMENTS) },
       { key: "space_warning_gb", label: "Warn when free space is below (GB, 0 = off)", kind: "number", value: String(p.space_warning_gb), min: 0, max: 10000 },
-      { key: "jitter_buffer_ms", label: "Live view smoothing buffer (ms, 300-1000 recommended)", kind: "number", value: String(p.jitter_buffer_ms || 400), min: 100, max: 2000 },
+      { key: "live_view_substream", label: "Use low-res stream for live view (saves bandwidth)", kind: "toggle", value: (p.live_view_substream ?? true) ? "1" : "0" },
+      { key: "jitter_buffer_ms", label: "Live view smoothing buffer (ms, 500-1000 recommended)", kind: "number", value: String(p.jitter_buffer_ms || 700), min: 100, max: 3000 },
       { key: "hardware_decode", label: "Hardware video decoding", kind: "toggle", value: p.hardware_decode ? "1" : "0" },
       { key: "scan_network", label: "Find new cameras on the network", kind: "toggle", value: p.scan_network ? "1" : "0" },
       { key: "run_at_startup", label: "Run at Windows startup", kind: "toggle", value: p.run_at_startup ? "1" : "0" },
@@ -727,7 +795,8 @@ function viewToPrefs(values) {
   return {
     playback_source: values.playback_source || "local", snapshot_dir: values.snapshot_dir, record_dir: values.record_dir,
     segment_minutes: +values.segment_minutes, space_warning_gb: Math.max(0, Math.round(+values.space_warning_gb || 0)),
-    jitter_buffer_ms: Math.max(100, Math.min(2000, Math.round(+values.jitter_buffer_ms || 400))),
+    live_view_substream: values.live_view_substream === "1",
+    jitter_buffer_ms: Math.max(100, Math.min(3000, Math.round(+values.jitter_buffer_ms || 700))),
     hardware_decode: values.hardware_decode === "1", scan_network: values.scan_network === "1",
     run_at_startup: values.run_at_startup === "1",
     alarm_beep: values.alarm_beep === "1", alarm_volume: Math.round(+values.alarm_volume || 0),

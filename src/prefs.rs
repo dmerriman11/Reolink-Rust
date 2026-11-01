@@ -31,6 +31,8 @@ pub struct Prefs {
     pub record_schedule: String,
     /// Jitter buffer size in milliseconds for smooth live view (300-1000ms recommended).
     pub jitter_buffer_ms: u32,
+    /// Use substream (low resolution) for live view to reduce bandwidth. Recording still uses main stream.
+    pub live_view_substream: bool,
 }
 
 pub const LOCAL_RECORD: [&str; 3] = ["off", "motion", "continuous"];
@@ -55,7 +57,8 @@ impl Default for Prefs {
             alarm_volume: 60,
             local_record: "off".into(),
             record_schedule: "1".repeat(168),
-            jitter_buffer_ms: 400,
+            jitter_buffer_ms: 700,
+            live_view_substream: true,
         }
     }
 }
@@ -89,8 +92,8 @@ impl Prefs {
         if self.space_warning_gb > 10_000 {
             return Err("Space warning must be 10,000 GB or less".into());
         }
-        if self.jitter_buffer_ms < 100 || self.jitter_buffer_ms > 2000 {
-            return Err("Jitter buffer must be 100-2000 ms".into());
+        if self.jitter_buffer_ms < 100 || self.jitter_buffer_ms > 3000 {
+            return Err("Jitter buffer must be 100-3000 ms".into());
         }
         for (label, dir) in [("Snapshot folder", &self.snapshot_dir), ("Recording folder", &self.record_dir)] {
             if !dir.is_absolute() {
