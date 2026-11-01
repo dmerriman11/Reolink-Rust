@@ -309,9 +309,52 @@ struct UdpPayloadInner {
     /// This `resend_interval` controls how ofen we do this
     resend_interval: Interval,
     ack_latency: AckLatency,
+    stats: LinkStats,
     cancel: CancellationToken,
     set: JoinSet<Result<()>>,
 }
+
+/// What the link did since the last log line: holes in the packet sequence hold back everything after them, so
+/// their length is exactly how long the video behind them stalls.
+struct LinkStats {
+    since: Instant,
+    data: u32,
+    duplicates: u32,
+    holes: u32,
+    hole_since: Option<Instant>,
+    longest_hole: Duration,
+}
+
+impl Default for LinkStats {
+    fn default() -> Self {
+        Self { since: Instant::now(), data: 0, duplicates: 0, holes: 0, hole_since: None, longest_hole: Duration::ZERO }
+    }
+}
+
+impl LinkStats {
+    /// Call after handing over what's in sequence; `holed` is whether packets are still waiting behind a gap.
+    fn update(&mut self, holed: bool) {
+        match (holed, self.hole_since) {
+            (true, None) => {
+                self.hole_since = Some(Instant::now());
+                self.holes += 1;
+            }
+            (false, Some(t)) => {
+                self.longest_hole = self.longest_hole.max(t.elapsed());
+                self.hole_since = None;
+            }
+            _ => {}
+        }
+        if self.since.elapsed() >= Duration::from_secs(5) {
+            log::debug!(
+                "UDP link: {} packets, {} resent or duplicate, {} holes, longest {} ms",
+                self.data, self.duplicates, self.holes, self.longest_hole.as_millis()
+            );
+            *self = Self { hole_since: self.hole_since, ..Default::default() };
+        }
+    }
+}
+
 impl UdpPayloadInner {
     fn new(
         mut inner: BcUdpSource,
@@ -494,6 +537,7 @@ impl UdpPayloadInner {
             recieved: Default::default(),
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
+            stats: Default::default(),
             cancel,
             set,
         }
@@ -557,10 +601,15 @@ impl UdpPayloadInner {
                         BcUdp::Data(data)  => {
                             if data.connection_id == self.client_id {
                                 let packet_id = data.packet_id;
+                                self.stats.data += 1;
                                 if packet_id >= self.packets_want {
                                     // error!("packets_want: {}", this.packets_want);
-                                    self.recieved.insert(packet_id, data.payload);
+                                    if self.recieved.insert(packet_id, data.payload).is_some() {
+                                        self.stats.duplicates += 1;
+                                    }
                                     self.ack_tx.send_replace(self.build_send_ack());
+                                } else {
+                                    self.stats.duplicates += 1;
                                 }
                             }
                         },
@@ -576,6 +625,7 @@ impl UdpPayloadInner {
             self.packets_want += 1;
             self.thread_stream.feed(Ok(payload)).await?;
         }
+        self.stats.update(!self.recieved.is_empty());
         log::trace!("recieved: {}", self.recieved.len());
         log::trace!("Flush");
         self.socket_in.flush().await?;
@@ -591,7 +641,7 @@ impl UdpPayloadInner {
                 // Happens if we have recieved but not consumed yet
                 first_missing += 1;
             }
-            let missing_ids = if let Some(end) = self.recieved.keys().max() {
+            let missing_ids = if let Some((end, _)) = self.recieved.last_key_value() {
                 let mut vec = vec![];
                 // From last contiguous packet to last recieved packet
                 // create a payload of `00` (unreceived) and `01` (received)

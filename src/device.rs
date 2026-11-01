@@ -590,9 +590,9 @@ async fn session(
 }
 
 fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State>>, views: &Views) {
-    let (codec, data, key) = match media {
-        BcMedia::Iframe(f) => (f.video_type, f.data, true),
-        BcMedia::Pframe(f) => (f.video_type, f.data, false),
+    let (codec, data, key, us) = match media {
+        BcMedia::Iframe(f) => (f.video_type, f.data, true, f.microseconds),
+        BcMedia::Pframe(f) => (f.video_type, f.data, false, f.microseconds),
         _ => return, // shortcut: live audio playback not implemented yet (phase 2)
     };
     state.lock().unwrap().last_frame = Some(Instant::now());
@@ -617,7 +617,7 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         }
     }
     if let Some(r) = live.recorder.as_mut() {
-        match r.push(&data, key) {
+        match r.push(&data, key, us) {
             Pushed::Queued => {}
             Pushed::Overloaded => {
                 log::warn!("{name}: recording can't keep up, dropping frames");
@@ -640,10 +640,10 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     let hevc = matches!(codec, VideoType::H265);
     if views.jpeg.receiver_count() == 0 {
         live.decoder = None;
-        views.raw.push(Raw { hevc, key, data });
+        views.raw.push(Raw { hevc, key, us, data });
         return;
     }
-    views.raw.push(Raw { hevc, key, data: data.clone() });
+    views.raw.push(Raw { hevc, key, us, data: data.clone() });
 
     // Swap decoders only at a keyframe so the new one starts clean; the old one keeps the tile live until then.
     let stale = live.decoder.as_ref().is_some_and(|d| {

@@ -243,12 +243,14 @@ function streamInfo(frame, hevc) {
   return null;
 }
 
-// Play GET /raw/<id> (see stream.rs: 1-byte flags, 4-byte length, access unit) into `canvas`.
+// Play GET /raw/<id> (see stream.rs) into `canvas`, each frame at its time on the camera's clock (see playout.js).
 function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
   const ctx = canvas.getContext("2d");
   const abort = new AbortController();
-  let dec = null, sig = null, waitKey = true, ts = 0, shown = false, size = null;
-  const stop = () => { abort.abort(); try { dec?.close(); } catch { /* already closed */ } dec = null; };
+  const playout = new Playout();
+  let dec = null, applied = null, stream = null, waitKey = true, ts = 0, shown = false, size = null;
+  let held = [], timer = null, catchingUp = false;
+  const stop = () => { abort.abort(); clearTimeout(timer); held = []; try { dec?.close(); } catch { /* already closed */ } dec = null; };
   const fail = (why) => { if (abort.signal.aborted) return; console.warn("WebCodecs, using MJPEG:", why); stop(); onFail(); };
   const draw = (frame) => {
     // WebView2's hardware HEVC decoder can report Chromium's default 1280x720 as the visible area of a larger
@@ -266,7 +268,28 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     frame.close();
     if (!shown) { shown = true; onFirst(); }
   };
-  async function onFrame(flags, data) {
+  const decode = ({ key, data, stream: s }) => {
+    // Applied here, in frame order, as a new stream's frames wait their turn behind the old stream's.
+    if (key && s !== applied) {
+      size = s.size;
+      dec ||= new VideoDecoder({ output: draw, error: fail });
+      dec.configure(s.config);
+      applied = s;
+      waitKey = true;
+    }
+    if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
+    catchingUp &&= dec.decodeQueueSize > 1;
+    if (!catchingUp && dec.decodeQueueSize > 8) { waitKey = true; return; } // the decoder can't keep up: drop to the next keyframe
+    waitKey = false;
+    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 1000), data }));
+  };
+  const pump = () => {
+    timer = null;
+    const now = performance.now();
+    while (held.length && held[0].due <= now) decode(held.shift());
+    if (held.length) timer = setTimeout(pump, held[0].due - now);
+  };
+  async function onFrame(flags, us, data) {
     const key = (flags & 1) !== 0;
     if (key) {
       const hevc = (flags & 2) !== 0;
@@ -275,22 +298,33 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
       // Reconfigure when the stream changes (main/sub switch, new resolution): its parameter sets (VPS/SPS/PPS) do.
       const params = nalUnits(data).filter((n) => (hevc ? [32, 33, 34].includes((n[0] >> 1) & 0x3f) : [7, 8].includes(n[0] & 0x1f)));
       const s = codec && codec + params.map((n) => n.join()).join("|");
-      if (codec && s !== sig) {
-        size = info.width ? { width: info.width, height: info.height } : null;
-        // No description: Annex B with in-band parameter sets. The size hint keeps hardware decoders from guessing.
-        const config = { codec, optimizeForLatency: true, ...(size && { codedWidth: size.width, codedHeight: size.height }) };
-        const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
-        if (!supported) return fail(`${codec} not supported`);
-        dec ||= new VideoDecoder({ output: draw, error: fail });
-        dec.configure(config);
-        sig = s;
-        waitKey = true;
+      if (codec && s !== stream?.sig) {
+        const box = info.width ? { width: info.width, height: info.height } : null;
+        let config = null;
+        for (const c of decoderConfigs(codec, box)) {
+          const { supported } = await VideoDecoder.isConfigSupported(c).catch(() => ({ supported: false }));
+          if (supported) { config = c; break; }
+        }
+        if (abort.signal.aborted) return;
+        if (!config) return fail(`${codec} not supported`);
+        stream = { sig: s, config, size: box };
       }
     }
-    if (!dec || dec.state !== "configured" || (waitKey && !key)) return;
-    if (dec.decodeQueueSize > 8) { waitKey = true; return; } // falling behind: drop to the next keyframe
-    waitKey = false;
-    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 1000), data }));
+    if (!stream) return;
+    // What the server had cached for a new viewer is already old: get through it at once, so the decoder has the
+    // pictures the next live frame depends on, and keep it out of the timing.
+    if (flags & 4) {
+      catchingUp = true;
+      return decode({ key, data, stream });
+    }
+    const { due, overflow } = playout.add(us, performance.now());
+    if (overflow) {
+      console.warn("live stream can't keep up, skipping ahead");
+      held = [];
+      waitKey = true;
+    }
+    held.push({ key, data, stream, due });
+    if (timer === null) pump();
   }
   (async () => {
     const reader = (await fetch(url, { signal: abort.signal, cache: "no-store" })).body.getReader();
@@ -302,39 +336,6 @@ function rawPlayer(canvas, url, onFirst, onFail, onEnd) {
     }
   })().catch((e) => { if (!abort.signal.aborted) { console.warn("live stream:", e); onEnd(); } });
   return { stop };
-}
-
-// Split /raw's byte stream (1 flag byte, 4-byte big-endian length, payload) into frames, however the chunks fall.
-// Each payload is allocated once and every byte copied once, so big keyframes spread over many chunks stay cheap.
-function framer(onFrame) {
-  const head = new Uint8Array(5);
-  let have = 0; // header bytes so far
-  let body = null; // payload being filled
-  let filled = 0;
-  return async (chunk) => {
-    let at = 0;
-    while (at < chunk.length) {
-      if (!body) {
-        const n = Math.min(5 - have, chunk.length - at);
-        head.set(chunk.subarray(at, at + n), have);
-        have += n;
-        at += n;
-        if (have < 5) return;
-        body = new Uint8Array(((head[1] << 24) >>> 0) + (head[2] << 16) + (head[3] << 8) + head[4]);
-        filled = 0;
-      }
-      const n = Math.min(body.length - filled, chunk.length - at);
-      body.set(chunk.subarray(at, at + n), filled);
-      filled += n;
-      at += n;
-      if (filled === body.length) {
-        const frame = body;
-        body = null;
-        have = 0;
-        await onFrame(head[0], frame);
-      }
-    }
-  };
 }
 
 // Point a tile at a camera's video, keeping its connection while it shows the same camera.

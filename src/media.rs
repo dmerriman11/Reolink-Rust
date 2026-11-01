@@ -172,6 +172,8 @@ fn read_mpjpeg(r: &mut impl std::io::BufRead) -> Option<Vec<u8>> {
 pub struct Raw {
     pub hevc: bool,
     pub key: bool,
+    /// Time on the camera's clock in microseconds, wrapping at u32.
+    pub us: u32,
     pub data: Vec<u8>,
 }
 
@@ -221,6 +223,111 @@ impl RawFeed {
     }
 }
 
+/// Wraps frames in MPEG-TS for ffmpeg: the one way into its `-c copy` that keeps Annex-B and carries a timestamp per
+/// frame. A raw stream can only be stamped on arrival, which writes every network stall into the file.
+struct Mpegts {
+    stream_type: u8,
+    /// Continuity counters for the PAT, the PMT and the video.
+    counters: [u8; 3],
+    last_us: Option<u32>,
+    /// The last usable step between frames, for a clock that didn't move.
+    step_us: u32,
+    /// The camera's clock unwrapped. Starts above zero so ffmpeg never sees a time before the start.
+    total_us: u64,
+}
+
+impl Mpegts {
+    const PMT_PID: u16 = 0x1000;
+    const VIDEO_PID: u16 = 0x0100;
+
+    fn new(codec: VideoType) -> Self {
+        let stream_type = match codec {
+            VideoType::H264 => 0x1B,
+            VideoType::H265 => 0x24,
+        };
+        Self { stream_type, counters: [0; 3], last_us: None, step_us: 66_667, total_us: 1_000_000 }
+    }
+
+    /// The 90 kHz timestamp for a frame stamped `us`; never goes backwards, as a file can't.
+    fn pts(&mut self, us: u32) -> u64 {
+        if let Some(last) = self.last_us {
+            let delta = us.wrapping_sub(last) as i32; // signed, so the clock wrapping is just the next step
+            if delta > 0 {
+                self.step_us = delta as u32;
+            }
+            self.total_us += self.step_us as u64;
+        }
+        self.last_us = Some(us);
+        (self.total_us * 9 / 100) & ((1 << 33) - 1)
+    }
+
+    /// One PSI table (PAT or PMT) in a packet of its own, with its CRC.
+    fn table(&mut self, which: usize, pid: u16, section: &[u8], out: &mut Vec<u8>) {
+        let mut p = [0xFF; 188];
+        p[..5].copy_from_slice(&[0x47, 0x40 | (pid >> 8) as u8, pid as u8, 0x10 | self.counters[which], 0]);
+        self.counters[which] = (self.counters[which] + 1) & 15;
+        p[5..5 + section.len()].copy_from_slice(section);
+        p[5 + section.len()..9 + section.len()].copy_from_slice(&mpeg_crc32(section).to_be_bytes());
+        out.extend_from_slice(&p);
+    }
+
+    fn frame(&mut self, data: &[u8], key: bool, us: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((data.len() / 184 + 4) * 188);
+        let pid = Self::VIDEO_PID.to_be_bytes();
+        if key {
+            // Before every keyframe, as a demuxer can only start from these.
+            let pmt_pid = Self::PMT_PID.to_be_bytes();
+            let pat = [0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0, 0, 1, 0xE0 | pmt_pid[0], pmt_pid[1]];
+            let pmt = [0x02, 0xB0, 18, 0, 1, 0xC1, 0, 0, 0xE0 | pid[0], pid[1], 0xF0, 0, self.stream_type, 0xE0 | pid[0], pid[1], 0xF0, 0];
+            self.table(0, 0, &pat, &mut out);
+            self.table(1, Self::PMT_PID, &pmt, &mut out);
+        }
+        let pts = self.pts(us);
+        let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5];
+        pes.extend_from_slice(&[
+            0x21 | ((pts >> 29) & 0x0E) as u8,
+            (pts >> 22) as u8,
+            ((pts >> 14) & 0xFE) as u8 | 1,
+            (pts >> 7) as u8,
+            ((pts << 1) & 0xFE) as u8 | 1,
+        ]);
+        pes.extend_from_slice(data);
+        let pcr = [(pts >> 25) as u8, (pts >> 17) as u8, (pts >> 9) as u8, (pts >> 1) as u8, ((pts & 1) << 7) as u8 | 0x7E, 0];
+
+        let mut rest = &pes[..];
+        let mut first = true;
+        while !rest.is_empty() {
+            // The first packet of a frame carries the clock; the last pads itself out to 188 with an adaptation field.
+            let n = rest.len().min(if first { 176 } else { 184 });
+            let field = 184 - n;
+            let mut p = [0xFF; 188];
+            p[..4].copy_from_slice(&[0x47, (first as u8) << 6 | pid[0], pid[1], if field > 0 { 0x30 } else { 0x10 } | self.counters[2]]);
+            self.counters[2] = (self.counters[2] + 1) & 15;
+            if field > 0 {
+                p[4] = field as u8 - 1;
+            }
+            if field > 1 {
+                p[5] = if first { 0x10 | (key as u8) << 6 } else { 0 };
+            }
+            if first {
+                p[6..12].copy_from_slice(&pcr);
+            }
+            p[188 - n..].copy_from_slice(&rest[..n]);
+            out.extend_from_slice(&p);
+            rest = &rest[n..];
+            first = false;
+        }
+        out
+    }
+}
+
+/// The CRC MPEG-TS tables end with (CRC-32/MPEG-2).
+fn mpeg_crc32(data: &[u8]) -> u32 {
+    data.iter().fold(u32::MAX, |crc, &b| {
+        (0..8).fold(crc ^ (b as u32) << 24, |c, _| if c & 0x8000_0000 != 0 { c << 1 ^ 0x04C1_1DB7 } else { c << 1 })
+    })
+}
+
 /// Video a recording may have waiting for ffmpeg (a minute or more of a main stream) before frames are dropped.
 const REC_QUEUE_BYTES: usize = 64 << 20;
 
@@ -236,10 +343,16 @@ pub enum Pushed {
     Dead,
 }
 
+struct RecFrame {
+    data: Vec<u8>,
+    key: bool,
+    us: u32,
+}
+
 pub struct Recorder {
     pub path: PathBuf,
     child: Option<Child>,
-    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    tx: Option<std::sync::mpsc::Sender<RecFrame>>,
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Waiting for a keyframe: at the start, and after dropping frames.
     waiting: bool,
@@ -250,39 +363,46 @@ impl Recorder {
     /// Record into `dir` as `<base>_<YYYY-MM-DD_HH-MM-SS>.mp4`, starting a new file every `segment_minutes`
     /// (0 = one file). Fragmented MP4 (a fragment per keyframe): a crash loses only the last fragment, and closing
     /// a segment never rewrites it the way faststart did. WebView2 plays and seeks these over the asset protocol.
+    /// Timed by the camera's clock, so playback is as steady as the camera however unevenly frames arrived here.
     pub fn new(codec: VideoType, dir: &Path, base: &str, segment_minutes: u32) -> std::io::Result<Self> {
         let template = dir.join(format!("{base}_%Y-%m-%d_%H-%M-%S.mp4")).to_string_lossy().into_owned();
         let seconds = if segment_minutes == 0 { 360_000 } else { segment_minutes * 60 }.to_string();
         let mut child = spawn(
             &[
-                "-use_wallclock_as_timestamps", "1", "-f", format_of(codec), "-i", "pipe:0",
+                "-f", "mpegts", "-i", "pipe:0",
                 "-c", "copy", "-f", "segment", "-segment_time", &seconds, "-reset_timestamps", "1",
                 "-strftime", "1", "-segment_format", "mp4", "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof", &template,
             ],
             false,
         )?;
         let stdin = child.stdin.take().expect("piped stdin");
-        Ok(Self::with_writer(dir.to_owned(), Some(child), stdin))
+        let mut mux = Mpegts::new(codec);
+        Ok(Self::with_writer(dir.to_owned(), Some(child), stdin, move |f| mux.frame(&f.data, f.key, f.us)))
     }
 
     /// The writer thread owns all waiting on the disk; the camera loop only ever queues or drops.
-    fn with_writer(path: PathBuf, child: Option<Child>, mut out: impl Write + Send + 'static) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    fn with_writer(
+        path: PathBuf,
+        child: Option<Child>,
+        mut out: impl Write + Send + 'static,
+        mut encode: impl FnMut(&RecFrame) -> Vec<u8> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<RecFrame>();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let q = queued.clone();
         std::thread::spawn(move || {
-            for buf in rx {
-                if out.write_all(&buf).is_err() {
+            for frame in rx {
+                if out.write_all(&encode(&frame)).is_err() {
                     break;
                 }
-                q.fetch_sub(buf.len(), std::sync::atomic::Ordering::Relaxed);
+                q.fetch_sub(frame.data.len(), std::sync::atomic::Ordering::Relaxed);
             }
         });
         Self { path, child, tx: Some(tx), queued, waiting: true, dropping: false }
     }
 
     /// Never blocks: a stalled ffmpeg must not stall the camera's media, commands and pings.
-    pub fn push(&mut self, data: &[u8], keyframe: bool) -> Pushed {
+    pub fn push(&mut self, data: &[u8], keyframe: bool, us: u32) -> Pushed {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(tx) = &self.tx else { return Pushed::Dead };
         if self.queued.load(Relaxed) + data.len() > REC_QUEUE_BYTES {
@@ -295,7 +415,7 @@ impl Recorder {
         self.waiting = false;
         self.dropping = false;
         self.queued.fetch_add(data.len(), Relaxed);
-        if tx.send(data.to_vec()).is_err() {
+        if tx.send(RecFrame { data: data.to_vec(), key: keyframe, us }).is_err() {
             return Pushed::Dead; // the writer stopped: ffmpeg quit
         }
         Pushed::Queued
@@ -352,14 +472,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0).unwrap();
-        assert_eq!(rec.push(b"\0\0\0\x01", true), Pushed::Queued);
+        assert_eq!(rec.push(b"\0\0\0\x01", true, 0), Pushed::Queued);
         let mut child = rec.child.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         // The feeder notices on its next write; from then on every push fails.
         let gone = (0..500).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            rec.push(&[0u8; 4096], false) == Pushed::Dead
+            rec.push(&[0u8; 4096], false, 0) == Pushed::Dead
         });
         assert!(gone, "push kept succeeding after ffmpeg exited");
         drop(rec);
@@ -369,7 +489,7 @@ mod tests {
     #[test]
     fn raw_viewers_start_at_the_last_keyframe() {
         let feed = RawFeed::default();
-        let f = |key, n: u8| Raw { hevc: true, key, data: vec![n] };
+        let f = |key, n: u8| Raw { hevc: true, key, us: 0, data: vec![n] };
         feed.push(f(false, 0)); // before any keyframe: nothing to start from
         assert!(feed.subscribe().0.is_empty());
         feed.push(f(true, 1));
@@ -401,6 +521,107 @@ mod tests {
         assert!(read_mpjpeg(&mut r).is_none());
     }
 
+    #[test]
+    fn mpegts_crc_is_mpeg2() {
+        assert_eq!(mpeg_crc32(b"123456789"), 0x0376_E6E7);
+    }
+
+    #[test]
+    fn mpegts_time_follows_the_camera_clock() {
+        let mut m = Mpegts::new(VideoType::H265);
+        let t0 = m.pts(u32::MAX - 33_000);
+        assert_eq!(m.pts(u32::MAX) - t0, 2970, "33 ms at 90 kHz");
+        assert_eq!(m.pts(32_999) - t0, 5940, "across the clock wrapping");
+        assert_eq!(m.pts(32_999) - t0, 8910, "a stuck clock takes the last step");
+        assert_eq!(m.pts(1_000) - t0, 11880, "and so does one going backwards");
+        assert_eq!(m.pts(5_001_000) - t0, 11880 + 450_000, "a real gap stays a gap");
+    }
+
+    #[test]
+    fn mpegts_packets_are_well_formed() {
+        for len in [0, 1, 150, 161, 162, 163, 176, 500, 100_000] {
+            let mut m = Mpegts::new(VideoType::H264);
+            let out = m.frame(&vec![0xAB; len], true, 0);
+            assert_eq!(out.len() % 188, 0, "{len} bytes");
+            let packets: Vec<_> = out.chunks(188).collect();
+            assert!(packets.iter().all(|p| p[0] == 0x47));
+            let video: Vec<_> = packets.iter().filter(|p| p[1] & 0x1F == 1 && p[2] == 0).collect();
+            let mut payload = 0;
+            for (i, p) in video.iter().enumerate() {
+                assert_eq!(p[3] & 15, i as u8 & 15, "continuity");
+                assert_eq!(p[1] & 0x40 != 0, i == 0, "start flag");
+                payload += if p[3] & 0x20 != 0 { 183 - p[4] as usize } else { 184 };
+            }
+            assert_eq!(payload, 14 + len, "PES header and the whole frame, {len} bytes");
+        }
+    }
+
+    /// Encode `n` frames with an access unit delimiter ahead of each, and split them apart again.
+    fn access_units(enc: &str, params: (&str, &str), format: &str, aud: &[u8], n: usize) -> Vec<Vec<u8>> {
+        let frames = n.to_string();
+        let out = Command::new(ffmpeg())
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15", "-frames:v", &frames, "-c:v", enc, params.0, params.1, "-f", format, "pipe:1"])
+            .output()
+            .expect("ffmpeg on PATH");
+        assert!(out.status.success() && !out.stdout.is_empty());
+        let starts: Vec<usize> = out.stdout.windows(aud.len()).enumerate().filter(|(_, w)| *w == aud).map(|(i, _)| i).collect();
+        assert_eq!(starts.len(), n, "one delimiter per frame");
+        (0..n).map(|i| out.stdout[starts[i]..*starts.get(i + 1).unwrap_or(&out.stdout.len())].to_vec()).collect()
+    }
+
+    /// Frames that arrive in bursts with a long stall, stamped at a steady 15 fps, must come out of the file steady.
+    fn recording_keeps_camera_time(codec: VideoType, enc: &str, params: (&str, &str), format: &str, aud: &[u8], is_key: fn(&[u8]) -> bool) {
+        const N: usize = 45;
+        let units = access_units(enc, params, format, aud, N);
+        let dir = std::env::temp_dir().join(format!("reolink-rs-rec-time-{enc}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rec = Recorder::new(codec, &dir, "Cam", 0).unwrap();
+        let start = u32::MAX - 1_000_000; // the camera's clock wraps a second in
+        for (i, unit) in units.iter().enumerate() {
+            if i == 20 {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+            }
+            let us = start.wrapping_add((i as u64 * 1_000_000 / 15) as u32);
+            assert_eq!(rec.push(unit, is_key(unit), us), Pushed::Queued);
+        }
+        let mut child = rec.child.take().unwrap();
+        rec.tx.take();
+        child.wait().unwrap();
+
+        let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        assert!(std::fs::read(&file).unwrap().windows(4).any(|w| w == b"moof"), "fragmented");
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+            .arg(&file)
+            .output()
+            .expect("ffprobe on PATH");
+        assert!(probe.status.success());
+        let text = String::from_utf8(probe.stdout).unwrap();
+        let rows: Vec<(f64, bool)> = text.lines().filter(|l| !l.is_empty()).map(|l| {
+            let (t, flags) = l.split_once(',').unwrap();
+            (t.parse().unwrap(), flags.starts_with('K'))
+        }).collect();
+        assert_eq!(rows.len(), N, "every frame in the file");
+        assert!(rows[0].1, "starts on a keyframe");
+        assert!(rows[0].0.abs() < 0.001, "starts at zero, got {}", rows[0].0);
+        for w in rows.windows(2) {
+            let gap = w[1].0 - w[0].0;
+            assert!((gap - 1.0 / 15.0).abs() < 0.002, "frame gap {gap}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn h264_recording_keeps_camera_time() {
+        recording_keeps_camera_time(VideoType::H264, "libx264", ("-x264-params", "aud=1:keyint=15:bframes=0"), "h264", &[0, 0, 0, 1, 9], |u| u.windows(4).any(|w| w == [0, 0, 1, 0x65]));
+    }
+
+    #[test]
+    fn h265_recording_keeps_camera_time() {
+        recording_keeps_camera_time(VideoType::H265, "libx265", ("-x265-params", "aud=1:keyint=15:bframes=0:log-level=error"), "hevc", &[0, 0, 0, 1, 0x46, 1], |u| u.windows(4).any(|w| w[..3] == [0, 0, 1] && matches!((w[3] >> 1) & 0x3F, 16..=21)));
+    }
+
     /// A writer that blocks until the test lets it go, then records what reached it.
     struct Gate(std::sync::mpsc::Receiver<()>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl Write for Gate {
@@ -418,12 +639,12 @@ mod tests {
     fn recorder_never_blocks_and_resumes_at_a_keyframe() {
         let (open, gate) = std::sync::mpsc::channel();
         let got = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-        let mut r = Recorder::with_writer(PathBuf::new(), None, Gate(gate, got.clone()));
+        let mut r = Recorder::with_writer(PathBuf::new(), None, Gate(gate, got.clone()), |f| f.data.clone());
         let mb = vec![1u8; 1 << 20];
-        assert_eq!(r.push(&[9], false), Pushed::Queued); // before the first keyframe: skipped
+        assert_eq!(r.push(&[9], false, 0), Pushed::Queued); // before the first keyframe: skipped
         // A stalled disk: the queue fills, then frames drop with one report, all without blocking.
         let t = std::time::Instant::now();
-        let results: Vec<_> = (0..80).map(|i| r.push(&mb, i == 0)).collect();
+        let results: Vec<_> = (0..80).map(|i| r.push(&mb, i == 0, 0)).collect();
         assert!(t.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(results.iter().filter(|p| **p == Pushed::Overloaded).count(), 1);
         assert_eq!(results.iter().position(|p| *p == Pushed::Overloaded), Some(REC_QUEUE_BYTES >> 20));
@@ -434,8 +655,8 @@ mod tests {
         while r.queued.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             std::thread::yield_now();
         }
-        assert_eq!(r.push(&[2], false), Pushed::Queued);
-        assert_eq!(r.push(&[3], true), Pushed::Queued);
+        assert_eq!(r.push(&[2], false, 0), Pushed::Queued);
+        assert_eq!(r.push(&[3], true, 0), Pushed::Queued);
         open.send(()).unwrap();
         while r.queued.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             std::thread::yield_now();

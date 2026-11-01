@@ -2,13 +2,14 @@
 //! can't watch the cameras:
 //! - GET /live/<device id>?t=<token>: MJPEG for <img> tiles (decoded by ffmpeg).
 //! - GET /raw/<device id>?t=<token>: the camera's own H.264/H.265 for tiles that decode with WebCodecs. Each frame is
-//!   a 1-byte flag (bit 0 keyframe, bit 1 H.265), a 4-byte big-endian length and an Annex-B access unit.
+//!   a 1-byte flag (bit 0 keyframe, bit 1 H.265, bit 2 cached from before this viewer joined), a 4-byte big-endian
+//!   length, the 4-byte big-endian time on the camera's clock (microseconds, wrapping) and an Annex-B access unit.
 
 use crate::device::Views;
 use crate::media::Raw;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -114,9 +115,10 @@ async fn handle(mut sock: TcpStream, feeds: Feeds, token: &str) -> std::io::Resu
     }
 }
 
-async fn write_raw(sock: &mut TcpStream, f: &Raw) -> std::io::Result<()> {
-    let mut head = [f.key as u8 | (f.hevc as u8) << 1, 0, 0, 0, 0];
-    head[1..].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
+async fn write_raw(sock: &mut (impl AsyncWrite + Unpin), f: &Raw, cached: bool) -> std::io::Result<()> {
+    let mut head = [f.key as u8 | (f.hevc as u8) << 1 | (cached as u8) << 2, 0, 0, 0, 0, 0, 0, 0, 0];
+    head[1..5].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
+    head[5..].copy_from_slice(&f.us.to_be_bytes());
     sock.write_all(&head).await?;
     sock.write_all(&f.data).await
 }
@@ -136,7 +138,7 @@ async fn raw(
     );
     sock.write_all(head.as_bytes()).await?;
     for f in &gop {
-        write_raw(&mut sock, f).await?;
+        write_raw(&mut sock, f, true).await?;
     }
     let mut resync = false; // fell behind: skip to the next keyframe so the decoder never sees a gap
     loop {
@@ -144,7 +146,7 @@ async fn raw(
             Ok(f) => {
                 resync &= !f.key;
                 if !resync {
-                    write_raw(&mut sock, &f).await?;
+                    write_raw(&mut sock, &f, false).await?;
                 }
             }
             Err(RecvError::Lagged(_)) => resync = true,
@@ -155,7 +157,20 @@ async fn raw(
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, app_origin, route};
+    use super::{Route, app_origin, route, write_raw};
+    use crate::media::Raw;
+
+    #[tokio::test]
+    async fn raw_frames_carry_flags_length_and_camera_time() {
+        let mut out = vec![];
+        write_raw(&mut out, &Raw { hevc: true, key: true, us: 0x0102_0304, data: vec![7, 8] }, false).await.unwrap();
+        write_raw(&mut out, &Raw { hevc: false, key: false, us: u32::MAX, data: vec![9] }, true).await.unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out, [
+            0b011, 0, 0, 0, 2, 1, 2, 3, 4, 7, 8,
+            0b100, 0, 0, 0, 1, 255, 255, 255, 255, 9,
+        ]);
+    }
 
     #[test]
     fn only_the_app_page_may_read_raw() {
