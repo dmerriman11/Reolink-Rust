@@ -209,7 +209,7 @@ body.dragging-feed, body.dragging-feed * { cursor: grabbing !important; }
 .chip.rec { margin-left: auto; background: var(--rec); color: #fff; animation: pulse 1.6s ease-in-out infinite; }
 
 .tile-bar {
-  position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 6px;
+  position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   padding: 5px; border-radius: 10px;
   background: rgba(16, 18, 21, .72); backdrop-filter: blur(14px) saturate(1.3);
   border: 1px solid var(--line-strong);
@@ -237,6 +237,11 @@ body.dragging-feed, body.dragging-feed * { cursor: grabbing !important; }
 .bar-btn:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
 .bar-btn.recording { color: var(--rec); }
 .bar-btn.recording svg { fill: var(--rec); }
+.bar-btn[aria-pressed="true"] { color: var(--accent); }
+.bar-btn.armed { background: var(--rec); color: #fff; }
+.tile.zoomed img, .tile.zoomed canvas { transform-origin: 0 0; cursor: grab; touch-action: none; }
+.tile.zoomed img:active, .tile.zoomed canvas:active { cursor: grabbing; }
+.tile .tile-zoom { top: 44px; left: 12px; right: auto; bottom: auto; }
 .spacer { flex: 1; }
 
 /* ---------- collapsible device panel, full-screen view ---------- */

@@ -10,6 +10,7 @@ mod scan;
 mod secrets;
 mod settings;
 mod stream;
+mod talk;
 
 use device::{Cmd, Device, DeviceConfig};
 use neolink_core::bc_protocol::{Direction, StreamKind};
@@ -92,6 +93,8 @@ struct App {
     feeds: stream::Feeds,
     port: u16,
     token: String,
+    /// The talk in progress per camera; removing one ends it.
+    talks: Mutex<HashMap<u64, talk::Session>>,
 }
 
 impl App {
@@ -182,6 +185,8 @@ struct DeviceDto {
     wifi_level: Option<u8>,
     live: Option<&'static str>,
     clear: bool,
+    /// The light is on from a click here (not from motion or a schedule, which the app isn't told about).
+    light: bool,
     recording: bool,
     motion: bool,
     motion_events: u64,
@@ -233,6 +238,7 @@ fn get_state(app: State<App>) -> StateDto {
                 wifi_level: s.wifi_dbm.map(device::wifi_level),
                 live: s.live.map(|k| if k == StreamKind::Main { "main" } else { "sub" }),
                 clear: inner.clear.contains(&d.id),
+                light: s.light_until.is_some_and(|t| t > std::time::Instant::now()),
                 recording: s.recording.is_some(),
                 motion: s.motion,
                 motion_events: s.motion_events,
@@ -417,6 +423,47 @@ fn ptz(app: State<App>, id: u64, dir: String) -> Result<(), String> {
         _ => return Err("bad direction".into()),
     };
     send(&app, id, Cmd::Ptz(dir))
+}
+
+#[tauri::command]
+fn light(app: State<App>, id: u64, on: bool) -> Result<(), String> {
+    send(&app, id, Cmd::Light(on))
+}
+
+#[tauri::command]
+fn siren(app: State<App>, id: u64) -> Result<(), String> {
+    send(&app, id, Cmd::Siren)
+}
+
+/// Open the camera's speaker; replies with the sample rate talk_audio's samples must be at.
+#[tauri::command]
+async fn talk_start(app: State<'_, App>, id: u64) -> Result<u32, String> {
+    let tx = device_cam(&app, id)?.0;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Cmd::Talk(reply)).map_err(|_| "device was removed".to_string())?;
+    let session = tokio::time::timeout(std::time::Duration::from_secs(20), rx)
+        .await
+        .map_err(|_| "camera didn't answer in time".to_string())?
+        .map_err(|_| "device restarted; try again".to_string())??;
+    let rate = session.rate;
+    app.talks.lock().unwrap().insert(id, session);
+    Ok(rate)
+}
+
+#[tauri::command(async)]
+fn talk_audio(app: State<App>, id: u64, samples: Vec<i16>) -> Result<(), String> {
+    let mut talks = app.talks.lock().unwrap();
+    let session = talks.get_mut(&id).ok_or("not talking")?;
+    let res = session.push(&samples);
+    if res.is_err() {
+        talks.remove(&id);
+    }
+    res
+}
+
+#[tauri::command]
+fn talk_stop(app: State<App>, id: u64) {
+    app.talks.lock().unwrap().remove(&id);
 }
 
 #[tauri::command]
@@ -896,6 +943,7 @@ fn main() {
         feeds,
         port,
         token,
+        talks: Mutex::default(),
     };
     {
         let mut inner = app.inner.lock().unwrap();
@@ -918,7 +966,7 @@ fn main() {
         .manage(app)
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile, swap_tiles,
-            set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
+            set_clear, ptz, light, siren, talk_start, talk_audio, talk_stop, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
             get_prefs, save_prefs, pick_folder, add_found,

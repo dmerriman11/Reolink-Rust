@@ -9,6 +9,9 @@ const LAYOUTS = [
 ];
 
 const ICON = {
+  light: '<svg viewBox="0 0 24 24"><path d="M9 17h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.5.4.5 1 .5 1.6V17h6v-1.5c0-.6 0-1.2.5-1.6A6 6 0 0 0 12 3z"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24"><path d="M4 9.5v5h4l5 4.5V5L8 9.5zM16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/></svg>',
+  siren: '<svg viewBox="0 0 24 24"><path d="M7 17v-5a5 5 0 0 1 10 0v5M5 17h14v3H5zM12 3v2M4.5 6l1.4 1.4M19.5 6l-1.4 1.4"/></svg>',
   camera: '<svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>',
   rec: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
@@ -377,10 +380,24 @@ function makeTile(idx) {
   t.img.alt = "";
   t.img.draggable = false;
   t.root.tabIndex = 0;
+  t.zoom = clampZoom(1, 0.5, 0.5);
+  t.zoomChip = el("button", "pb-zoom tile-zoom");
+  t.zoomChip.hidden = true;
+  t.zoomChip.onclick = (e) => { e.stopPropagation(); setTileZoom(t, 1, 0.5, 0.5); };
+  for (const view of [t.img, t.canvas]) panTileZoom(t, view);
+  t.root.addEventListener("wheel", (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault(); // or the whole window zooms
+    const view = [t.img, t.canvas].find((v) => v.classList.contains("ok"));
+    if (!view) return;
+    const r = view.getBoundingClientRect(); // the zoomed box, so these are already fractions of the picture
+    const z = zoomAround(t.zoom, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, Math.exp(-e.deltaY * 0.0015), ZOOM_MAX);
+    setTileZoom(t, z.s, z.x, z.y);
+  }, { passive: false });
   t.root.onclick = () => { selected = t.idx; renderTiles(); };
   t.root.onfocus = () => { if (selected !== t.idx) { selected = t.idx; renderTiles(); } };
   t.root.ondblclick = (e) => {
-    if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button, .ptz")) return;
+    if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button, .ptz, .tile-zoom")) return;
     setSolo(solo === t.idx ? null : t.idx);
   };
   // Keyboard: Enter toggles single view (Esc leaves it), arrows move between tiles, Shift+arrows move the camera.
@@ -396,6 +413,34 @@ function makeTile(idx) {
     tiles[next].root.focus();
   };
   return t;
+}
+
+function setTileZoom(t, s, x, y) {
+  t.zoom = clampZoom(s, x, y);
+  const on = t.zoom.s > 1.001;
+  const shift = (v) => (0.5 - v * t.zoom.s) * 100;
+  for (const view of [t.img, t.canvas]) view.style.transform = on ? `translate(${shift(t.zoom.x)}%, ${shift(t.zoom.y)}%) scale(${t.zoom.s})` : "";
+  t.root.classList.toggle("zoomed", on);
+  t.zoomChip.hidden = !on;
+  t.zoomChip.textContent = `${t.zoom.s.toFixed(1)}× · Reset`;
+}
+
+// Dragging a zoomed picture moves around it.
+function panTileZoom(t, view) {
+  let from = null;
+  view.addEventListener("pointerdown", (e) => {
+    if (t.zoom.s <= 1 || e.button !== 0) return;
+    view.setPointerCapture(e.pointerId);
+    from = { px: e.clientX, py: e.clientY, x: t.zoom.x, y: t.zoom.y };
+  });
+  view.addEventListener("pointermove", (e) => {
+    if (!from) return;
+    const r = view.getBoundingClientRect();
+    setTileZoom(t, t.zoom.s, from.x - (e.clientX - from.px) / r.width, from.y - (e.clientY - from.py) / r.height);
+  });
+  const end = () => { from = null; };
+  view.addEventListener("pointerup", end);
+  view.addEventListener("pointercancel", end);
 }
 
 // A live tile whose camera stopped sending frames keeps its last picture, so say it's frozen and offer a way out.
@@ -431,6 +476,7 @@ function renderTiles() {
   grid.style.setProperty("--rows", l.rows);
   grid.classList.toggle("solo", solo != null);
   if (selected >= l.n) selected = 0;
+  if (talk && !state.tiles.slice(0, l.n).includes(talk.id)) stopTalk(); // never leave a microphone open for a camera no longer shown
   while (tiles.length < l.n) tiles.push(makeTile(tiles.length));
   const moved = followCameras(tiles, state.tiles, l.n);
   // Only touch the grid when the tile count changes; re-inserting tiles restarts their entry
@@ -448,7 +494,7 @@ function renderTiles() {
     t.root.classList.toggle("motion", !!d?.motion);
     t.root.setAttribute("aria-label", d ? `${d.name}: Enter for single view` : `Tile ${idx + 1}, empty`);
     // Rebuild a tile only when what it shows changes; the <img> keeps its stream connection otherwise.
-    const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.online && d.live ? "" : d.status].join("|") : "empty";
+    const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.light, talk?.id === d.id, d.online && d.live ? "" : d.status].join("|") : "empty";
     if (key !== t.key) buildTile(t, d, key);
     renderHealth(t, d);
   });
@@ -460,6 +506,7 @@ function renderTiles() {
 
 function buildTile(t, d, key) {
   t.key = key;
+  if ((d?.id ?? null) !== t.dev) setTileZoom(t, 1, 0.5, 0.5); // a zoom belongs to the camera it was made on
   t.dev = d?.id ?? null;
   reportSizes(); // the tile may now show another camera
   t.root.replaceChildren();
@@ -491,6 +538,7 @@ function buildTile(t, d, key) {
   head.append(grip);
   if (d.live && d.online) head.append(Object.assign(el("span", "chip live"), { textContent: d.live === "main" ? "HD" : "SD" }));
   if (d.recording) head.append(Object.assign(el("span", "chip rec"), { textContent: "REC" }));
+  if (talk?.id === d.id) head.append(Object.assign(el("span", "chip rec"), { textContent: "MIC ON" }));
   t.root.append(head);
 
   const bar = el("div", "tile-bar");
@@ -514,9 +562,82 @@ function buildTile(t, d, key) {
     if (solo === t.idx) setSolo(null);
     call("assign_tile", { tile: t.idx, id: null }).then(refresh);
   };
-  bar.append(seg, snap, rec, el("span", "spacer"), close);
-  t.root.append(bar);
+  const toggle = (icon, label, on, click) => {
+    const b = el("button", "bar-btn", icon);
+    b.title = label;
+    b.setAttribute("aria-label", label);
+    b.setAttribute("aria-pressed", String(on));
+    b.onclick = (e) => { e.stopPropagation(); click(); };
+    return b;
+  };
+  const light = toggle(ICON.light, "Light (turns itself off after 3 minutes)", !!d.light, () => call("light", { id: d.id, on: !d.light }).then(refresh));
+  const speaker = toggle(ICON.speaker, "Talk through the camera's speaker using this PC's microphone", talk?.id === d.id, () => (talk?.id === d.id ? stopTalk() : startTalk(d.id)));
+  bar.append(seg, snap, rec, light, speaker, sirenButton(d), el("span", "spacer"), close);
+  t.root.append(bar, t.zoomChip);
 }
+
+// The siren is loud and can't be called back, so it takes a second click within a few seconds.
+function sirenButton(d) {
+  const b = el("button", "bar-btn", `${ICON.siren}<span hidden>Sound siren?</span>`);
+  b.title = "Siren";
+  b.setAttribute("aria-label", "Siren");
+  let timer = null;
+  const disarm = () => { clearTimeout(timer); timer = null; b.classList.remove("armed"); b.lastChild.hidden = true; b.setAttribute("aria-label", "Siren"); };
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (timer) { disarm(); call("siren", { id: d.id }).catch(() => {}); return; }
+    b.classList.add("armed");
+    b.lastChild.hidden = false;
+    b.setAttribute("aria-label", "Confirm: sound the siren");
+    timer = setTimeout(disarm, 4000);
+  };
+  return b;
+}
+
+// ---------- talking through a camera ----------
+// One at a time, as there is one microphone. { id, end } while it's open.
+let talk = null;
+
+async function startTalk(id) {
+  stopTalk();
+  let mic = null, ctx = null, open = false;
+  const me = talk = { id, end() {
+    mic?.getTracks().forEach((track) => track.stop());
+    ctx?.close();
+    if (open) invoke("talk_stop", { id }).catch(() => {});
+  } };
+  const lost = (e) => { if (talk === me) { stopTalk(); toast(String(e)); } };
+  renderTiles();
+  try {
+    // shortcut: on macOS and Linux the webview may refuse the microphone; only WebView2 is targeted so far, retest there before relying on it.
+    if (!navigator.mediaDevices) throw "This window can't use the microphone";
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    if (talk !== me) return me.end();
+    const rate = await invoke("talk_start", { id });
+    open = true;
+    if (talk !== me) return me.end();
+    ctx = new AudioContext({ sampleRate: rate }); // the browser resamples the microphone to the camera's rate
+    // shortcut: ScriptProcessor is deprecated and runs on the page's thread, but its 256 ms buffer rides out busy frames; move to an AudioWorklet if it's ever removed.
+    const tap = ctx.createScriptProcessor(4096, 1, 1);
+    tap.onaudioprocess = (e) => {
+      const samples = Array.from(e.inputBuffer.getChannelData(0), (v) => Math.round(Math.max(-1, Math.min(1, v)) * 32767));
+      invoke("talk_audio", { id, samples }).catch(lost);
+    };
+    ctx.createMediaStreamSource(mic).connect(tap);
+    tap.connect(ctx.destination); // it only runs when connected; its output is silent
+  } catch (e) {
+    lost(e?.name === "NotAllowedError" ? "Microphone access was refused" : e?.name === "NotFoundError" ? "No microphone found" : e);
+  }
+}
+
+function stopTalk() {
+  if (!talk) return;
+  const me = talk;
+  talk = null;
+  me.end();
+  renderTiles();
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopTalk(); }); // minimized or in the tray: nobody can see the microphone is on
 
 // ---------- rearranging and resizing the grid ----------
 function swapFeeds(t, to) {
@@ -2025,6 +2146,7 @@ function setView(playback) {
   $("#nvr").hidden = !playback;
   $("#view-live").setAttribute("aria-pressed", String(!playback));
   $("#view-playback").setAttribute("aria-pressed", String(playback));
+  if (playback) stopTalk();
   // The live grid is off screen during playback, so stop its streams (scheduled recording carries on).
   invoke("set_live_paused", { paused: playback }).catch(() => {});
   clearInterval(PB.timer);
@@ -2260,6 +2382,8 @@ function demoInvoke(cmd, args) {
   if (cmd === "scan_lan") return Promise.resolve([{ uid: "95270000EXAMPLEA", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;
+  if (cmd === "light") demo.devices.find((d) => d.id === args.id).light = args.on;
+  if (cmd === "talk_start") return Promise.resolve(16000);
   if (cmd === "swap_tiles") [demo.tiles[args.a], demo.tiles[args.b]] = [demo.tiles[args.b], demo.tiles[args.a]];
   return Promise.resolve(cmd === "get_state" ? structuredClone(demo) : null);
 }

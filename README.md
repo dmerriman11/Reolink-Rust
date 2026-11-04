@@ -79,6 +79,10 @@ Arrange the live grid: drag a camera by its name onto another tile to swap them 
 and drag the borders between tiles to resize rows and columns. Each layout remembers its proportions; double-click
 a border to make them equal again. Video keeps playing throughout.
 
+Hold Ctrl and scroll over a live picture to zoom in and out around the pointer, up to 8×; drag to move around, and the chip
+resets it. A tile's control bar also has the light (on for 3 minutes per click), the camera's speaker (talk through
+it with this PC's microphone) and the siren (a second click confirms).
+
 Live view health: a tile whose camera stops sending frames says "No new video for N s" with a Reconnect button
 (the app also reconnects by itself after 20 s); an offline tile shows why, with Retry now. Recording paused (tray)
 shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Shift+arrows move its camera, Enter for single
@@ -90,7 +94,7 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
 Next phases toward parity with the official client:
-1. Live audio and two-way talk; PTZ presets/zoom/focus
+1. Live audio; PTZ presets/zoom/focus
 2. Expanded NVR compatibility, playback while SD clips download, and motion markers on the timeline
 3. Alarm/motion notifications and event log; firmware update
 4. Users, Wi-Fi network switching, AI detection config (need protocol work; read-only today)

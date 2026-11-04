@@ -1,7 +1,7 @@
 // `node --test tests/gridlayout.test.js`
 const test = require("node:test");
 const assert = require("node:assert");
-const { followCameras, resizeTracks, validTracks } = require("../ui/gridlayout.js");
+const { followCameras, resizeTracks, validTracks, clampZoom, zoomAround } = require("../ui/gridlayout.js");
 
 const records = (...devs) => devs.map((dev) => ({ dev }));
 const devs = (tiles) => tiles.map((t) => t.dev);
@@ -47,6 +47,26 @@ test("the minimum adapts to a small window", () => {
 
 test("a pair already below the minimum doesn't jump", () => {
   assert.deepEqual(resizeTracks([60, 60, 1000], 0, 30, 120), [60, 60, 1000]);
+});
+
+test("a zoomed picture stays inside the tile", () => {
+  assert.deepEqual(clampZoom(2, 0.4, 0.6), { s: 2, x: 0.4, y: 0.6 });
+  assert.deepEqual(clampZoom(2, 0.1, 0.9), { s: 2, x: 0.25, y: 0.75 });
+  assert.deepEqual(clampZoom(1, 0, 1), { s: 1, x: 0.5, y: 0.5 });
+});
+
+test("zooming keeps the point under the pointer in place", () => {
+  const screen = (z, p, axis) => 0.5 + (p - z[axis]) * z.s;
+  const before = { s: 2, x: 0.4, y: 0.5 };
+  const after = zoomAround(before, 0.45, 0.55, 1.5, 8);
+  assert.equal(after.s, 3);
+  assert.ok(Math.abs(screen(after, 0.45, "x") - screen(before, 0.45, "x")) < 1e-9);
+  assert.ok(Math.abs(screen(after, 0.55, "y") - screen(before, 0.55, "y")) < 1e-9);
+});
+
+test("zoom stops at its limits, and all the way out is the whole picture", () => {
+  assert.equal(zoomAround({ s: 6, x: 0.5, y: 0.5 }, 0.5, 0.5, 2, 8).s, 8);
+  assert.deepEqual(zoomAround({ s: 2, x: 0.3, y: 0.7 }, 0.2, 0.8, 0.1, 8), { s: 1, x: 0.5, y: 0.5 });
 });
 
 test("bad saved sizes are refused", () => {

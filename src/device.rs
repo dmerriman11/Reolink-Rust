@@ -75,6 +75,10 @@ pub enum Cmd {
     SnapshotJpeg(Reply<Vec<u8>>),
     Live(Option<StreamKind>),
     Ptz(Direction),
+    Light(bool),
+    Siren,
+    /// Open the camera's speaker for the microphone; see crate::talk.
+    Talk(Reply<crate::talk::Session>),
     Snapshot,
     Record(bool),
     /// Largest JPEG (device pixels) the tile can show; see media::jpeg_box.
@@ -104,6 +108,8 @@ pub struct State {
     pub aes: bool,
     /// When the live stream last delivered a video frame (or started): the UI shows a stalled picture from this.
     pub last_frame: Option<Instant>,
+    /// Until when a manual light-on holds; the camera turns it off by itself then.
+    pub light_until: Option<Instant>,
 }
 
 pub struct Device {
@@ -311,6 +317,43 @@ async fn draining<T>(
             }
         }
     }
+}
+
+/// How long a click keeps the light on (seconds), so a forgotten light doesn't drain a battery camera.
+const LIGHT_SECS: u16 = 180;
+/// A camera that doesn't answer these in time would otherwise hold up its worker.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Open the camera's speaker and start sending it whatever the session is given.
+async fn start_talk(cam: Arc<BcCamera>, channel: u8, name: String, state: Arc<Mutex<State>>) -> Result<crate::talk::Session, String> {
+    let ability = tokio::time::timeout(CONTROL_TIMEOUT, cam.talk_ability())
+        .await
+        .map_err(|_| "The camera didn't answer about its speaker".to_string())?
+        .map_err(|e| format!("This camera can't talk: {e}"))?;
+    let audio = ability.audio_config_list.into_iter().map(|c| c.audio_config).find(|c| c.audio_type == "adpcm" && c.length_per_encoder >= 2);
+    let (Some(audio), Some(duplex), Some(mode)) = (audio, ability.duplex_list.into_iter().next(), ability.audio_stream_mode_list.into_iter().next()) else {
+        return Err("This camera can't talk".into());
+    };
+    let (block, rate) = (audio.length_per_encoder as usize / 2, audio.sample_rate as u32);
+    let config = neolink_core::bc::xml::TalkConfig {
+        version: "1.1".into(),
+        channel_id: channel,
+        duplex: duplex.duplex,
+        audio_stream_mode: mode.audio_stream_mode,
+        audio_config: audio,
+    };
+    // A talk left open by a crash, or by another client, blocks this one. The official client ends it the same way.
+    let _ = tokio::time::timeout(CONTROL_TIMEOUT, cam.talk_stop()).await;
+    let (tx, rx) = crossbeam_channel::bounded(8); // about half a second of audio at most
+    let rt = tokio::runtime::Handle::current();
+    // talk_stream waits on the channel without yielding, so it gets a thread of its own.
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = rt.block_on(cam.talk_stream(rx, config)) {
+            log::warn!("{name}: talk: {e}");
+            state.lock().unwrap().message = Some(format!("Talking stopped: {e}"));
+        }
+    });
+    Ok(crate::talk::Session::new(tx, block, rate))
 }
 
 /// A camera that doesn't answer a ping in this long is gone; reconnect instead of waiting forever.
@@ -539,6 +582,28 @@ async fn session(
                 if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, views).await? {
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
+            }
+            Cmd::Light(on) => {
+                let res = draining(cam.set_floodlight_manual(on, LIGHT_SECS), &mut live, &cfg.name, state, views).await?;
+                match res {
+                    Ok(()) => set(&|s| s.light_until = on.then(|| Instant::now() + Duration::from_secs(LIGHT_SECS as u64))),
+                    Err(e) => set(&|s| s.message = Some(format!("Light: {e}"))),
+                }
+            }
+            Cmd::Siren => {
+                let res = draining(tokio::time::timeout(CONTROL_TIMEOUT, cam.siren()), &mut live, &cfg.name, state, views).await?;
+                let failed = match res {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(_) => Some("the camera didn't answer".to_string()),
+                };
+                if let Some(e) = failed {
+                    set(&|s| s.message = Some(format!("Siren: {e}")));
+                }
+            }
+            Cmd::Talk(reply) => {
+                let (cam, channel, name, shared) = (cam.clone(), cfg.channel, cfg.name.clone(), state.clone());
+                tokio::spawn(async move { let _ = reply.send(start_talk(cam, channel, name, shared).await); });
             }
             Cmd::SdSearch { day, reply } => {
                 let cam=cam.clone(); let channel=cfg.channel;
