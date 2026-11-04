@@ -14,6 +14,7 @@ const ICON = {
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   wifi: '<svg viewBox="0 0 24 24"><path class="a3" d="M2.5 9.5a14 14 0 0 1 19 0"/><path class="a2" d="M5.5 13a9.5 9.5 0 0 1 13 0"/><path class="a1" d="M8.6 16.4a4.8 4.8 0 0 1 6.8 0"/><circle cx="12" cy="19.6" r="1.4" fill="currentColor" stroke="none"/></svg>',
   plus: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 9v6M9 12h6"/></svg>',
+  grip: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.8"/><circle cx="15" cy="6" r="1.8"/><circle cx="9" cy="12" r="1.8"/><circle cx="15" cy="12" r="1.8"/><circle cx="9" cy="18" r="1.8"/><circle cx="15" cy="18" r="1.8"/></svg>',
 };
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : demoInvoke;
@@ -369,26 +370,29 @@ function stopVideo(t) {
 }
 
 function makeTile(idx) {
-  const t = { root: el("div", "tile"), img: el("img"), canvas: el("canvas"), key: null, src: "", player: null, loading: null };
+  // Records move between slots with their camera (followCameras), so handlers read t.idx, never a captured index.
+  const t = { idx, dev: null, root: el("div", "tile"), img: el("img"), canvas: el("canvas"), key: null, src: "", player: null, loading: null };
+  t.root.style.animationDelay = `${idx * 35}ms`;
   sizeObserver.observe(t.root);
   t.img.alt = "";
   t.img.draggable = false;
   t.root.tabIndex = 0;
-  t.root.onclick = () => { selected = idx; renderTiles(); };
-  t.root.onfocus = () => { if (selected !== idx) { selected = idx; renderTiles(); } };
+  t.root.onclick = () => { selected = t.idx; renderTiles(); };
+  t.root.onfocus = () => { if (selected !== t.idx) { selected = t.idx; renderTiles(); } };
   t.root.ondblclick = (e) => {
     if (e.target.closest(".tile-bar, .tile-stall, .tile-msg button, .ptz")) return;
-    setSolo(solo === idx ? null : idx);
+    setSolo(solo === t.idx ? null : t.idx);
   };
-  // Keyboard: Enter toggles single view (Esc leaves it), arrows move between tiles.
+  // Keyboard: Enter toggles single view (Esc leaves it), arrows move between tiles, Shift+arrows move the camera.
   t.root.onkeydown = (e) => {
     if (e.target !== t.root) return;
-    if (e.key === "Enter") { e.preventDefault(); setSolo(solo === idx ? null : idx); return; }
+    if (e.key === "Enter") { e.preventDefault(); setSolo(solo === t.idx ? null : t.idx); return; }
     const l = LAYOUTS.find((x) => x.n === state.layout) || LAYOUTS[2];
     const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -l.cols, ArrowDown: l.cols }[e.key];
-    const next = idx + (step ?? 0);
+    const next = t.idx + (step ?? 0);
     if (!step || solo != null || next < 0 || next >= l.n) return;
     e.preventDefault();
+    if (e.shiftKey) { if (t.dev != null) swapFeeds(t, next); return; }
     tiles[next].root.focus();
   };
   return t;
@@ -428,29 +432,35 @@ function renderTiles() {
   grid.classList.toggle("solo", solo != null);
   if (selected >= l.n) selected = 0;
   while (tiles.length < l.n) tiles.push(makeTile(tiles.length));
+  const moved = followCameras(tiles, state.tiles, l.n);
   // Only touch the grid when the tile count changes; re-inserting tiles restarts their entry
   // animation and detaches the MJPEG <img>, which showed as a black flash on every poll.
   if (grid.children.length !== l.n) grid.replaceChildren(...tiles.slice(0, l.n).map((t) => t.root));
+  // shortcut: without moveBefore (WebKit on macOS and Linux) Tab order stays as it was until the layout changes; arrows still follow the screen.
+  else if (moved && grid.moveBefore) for (const t of tiles.slice(0, l.n)) grid.moveBefore(t.root, null);
 
   tiles.slice(0, l.n).forEach((t, idx) => {
+    t.idx = idx;
+    t.root.style.order = idx; // places the tile without re-inserting it
     t.root.classList.toggle("selected", idx === selected);
     t.root.classList.toggle("solo", idx === solo);
-    t.root.style.animationDelay = `${idx * 35}ms`;
     const d = device(state.tiles[idx]);
     t.root.classList.toggle("motion", !!d?.motion);
     t.root.setAttribute("aria-label", d ? `${d.name}: Enter for single view` : `Tile ${idx + 1}, empty`);
     // Rebuild a tile only when what it shows changes; the <img> keeps its stream connection otherwise.
     const key = d ? [d.id, d.online, d.live, d.clear, d.recording, d.online && d.live ? "" : d.status].join("|") : "empty";
-    if (key !== t.key) buildTile(t, d, idx, key);
+    if (key !== t.key) buildTile(t, d, key);
     renderHealth(t, d);
   });
   // Drop streams for tiles hidden by a smaller layout.
-  tiles.slice(l.n).forEach((t) => { stopVideo(t); t.key = null; });
+  tiles.slice(l.n).forEach((t) => { stopVideo(t); t.key = null; t.dev = null; });
   renderPtz();
+  renderSplitters(l);
 }
 
-function buildTile(t, d, idx, key) {
+function buildTile(t, d, key) {
   t.key = key;
+  t.dev = d?.id ?? null;
   reportSizes(); // the tile may now show another camera
   t.root.replaceChildren();
 
@@ -474,7 +484,11 @@ function buildTile(t, d, idx, key) {
   t.root.append(...(d.online && view.classList.contains("ok") ? [] : [loading]), view);
 
   const head = el("div", "tile-head");
-  head.append(Object.assign(el("span"), { textContent: d.name }));
+  const grip = el("span", "tile-grip", ICON.grip);
+  grip.append(d.name);
+  grip.title = "Drag onto another tile to swap (Shift+arrow keys on a focused tile)";
+  grip.onpointerdown = (e) => dragFeed(e, t, d.name);
+  head.append(grip);
   if (d.live && d.online) head.append(Object.assign(el("span", "chip live"), { textContent: d.live === "main" ? "HD" : "SD" }));
   if (d.recording) head.append(Object.assign(el("span", "chip rec"), { textContent: "REC" }));
   t.root.append(head);
@@ -497,12 +511,164 @@ function buildTile(t, d, idx, key) {
   close.title = "Close live view";
   close.onclick = (e) => {
     e.stopPropagation();
-    if (solo === idx) setSolo(null);
-    call("assign_tile", { tile: idx, id: null }).then(refresh);
+    if (solo === t.idx) setSolo(null);
+    call("assign_tile", { tile: t.idx, id: null }).then(refresh);
   };
   bar.append(seg, snap, rec, el("span", "spacer"), close);
   t.root.append(bar);
 }
+
+// ---------- rearranging and resizing the grid ----------
+function swapFeeds(t, to) {
+  call("swap_tiles", { a: t.idx, b: to }).then(() => { selected = to; return refresh(); });
+}
+
+// Pointer events, as Tauri's window-level file drop swallows HTML5 drag and drop. Listens on the window because a
+// status change can rebuild the tile, and its handle, mid-drag.
+function dragFeed(e, t, name) {
+  if (e.button !== 0) return;
+  e.preventDefault(); // no text selection
+  const [x0, y0] = [e.clientX, e.clientY];
+  let ghost = null, over = null;
+  const setOver = (target) => {
+    over?.root.classList.remove("drop-target");
+    over = target;
+    over?.root.classList.add("drop-target");
+  };
+  const move = (ev) => {
+    if (!ghost) {
+      if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < 6) return; // a click or double-click, not a drag
+      ghost = Object.assign(el("div", "tile-ghost"), { textContent: name });
+      document.body.append(ghost);
+      document.body.classList.add("dragging-feed");
+      t.root.classList.add("dragging");
+    }
+    ghost.style.translate = `${ev.clientX + 14}px ${ev.clientY + 14}px`;
+    const hit = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".tile");
+    const target = tiles.find((x) => x.root === hit);
+    setOver(target && target !== t ? target : null);
+  };
+  const end = (drop) => {
+    removeEventListener("pointermove", move);
+    removeEventListener("pointerup", up);
+    removeEventListener("pointercancel", cancel);
+    document.removeEventListener("keydown", esc, true);
+    ghost?.remove();
+    document.body.classList.remove("dragging-feed");
+    t.root.classList.remove("dragging");
+    if (drop && over && t.dev != null) swapFeeds(t, over.idx);
+    setOver(null);
+  };
+  const up = () => end(true);
+  const cancel = () => end(false);
+  // Captured, so Esc cancels the drag without also leaving full screen.
+  const esc = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); end(false); } };
+  addEventListener("pointermove", move);
+  addEventListener("pointerup", up);
+  addEventListener("pointercancel", cancel);
+  document.addEventListener("keydown", esc, true);
+}
+
+const MIN_TRACK = 120;
+let splitterLayout = null;
+// Proportions per layout: { "4": { cols: [..], rows: [..] } }. A view preference nothing in the backend reads.
+let gridSizes = {};
+try { gridSizes = JSON.parse(localStorage.getItem("gridSizes")) || {}; } catch { /* storage unavailable or corrupt: equal sizes */ }
+const saveGridSizes = () => { try { localStorage.setItem("gridSizes", JSON.stringify(gridSizes)); } catch { /* ignore */ } };
+
+const tracksPx = (axis) => getComputedStyle($("#grid"))[axis === "cols" ? "gridTemplateColumns" : "gridTemplateRows"].split(" ").map(parseFloat);
+
+function applyTracks(l) {
+  const grid = $("#grid");
+  for (const [axis, len, prop] of [["cols", l.cols, "--col-tracks"], ["rows", l.rows, "--row-tracks"]]) {
+    const v = gridSizes[l.n]?.[axis];
+    if (validTracks(v, len)) grid.style.setProperty(prop, v.map((x) => `minmax(0, ${x}fr)`).join(" "));
+    else grid.style.removeProperty(prop);
+  }
+}
+
+function makeSplitter(axis, i, l) {
+  const vertical = axis === "cols";
+  const s = el("div", `splitter ${axis}`);
+  s.tabIndex = 0;
+  s.title = "Drag to resize. Double-click to make all equal.";
+  s.setAttribute("role", "separator");
+  s.setAttribute("aria-orientation", vertical ? "vertical" : "horizontal");
+  s.setAttribute("aria-label", `Resize ${vertical ? "columns" : "rows"} ${i + 1} and ${i + 2}. Arrow keys resize, Home makes all equal.`);
+  s.setAttribute("aria-valuemin", "0");
+  s.setAttribute("aria-valuemax", "100");
+  const set = (px) => {
+    // Stored as fr, summing to the track count, so the proportions survive any window size.
+    const sum = px.reduce((a, b) => a + b, 0);
+    (gridSizes[l.n] ||= {})[axis] = px.map((x) => +((x / sum) * px.length).toFixed(4));
+    applyTracks(l);
+    placeSplitters();
+  };
+  const reset = () => {
+    delete gridSizes[l.n];
+    saveGridSizes();
+    applyTracks(l);
+    placeSplitters();
+  };
+  let start = null, from = 0;
+  const at = (e) => (vertical ? e.clientX : e.clientY);
+  s.onpointerdown = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    s.setPointerCapture(e.pointerId);
+    start = tracksPx(axis);
+    from = at(e);
+    s.classList.add("active");
+  };
+  s.onpointermove = (e) => { if (start) set(resizeTracks(start, i, at(e) - from, MIN_TRACK)); };
+  s.onlostpointercapture = () => { start = null; s.classList.remove("active"); saveGridSizes(); };
+  s.ondblclick = reset;
+  s.onkeydown = (e) => {
+    if (e.key === "Home") { e.preventDefault(); reset(); return; }
+    const step = (vertical ? { ArrowLeft: -24, ArrowRight: 24 } : { ArrowUp: -24, ArrowDown: 24 })[e.key];
+    if (!step) return;
+    e.preventDefault();
+    set(resizeTracks(tracksPx(axis), i, step, MIN_TRACK));
+    saveGridSizes();
+  };
+  return s;
+}
+
+function renderSplitters(l) {
+  const box = $("#splitters");
+  box.hidden = solo != null;
+  if (splitterLayout !== l.n) {
+    splitterLayout = l.n;
+    applyTracks(l);
+    box.replaceChildren(
+      ...Array.from({ length: l.cols - 1 }, (_, i) => makeSplitter("cols", i, l)),
+      ...Array.from({ length: l.rows - 1 }, (_, i) => makeSplitter("rows", i, l)),
+    );
+  }
+  placeSplitters();
+}
+
+// Over the gaps between tracks. They live outside #grid, whose children are exactly the tiles.
+function placeSplitters() {
+  const grid = $("#grid"), box = $("#splitters");
+  if (box.hidden || grid.offsetParent === null) return; // single view, or playback: the tracks aren't the layout's
+  const cs = getComputedStyle(grid), g = grid.getBoundingClientRect(), b = box.getBoundingClientRect();
+  const gap = parseFloat(cs.columnGap), rowGap = parseFloat(cs.rowGap);
+  const [left, top] = [g.left - b.left + parseFloat(cs.paddingLeft), g.top - b.top + parseFloat(cs.paddingTop)];
+  const cols = tracksPx("cols"), rows = tracksPx("rows");
+  const span = (px, w) => px.reduce((a, c) => a + c, 0) + w * (px.length - 1);
+  const edge = (px, i, w) => px.slice(0, i + 1).reduce((a, c) => a + c, 0) + w * i + w / 2;
+  const percent = (px, i) => String(Math.round((px[i] / (px[i] + px[i + 1])) * 100));
+  box.querySelectorAll(".splitter.cols").forEach((s, i) => {
+    Object.assign(s.style, { left: `${left + edge(cols, i, gap)}px`, top: `${top}px`, height: `${span(rows, rowGap)}px` });
+    s.setAttribute("aria-valuenow", percent(cols, i));
+  });
+  box.querySelectorAll(".splitter.rows").forEach((s, i) => {
+    Object.assign(s.style, { left: `${left}px`, top: `${top + edge(rows, i, rowGap)}px`, width: `${span(cols, gap)}px` });
+    s.setAttribute("aria-valuenow", percent(rows, i));
+  });
+}
+new ResizeObserver(placeSplitters).observe($("#grid"));
 
 // ---------- PTZ ----------
 // The controls ride on the selected live feed; buildTile empties a tile, so re-attach after every render.
@@ -2094,5 +2260,6 @@ function demoInvoke(cmd, args) {
   if (cmd === "scan_lan") return Promise.resolve([{ uid: "95270000EXAMPLEA", ip: "192.168.1.254", battery: 99, added: false }]);
   if (cmd === "set_layout") demo.layout = args.layout;
   if (cmd === "assign_tile") demo.tiles[args.tile] = args.id;
+  if (cmd === "swap_tiles") [demo.tiles[args.a], demo.tiles[args.b]] = [demo.tiles[args.b], demo.tiles[args.a]];
   return Promise.resolve(cmd === "get_state" ? structuredClone(demo) : null);
 }

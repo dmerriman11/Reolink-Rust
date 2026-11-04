@@ -75,9 +75,13 @@ Keys: Space, ← → (Shift: 1 min), Home / End, , . (frame), [ ] (speed), I / O
 The day list and arrows step between days that have recordings; a time box jumps to a time (a gap plays the next
 recording and says so). Clip In/Out can be typed as times; the export result stays on screen with Show in folder.
 
+Arrange the live grid: drag a camera by its name onto another tile to swap them (or onto an empty one to move it),
+and drag the borders between tiles to resize rows and columns. Each layout remembers its proportions; double-click
+a border to make them equal again. Video keeps playing throughout.
+
 Live view health: a tile whose camera stops sending frames says "No new video for N s" with a Reconnect button
 (the app also reconnects by itself after 20 s); an offline tile shows why, with Retry now. Recording paused (tray)
-shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Enter for single
+shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Shift+arrows move its camera, Enter for single
 view, Esc back; hold Enter/Space on a PTZ arrow to move; schedule grids take arrows, Space, and Shift+arrows to paint.
 
 Tray (0.4.1): minimizing or closing hides the window to the tray (left-click to show it again). The tray's

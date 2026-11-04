@@ -354,6 +354,18 @@ fn assign_tile(app: State<App>, tile: usize, id: Option<u64>) -> Result<(), Stri
     Ok(())
 }
 
+/// Exchange two tiles in one step: the set of cameras on screen doesn't change, so no stream is told to stop.
+#[tauri::command(async)]
+fn swap_tiles(app: State<App>, a: usize, b: usize) -> Result<(), String> {
+    let mut inner = app.inner.lock().unwrap();
+    if a.max(b) >= inner.tiles.len() {
+        return Err("bad tile".into());
+    }
+    inner.tiles.swap(a, b);
+    inner.changed();
+    Ok(())
+}
+
 #[tauri::command]
 fn set_solo(app: State<App>, tile: Option<usize>) {
     let mut inner = app.inner.lock().unwrap();
@@ -905,7 +917,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(app)
         .invoke_handler(tauri::generate_handler![
-            get_state, device_config, save_device, remove_device, set_layout, assign_tile,
+            get_state, device_config, save_device, remove_device, set_layout, assign_tile, swap_tiles,
             set_clear, ptz, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
