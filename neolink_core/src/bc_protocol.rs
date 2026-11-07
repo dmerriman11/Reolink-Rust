@@ -71,6 +71,8 @@ enum ReadKind {
 /// This is the primary struct of this library when interacting with the camera
 ///
 pub struct BcCamera {
+    /// Name from the options, for logs
+    name: String,
     channel_id: u8,
     connection: Arc<BcConnection>,
     logged_in: AtomicBool,
@@ -362,6 +364,7 @@ impl BcCamera {
         let me = Self {
             connection: Arc::new(conn),
             message_num: AtomicU16::new(0),
+            name: options.name.clone(),
             channel_id: options.channel_id,
             logged_in: AtomicBool::new(false),
             aes: AtomicBool::new(false),

@@ -161,6 +161,16 @@ impl MotionData {
     }
 }
 
+/// Only video motion (`status`) counts: it is what the motion detection area limits. An AI-only alert
+/// (`status="none"`, `AItype="people"`) comes from the AI zones, which the area doesn't cover.
+fn classify(ev: &AlarmEvent) -> MotionStatus {
+    if ev.status != "none" {
+        MotionStatus::Start(Instant::now())
+    } else {
+        MotionStatus::Stop(Instant::now())
+    }
+}
+
 impl BcCamera {
     /// This message tells the camera to send the motion events to us
     /// Which are the recieved on msgid 33
@@ -214,6 +224,7 @@ impl BcCamera {
 
         let mut set = JoinSet::new();
         let channel_id = self.channel_id;
+        let name = self.name.clone();
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
         set.spawn(async move {
@@ -239,19 +250,9 @@ impl BcCamera {
                                     let mut result = MotionStatus::NoChange(Instant::now());
                                     for alarm_event in &alarm_event_list.alarm_events {
                                         if alarm_event.channel_id == channel_id {
-                                            if alarm_event.status != "none"
-                                                || alarm_event
-                                                    .ai_type
-                                                    .as_ref()
-                                                    .map(|ai_type| ai_type != "none")
-                                                    .unwrap_or(false)
-                                            {
-                                                result = MotionStatus::Start(Instant::now());
-                                                break;
-                                            } else {
-                                                result = MotionStatus::Stop(Instant::now());
-                                                break;
-                                            }
+                                            log::info!("{name}: alarm status={} AItype={}", alarm_event.status, alarm_event.ai_type.as_deref().unwrap_or("-"));
+                                            result = classify(alarm_event);
+                                            break;
                                         }
                                     }
                                     Ok(result)
@@ -292,5 +293,23 @@ impl Drop for MotionData {
             while handle.join_next().await.is_some() {}
             log::trace!("Dropped MotionData");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(status: &str, ai: Option<&str>) -> AlarmEvent {
+        AlarmEvent { status: status.into(), ai_type: ai.map(Into::into), ..Default::default() }
+    }
+
+    #[test]
+    fn only_video_motion_starts_motion() {
+        assert!(matches!(classify(&ev("MD", Some("none"))), MotionStatus::Start(_)));
+        assert!(matches!(classify(&ev("MD", None)), MotionStatus::Start(_)));
+        assert!(matches!(classify(&ev("MD", Some("people"))), MotionStatus::Start(_)));
+        assert!(matches!(classify(&ev("none", Some("people"))), MotionStatus::Stop(_)));
+        assert!(matches!(classify(&ev("none", Some("none"))), MotionStatus::Stop(_)));
     }
 }
