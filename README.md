@@ -103,11 +103,12 @@ Reboot a saved camera and time its reconnect: `cargo run --example reboot_check 
 
 Current version: **0.4.17**.
 
-Next phases toward parity with the official client:
-1. Live audio playback; PTZ presets and optical zoom/focus
-2. Expanded NVR compatibility, playback while SD clips download, and motion markers on the timeline
-3. Alarm/motion notifications and event log; firmware update
-4. Users, Wi-Fi network switching, AI detection config (need protocol work; read-only today)
+Next phases toward parity with the official client (already in place: two-way talk, digital zoom, light/siren,
+motion beep, camera push-notification settings, firmware version and auto-update toggle, Wi-Fi signal, NVR channels):
+1. Live audio playback (talk only sends audio today); PTZ presets and optical zoom/focus (PTZ is pan/tilt only)
+2. Playback: motion/AI markers on the timeline, play SD clips while they download, more NVR models tested
+3. Desktop motion notifications and an event log (today: a beep and a motion counter); manual firmware update
+4. Edit users, switch Wi-Fi networks, configure AI detection (need protocol work; read-only today)
 
 ## Patching the official client instead
 
