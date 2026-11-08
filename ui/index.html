@@ -19,7 +19,7 @@
       </button>
       <button class="view-btn" id="view-playback" aria-pressed="false">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l5.5-3.5z"/></svg>
-        Playback
+        Playback &amp; events
       </button>
     </nav>
     <div class="section-head">
@@ -82,7 +82,28 @@
           <button data-dir="right" class="d-right" aria-label="Pan right"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-dir="down" class="d-down" aria-label="Tilt down"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
         </div>
+        <div id="lens-zoom" hidden aria-label="Optical zoom">
+          <button type="button" data-dir="zoom_out">Zoom −</button>
+          <button type="button" data-dir="zoom_in">Zoom +</button>
+        </div>
+        <div id="lens-focus" hidden aria-label="Lens focus">
+          <button type="button" data-dir="focus_near">Focus near</button>
+          <button type="button" data-dir="focus_far">Focus far</button>
+        </div>
         <p class="ptz-hint">Hold to move</p>
+        <section class="ptz-presets" aria-label="PTZ presets">
+          <button type="button" id="preset-refresh">Load presets</button>
+          <form id="preset-form" hidden>
+            <fieldset id="preset-controls">
+              <legend>Presets</legend>
+              <div id="preset-list" aria-label="Saved positions"></div>
+              <label for="preset-name">Position name</label>
+              <input id="preset-name" name="name" required autocomplete="off">
+              <button type="submit">Save position</button>
+            </fieldset>
+          </form>
+          <p id="preset-status" role="status"></p>
+        </section>
       </div>
     </aside>
     <button class="fs-exit" id="fs-exit" title="Exit full screen (Esc)" aria-label="Exit full screen">
@@ -137,11 +158,17 @@
       <aside class="pb-files">
         <div class="section-head">
           <h2 id="pb-files-title">Recordings</h2>
+          <div class="seg pb-tabs" role="group" aria-label="List">
+            <button id="pb-tab-files" aria-pressed="true">Clips</button>
+            <button id="pb-tab-events" aria-pressed="false">Events</button>
+          </div>
           <button class="icon-btn" id="pb-list-thumbs" aria-pressed="false" title="Show thumbnails" aria-label="Show thumbnails in the list">
             <svg viewBox="0 0 24 24"><rect x="3" y="5" width="7" height="5" rx="1"/><rect x="3" y="14" width="7" height="5" rx="1"/><path d="M13 7.5h8M13 16.5h8"/></svg>
           </button>
         </div>
         <ul class="pb-file-list" id="pb-file-list"></ul>
+        <select id="pb-event-cam" aria-label="Events from camera" hidden><option value="">All cameras</option></select>
+        <ul class="pb-file-list" id="pb-event-list" hidden></ul>
       </aside>
       <section class="pb-player" id="pb-player">
         <video id="pb-video" preload="auto" playsinline></video>
@@ -256,7 +283,10 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="playout.js"></script>
+  <script src="audioplayout.js"></script>
   <script src="gridlayout.js"></script>
+  <script src="events.js"></script>
+  <script src="sdfeed.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

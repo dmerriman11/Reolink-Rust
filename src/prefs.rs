@@ -25,6 +25,8 @@ pub struct Prefs {
     /// Beep when a camera reports motion (official "Alarm beep"), at this volume 0-100.
     pub alarm_beep: bool,
     pub alarm_volume: u32,
+    /// Desktop notification on motion start (throttled per camera, not while that camera is on screen live).
+    pub notify_motion: bool,
     /// Local recording without pressing Record (official "Local record schedule"): "off", "motion", "continuous".
     pub local_record: String,
     /// Hours it applies: 7x24 '0'/'1', Sunday first, local time.
@@ -51,6 +53,7 @@ impl Default for Prefs {
             scan_network: true,
             alarm_beep: false,
             alarm_volume: 60,
+            notify_motion: false,
             local_record: "off".into(),
             record_schedule: "1".repeat(168),
         }

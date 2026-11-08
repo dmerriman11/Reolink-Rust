@@ -228,3 +228,12 @@ fn main() -> anyhow::Result<()> {
     println!("{}", if all_ok { "ALL PASS" } else { "SOME CHECKS FAILED" });
     Ok(())
 }
+
+#[path = "../src/talk.rs"]
+mod talk;
+
+#[path = "../src/audio.rs"]
+mod audio;
+
+#[path = "../src/events.rs"]
+mod events;

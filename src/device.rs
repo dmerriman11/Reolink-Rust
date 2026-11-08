@@ -31,12 +31,14 @@ pub type Frame = Option<Arc<Vec<u8>>>;
 pub struct Views {
     pub jpeg: watch::Sender<Frame>,
     pub raw: crate::media::RawFeed,
+    pub audio: crate::audio::Feed,
 }
 
 impl Views {
     fn stop(&self) {
         self.jpeg.send_replace(None);
         self.raw.clear();
+        self.audio.clear();
     }
 }
 
@@ -65,9 +67,108 @@ pub struct DeviceConfig {
 /// Reply channel for request/response commands.
 pub type Reply<T> = tokio::sync::oneshot::Sender<Result<T, String>>;
 
+#[derive(Clone, Serialize)]
+pub struct PtzPreset {
+    pub id: u8,
+    pub name: String,
+}
+
+pub enum PresetAction {
+    List,
+    Go(u8),
+    Save(String),
+    Rename(u8, String),
+    Delete(u8),
+}
+
+fn optical_ptz(ptz_type: Option<u32>) -> bool {
+    matches!(ptz_type, Some(1 | 2 | 4 | 5))
+}
+
+fn free_preset_id(presets: &[PtzPreset]) -> Result<u8, String> {
+    // Official SDK preset builder accepts IDs 0..63.
+    (0..64).find(|id| !presets.iter().any(|p| p.id == *id))
+        .ok_or_else(|| "All 64 preset slots are occupied".into())
+}
+
+async fn preset_command(cam: &BcCamera, action: PresetAction) -> Result<Vec<PtzPreset>, String> {
+    if let PresetAction::Save(name) | PresetAction::Rename(_, name) = &action {
+        if name.trim().is_empty() || name.trim().len() > 31 || name.chars().any(char::is_control) {
+            return Err("Enter a preset name of 1-31 UTF-8 bytes without control characters".into());
+        }
+    }
+    let xml = cam.get_ptz_preset().await.map_err(|e| e.to_string())?;
+    let mut presets: Vec<_> = xml.preset_list.preset.into_iter()
+        .map(|p| PtzPreset { id: p.id, name: p.name.unwrap_or_else(|| format!("Preset {}", p.id)) })
+        .collect();
+    match action {
+        PresetAction::List => {},
+        PresetAction::Go(id) => {
+            if !presets.iter().any(|p| p.id == id) { return Err("Preset no longer exists; refresh the list".into()); }
+            cam.moveto_ptz_preset(id).await.map_err(|e| e.to_string())?;
+        },
+        PresetAction::Rename(id, name) => {
+            let preset = presets.iter_mut().find(|p| p.id == id)
+                .ok_or("Preset no longer exists; refresh the list")?;
+            let name = name.trim().to_owned();
+            cam.rename_ptz_preset(id, name.clone()).await.map_err(|e| e.to_string())?;
+            preset.name = name;
+        },
+        PresetAction::Delete(id) => {
+            if !presets.iter().any(|p| p.id == id) { return Err("Preset no longer exists; refresh the list".into()); }
+            cam.delete_ptz_preset(id).await.map_err(|e| e.to_string())?;
+            presets.retain(|p| p.id != id);
+        },
+        PresetAction::Save(name) => {
+            let id = free_preset_id(&presets)?;
+            let name = name.trim().to_owned();
+            cam.set_ptz_preset(id, name.clone()).await.map_err(|e| e.to_string())?;
+            presets.push(PtzPreset { id, name });
+        },
+    }
+    presets.sort_by_key(|p| p.id);
+    Ok(presets)
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+    #[test]
+    fn parses_preset_lists_without_commands() {
+        use neolink_core::bc::xml::PtzPreset;
+        let xml = r#"<PtzPreset version="1.1"><channelId>3</channelId><presetList><preset><id>1</id><name>Gate &amp; yard</name></preset><preset><id>4</id><command>toPos</command></preset></presetList></PtzPreset>"#;
+        let parsed: PtzPreset = quick_xml::de::from_str(xml).unwrap();
+        assert_eq!(parsed.channel_id, 3);
+        assert_eq!(parsed.preset_list.preset[0].name.as_deref(), Some("Gate & yard"));
+        assert!(parsed.preset_list.preset[0].command.is_empty());
+        assert_eq!(parsed.preset_list.preset[1].name, None);
+        let empty: PtzPreset = quick_xml::de::from_str(r#"<PtzPreset version="1.1"><channelId>0</channelId><presetList/></PtzPreset>"#).unwrap();
+        assert!(empty.preset_list.preset.is_empty());
+    }
+    #[test]
+    fn optical_lens_requires_known_ability() {
+        for t in [None, Some(0), Some(3), Some(6), Some(u32::MAX)] { assert!(!optical_ptz(t)); }
+        for t in [1, 2, 4, 5] { assert!(optical_ptz(Some(t))); }
+    }
+    #[test]
+    fn lowest_free_slot_never_overwrites() {
+        let p = |id| PtzPreset { id, name: String::new() };
+        assert_eq!(free_preset_id(&[]), Ok(0));
+        assert_eq!(free_preset_id(&[p(3), p(1), p(1), p(0), p(255)]), Ok(2));
+        let mut full: Vec<_> = (0..64).map(p).collect();
+        assert!(free_preset_id(&full).is_err());
+        full.pop();
+        assert_eq!(free_preset_id(&full), Ok(63));
+    }
+}
+
 pub enum Cmd {
+    PtzPreset { action: PresetAction, reply: Reply<Vec<PtzPreset>> },
     SdSearch { day: String, reply: Reply<Vec<crate::sd::Clip>> },
-    SdDownload { start: String, end: String, cache: PathBuf, reply: Reply<PathBuf> },
+    /// Download a clip to `dest`, reporting into `progress` (see sd::Progress); replaces no reply.
+    SdDownload { start: String, end: String, dest: PathBuf, progress: crate::sd::Shared },
+    /// Camera user accounts (messages 58/59); see users_command.
+    Users { action: UserAction, reply: Reply<Vec<UserInfo>> },
     /// Read (`set: None`) or write a settings message; replies with the camera's XML (empty for writes).
     Xml { msg: crate::settings::Msg, set: Option<String>, reply: Reply<String> },
     Reboot(Reply<()>),
@@ -89,6 +190,92 @@ pub enum Cmd {
     Reconnect,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct UserInfo {
+    pub name: String,
+    pub admin: bool,
+    /// The account this app signs in with; it can't be changed or removed from here.
+    pub own: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum UserAction {
+    List,
+    Add { name: String, password: String, admin: bool },
+    Password { name: String, password: String },
+    Delete { name: String },
+}
+
+/// Limits from the SDK structs (BC_MAX_NAME_LEN 32 incl. NUL) and the camera's own password rule.
+pub fn validate_user(name: &str, password: Option<&str>) -> Result<(), String> {
+    if name.is_empty() || name.len() > 31 || name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("User name: 1–31 characters, no spaces".into());
+    }
+    if let Some(p) = password && (p.len() < 6 || p.len() > 31 || p.chars().any(|c| c.is_control() || c.is_whitespace())) {
+        return Err("Password: 6–31 characters, no spaces".into());
+    }
+    Ok(())
+}
+
+/// Which users may be changed: never the account this app uses (its stored credentials would stop working) and
+/// never an administrator's removal, so the camera can't be locked out from here.
+fn user_change_allowed(action: &UserAction, users: &[UserInfo]) -> Result<(), String> {
+    let target = match action { UserAction::Password { name, .. } | UserAction::Delete { name } => name, _ => return Ok(()) };
+    let Some(u) = users.iter().find(|u| &u.name == target) else { return Err(format!("No user {target}")) };
+    if u.own { return Err("This is the account Reolink-rs signs in with; change it in the camera's settings (Edit camera) instead".into()); }
+    if u.admin && matches!(action, UserAction::Delete { .. }) { return Err("Administrator accounts can't be deleted from here".into()); }
+    Ok(())
+}
+
+/// List, add, re-password or delete camera users; always answers with the list as the camera has it afterwards.
+async fn users_command(cam: &BcCamera, login: &str, action: UserAction) -> Result<Vec<UserInfo>, String> {
+    let list = |l: neolink_core::bc::xml::UserList| -> Vec<UserInfo> {
+        l.user_list.unwrap_or_default().into_iter().map(|u| UserInfo { own: u.user_name == login, admin: u.user_level == 1, name: u.user_name }).collect()
+    };
+    let wait = Duration::from_secs(20);
+    let users = list(tokio::time::timeout(wait, cam.get_users()).await.map_err(|_| "camera didn't answer")?.map_err(|e| match e {
+        neolink_core::Error::CameraServiceUnavailable { .. } => "This camera has no user accounts to manage (battery cameras refuse the user list)".to_string(),
+        e => e.to_string(),
+    })?);
+    user_change_allowed(&action, &users)?;
+    let r = match &action {
+        UserAction::List => return Ok(users),
+        UserAction::Add { name, password, admin } => { validate_user(name, Some(password))?; tokio::time::timeout(wait, cam.add_user(name.clone(), password.clone(), u8::from(*admin))).await }
+        UserAction::Password { name, password } => { validate_user(name, Some(password))?; tokio::time::timeout(wait, cam.modify_user(name.clone(), password.clone())).await }
+        UserAction::Delete { name } => tokio::time::timeout(wait, cam.delete_user(name.clone())).await,
+    };
+    r.map_err(|_| "camera didn't answer")?.map_err(|e| e.to_string())?;
+    Ok(list(tokio::time::timeout(wait, cam.get_users()).await.map_err(|_| "camera didn't answer")?.map_err(|e| e.to_string())?))
+}
+
+#[cfg(test)]
+mod user_tests {
+    use super::*;
+    fn users() -> Vec<UserInfo> {
+        vec![UserInfo { name: "admin".into(), admin: true, own: true }, UserInfo { name: "boss".into(), admin: true, own: false }, UserInfo { name: "kid".into(), admin: false, own: false }]
+    }
+    #[test]
+    fn own_and_admin_accounts_are_protected() {
+        let u = users();
+        assert!(user_change_allowed(&UserAction::Delete { name: "admin".into() }, &u).is_err());
+        assert!(user_change_allowed(&UserAction::Password { name: "admin".into(), password: "x".into() }, &u).is_err());
+        assert!(user_change_allowed(&UserAction::Delete { name: "boss".into() }, &u).is_err());
+        assert!(user_change_allowed(&UserAction::Password { name: "boss".into(), password: "x".into() }, &u).is_ok());
+        assert!(user_change_allowed(&UserAction::Delete { name: "kid".into() }, &u).is_ok());
+        assert!(user_change_allowed(&UserAction::Delete { name: "nobody".into() }, &u).is_err());
+        assert!(user_change_allowed(&UserAction::Add { name: "new".into(), password: "secret1".into(), admin: false }, &u).is_ok());
+    }
+    #[test]
+    fn user_fields_have_sdk_limits() {
+        assert!(validate_user("guest", Some("secret1")).is_ok());
+        assert!(validate_user("", Some("secret1")).is_err());
+        assert!(validate_user("a b", Some("secret1")).is_err());
+        assert!(validate_user(&"x".repeat(32), None).is_err());
+        assert!(validate_user("guest", Some("short")).is_err());
+    }
+}
+
 #[derive(Default)]
 pub struct State {
     pub status: String,
@@ -97,6 +284,10 @@ pub struct State {
     pub charging: bool,
     /// Wi-Fi RSSI in dBm; None for wired cameras or before the first reading.
     pub wifi_dbm: Option<i32>,
+    /// Audio has arrived on the current camera stream.
+    pub audio: bool,
+    pub lens_zoom: bool,
+    pub lens_focus: bool,
     pub live: Option<StreamKind>,
     pub recording: Option<PathBuf>,
     pub message: Option<String>,
@@ -206,6 +397,7 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
         {
             let mut s = state.lock().unwrap();
             s.online = false;
+            s.audio = false;
             s.recording = None;
             s.status = format!("Reconnecting in {backoff}s: {err:#}");
         }
@@ -223,8 +415,10 @@ async fn run(cfg: DeviceConfig, mut rx: UnboundedReceiver<Cmd>, state: Arc<Mutex
                     Some(Cmd::Record(r)) => wanted.record = r,
                     Some(Cmd::View(b)) => wanted.jpeg_box = b,
                     Some(Cmd::SdSearch { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
-                    Some(Cmd::SdDownload { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::SdDownload { progress, .. }) => { let mut p = progress.lock().unwrap(); p.done = true; p.error = Some("camera is offline".into()); }
+                    Some(Cmd::Users { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Xml { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
+                    Some(Cmd::PtzPreset { reply, .. }) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Reboot(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::SnapshotJpeg(reply)) => { let _ = reply.send(Err("camera is offline".into())); }
                     Some(Cmd::Reconnect) => { backoff = 1; continue 'run; }
@@ -280,6 +474,7 @@ fn camera_opts(cfg: &DeviceConfig) -> Result<BcCameraOpt> {
 
 struct Live {
     kind: StreamKind,
+    video_us: u32,
     stream: StreamData,
     decoder: Option<Decoder>,
     recorder: Option<Recorder>,
@@ -400,8 +595,18 @@ async fn session(
         anyhow::bail!("camera offered weaker encryption than the AES it used before; refused in case something on the network is intercepting (edit the camera to accept it)");
     }
 
+    // Fail closed: require advertised optical PTZ and a readable lens range.
+    let lens = tokio::time::timeout(CONTROL_TIMEOUT, async {
+        let support = cam.get_support().await.ok()?;
+        let item = support.items.iter().find(|i| i.chn_id == u32::from(cfg.channel))?;
+        if !optical_ptz(item.ptz_type) { return None; }
+        let lens = cam.get_zoom().await.ok()?;
+        Some((lens.zoom.max_pos > lens.zoom.min_pos, lens.focus.max_pos > lens.focus.min_pos))
+    }).await.ok().flatten().unwrap_or((false, false));
     let battery = cam.battery_info().await.ok();
     set(&|s| {
+        s.lens_zoom = lens.0;
+        s.lens_focus = lens.1;
         s.online = true;
         s.status = "Online".into();
         s.aes = cam.is_aes();
@@ -424,6 +629,7 @@ async fn session(
         }
     };
     let mut motion_until: Option<Instant> = None;
+    let mut motion_start: Option<i64> = None; // the open event in the motion log
     let mut auto = false; // the local recording schedule is recording this camera
     let mut schedule_tick = tokio::time::interval(Duration::from_secs(1));
     // Resume what was on screen (and recording) before a drop.
@@ -469,16 +675,27 @@ async fn session(
                     match ev {
                         Ok(MotionStatus::Start(_)) => {
                             motion_until = None;
-                            set(&|s| {
-                                if !s.motion {
+                            let (fresh, on_screen) = {
+                                let mut s = state.lock().unwrap();
+                                let fresh = !s.motion;
+                                if fresh {
                                     s.motion_events += 1;
                                 }
                                 s.motion = true;
-                            });
+                                (fresh, s.live.is_some())
+                            };
+                            if fresh {
+                                let ai = motion.as_ref().and_then(|m| m.last_ai());
+                                motion_start = Some(crate::events::start(&cfg.name, ai.clone()));
+                                crate::events::notify(&cfg.name, ai.as_deref(), on_screen);
+                            }
                         }
                         Ok(MotionStatus::Stop(_)) => {
                             motion_until = Some(Instant::now() + Duration::from_secs(crate::prefs::MOTION_POST_SECS));
                             set(&|s| s.motion = false);
+                            if let Some(start) = motion_start.take() {
+                                crate::events::end(&cfg.name, start, crate::events::now_ms() + crate::prefs::MOTION_POST_SECS as i64 * 1000);
+                            }
                         }
                         Ok(MotionStatus::NoChange(_)) => {}
                         Err(e) => {
@@ -517,11 +734,13 @@ async fn session(
                     if let Some(mut old) = live.take() {
                         let _ = old.stream.shutdown().await;
                     }
+                    set(&|s| s.audio = false);
+                    views.audio.clear();
                     if let Some(k) = want {
                         log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
                         let stream = cam.start_video(k, 0, false).await.context("start live")?;
                         set(&|s| s.last_frame = Some(Instant::now())); // a stream that never sends counts from here
-                        live = Some(Live { kind: k, stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
+                        live = Some(Live { kind: k, video_us: 0, stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
                     }
                 }
                 if let Some(l) = live.as_mut() {
@@ -579,9 +798,27 @@ async fn session(
                 }
             }
             Cmd::Ptz(dir) => {
+                let allowed = {
+                    let s = state.lock().unwrap();
+                    match dir {
+                        Direction::ZoomIn | Direction::ZoomOut => s.lens_zoom,
+                        Direction::FocusNear | Direction::FocusFar => s.lens_focus,
+                        _ => true,
+                    }
+                };
+                if !allowed { set(&|s| s.message = Some("This camera does not advertise that lens control".into())); continue; }
+
                 if let Err(e) = draining(cam.send_ptz(dir, 32.0), &mut live, &cfg.name, state, views).await? {
                     set(&|s| s.message = Some(format!("PTZ: {e}")));
                 }
+            }
+            Cmd::PtzPreset { action, reply } => {
+                // Serialize list-and-save with other controls while continuing to consume live media.
+                let result = draining(tokio::time::timeout(CONTROL_TIMEOUT, preset_command(&cam, action)),
+                    &mut live, &cfg.name, state, views).await?
+                    .unwrap_or_else(|_| Err("Preset request timed out; refresh before retrying a save".into()));
+                if let Err(e) = &result { set(&|s| s.message = Some(format!("PTZ presets: {e}"))); }
+                let _ = reply.send(result);
             }
             Cmd::Light(on) => {
                 let res = draining(cam.set_floodlight_manual(on, LIGHT_SECS), &mut live, &cfg.name, state, views).await?;
@@ -609,9 +846,20 @@ async fn session(
                 let cam=cam.clone(); let channel=cfg.channel;
                 tokio::spawn(async move { let result=tokio::time::timeout(Duration::from_secs(80),crate::sd::search(&cam,channel,&day)).await.unwrap_or_else(|_|Err("SD search timed out".into())); let _=reply.send(result); });
             }
-            Cmd::SdDownload { start, end, cache, reply } => {
+            Cmd::SdDownload { start, end, dest, progress } => {
                 let cam=cam.clone();let channel=cfg.channel;
-                tokio::spawn(async move { let _=reply.send(crate::sd::download(&cam,channel,&start,&end,&cache).await); });
+                let shared = progress.clone();
+                let task = tokio::spawn(async move {
+                    let r = crate::sd::download(cam,channel,&start,&end,dest,&shared).await;
+                    let mut p = shared.lock().unwrap();
+                    p.done = true;
+                    match r { Ok(f) => p.file = Some(f), Err(e) => p.error = Some(e) }
+                });
+                progress.lock().unwrap().abort = Some(task.abort_handle());
+            }
+            Cmd::Users { action, reply } => {
+                let (cam, login) = (cam.clone(), cfg.username.clone());
+                tokio::spawn(async move { let _ = reply.send(users_command(&cam, &login, action).await); });
             }
             Cmd::Xml { msg, set, reply } => {
                 let cam = cam.clone();
@@ -658,8 +906,14 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     let (codec, data, key, us) = match media {
         BcMedia::Iframe(f) => (f.video_type, f.data, true, f.microseconds),
         BcMedia::Pframe(f) => (f.video_type, f.data, false, f.microseconds),
-        _ => return, // shortcut: live audio playback not implemented yet (phase 2)
+        BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
+            state.lock().unwrap().audio = true;
+            if live.show { views.audio.push(media, live.video_us); }
+            return;
+        }
+        _ => return,
     };
+    live.video_us = us;
     state.lock().unwrap().last_frame = Some(Instant::now());
 
     if live.record && live.recorder.is_none() {

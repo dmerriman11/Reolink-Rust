@@ -14,6 +14,30 @@ pub enum Direction {
     Right,
     /// To stop currently active PTZ command
     Stop,
+    /// Increase optical zoom.
+    ZoomIn,
+    /// Decrease optical zoom.
+    ZoomOut,
+    /// Increase focus distance.
+    FocusFar,
+    /// Decrease focus distance.
+    FocusNear,
+}
+
+impl Direction {
+    fn command(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::Left => "left",
+            Direction::Right => "right",
+            Direction::Stop => "stop",
+            Direction::ZoomIn => "zoomInc",
+            Direction::ZoomOut => "zoomDec",
+            Direction::FocusFar => "focusDec",
+            Direction::FocusNear => "focusInc",
+        }
+    }
 }
 
 impl BcCamera {
@@ -24,14 +48,7 @@ impl BcCamera {
         let msg_num = self.new_message_num();
         let mut sub_set = connection.subscribe(MSG_ID_PTZ_CONTROL, msg_num).await?;
 
-        let direction_str = match direction {
-            Direction::Up => "up",
-            Direction::Down => "down",
-            Direction::Left => "left",
-            Direction::Right => "right",
-            Direction::Stop => "stop",
-        }
-        .to_string();
+        let direction_str = direction.command().to_owned();
         let send = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_PTZ_CONTROL,
@@ -124,6 +141,20 @@ impl BcCamera {
     ///
     /// The current position will be saved as a preset with the given [preset_id] and [name]
     pub async fn set_ptz_preset(&self, preset_id: u8, name: String) -> Result<()> {
+        self.write_ptz_preset(Preset { id: preset_id, name: Some(name), command: "setPos".into() }).await
+    }
+
+    /// Rename without changing the stored position (the SDK omits command).
+    pub async fn rename_ptz_preset(&self, preset_id: u8, name: String) -> Result<()> {
+        self.write_ptz_preset(Preset { id: preset_id, name: Some(name), command: String::new() }).await
+    }
+
+    /// Remove a stored preset.
+    pub async fn delete_ptz_preset(&self, preset_id: u8) -> Result<()> {
+        self.write_ptz_preset(Preset { id: preset_id, name: None, command: "delPos".into() }).await
+    }
+
+    async fn write_ptz_preset(&self, preset: Preset) -> Result<()> {
         self.has_ability_rw("control").await?;
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
@@ -131,11 +162,6 @@ impl BcCamera {
             .subscribe(MSG_ID_PTZ_CONTROL_PRESET, msg_num)
             .await?;
 
-        let preset = Preset {
-            id: preset_id,
-            name: Some(name),
-            command: "setPos".to_owned(),
-        };
         let send = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_PTZ_CONTROL_PRESET,
@@ -156,7 +182,8 @@ impl BcCamera {
                         preset_list: PresetList {
                             preset: vec![preset],
                         },
-                        ..Default::default()
+                        version: xml_ver(),
+                        channel_id: self.channel_id,
                     }),
                     ..Default::default()
                 })),
@@ -213,7 +240,8 @@ impl BcCamera {
                         preset_list: PresetList {
                             preset: vec![preset],
                         },
-                        ..Default::default()
+                        version: xml_ver(),
+                        channel_id: self.channel_id,
                     }),
                     ..Default::default()
                 })),
@@ -339,5 +367,35 @@ impl BcCamera {
                 why: "Expected PtzZoomFocus xml but it was not recieved",
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod lens_preset_tests {
+    use super::*;
+
+    #[test]
+    fn lens_xml_matches_official_builder() {
+        for (direction, command) in [(Direction::ZoomIn, "zoomInc"), (Direction::ZoomOut, "zoomDec"),
+            (Direction::FocusNear, "focusInc"), (Direction::FocusFar, "focusDec"), (Direction::Stop, "stop")] {
+            let xml = quick_xml::se::to_string(&PtzControl { version: xml_ver(), channel_id: 2,
+                speed: 32.0, command: direction.command().into() }).unwrap();
+            assert!(xml.contains(&format!("<command>{command}</command>")));
+            assert!(xml.contains("<channelId>2</channelId>"));
+        }
+    }
+
+    #[test]
+    fn rename_omits_command_and_escapes_name_delete_is_explicit() {
+        let mut preset = Preset { id: 0, name: Some("Gate & <yard>".into()), command: String::new() };
+        let xml = quick_xml::se::to_string(&preset).unwrap();
+        assert!(!xml.contains("command"));
+        assert!(xml.contains("Gate &amp; &lt;yard&gt;"));
+        assert!(xml.contains("<id>0</id>"));
+        preset.command = "delPos".into();
+        preset.name = None;
+        let xml = quick_xml::se::to_string(&preset).unwrap();
+        assert!(xml.contains("<command>delPos</command>"));
+        assert!(!xml.contains("<name"));
     }
 }

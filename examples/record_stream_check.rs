@@ -87,3 +87,12 @@ fn main() -> anyhow::Result<()> {
     println!("file {} {} KB, fragmented", files[0].file_name().to_string_lossy(), bytes.len() / 1024);
     Ok(())
 }
+
+#[path = "../src/talk.rs"]
+mod talk;
+
+#[path = "../src/audio.rs"]
+mod audio;
+
+#[path = "../src/events.rs"]
+mod events;

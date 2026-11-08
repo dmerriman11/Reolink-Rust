@@ -11,6 +11,8 @@ mod secrets;
 mod settings;
 mod stream;
 mod talk;
+mod audio;
+mod events;
 
 use device::{Cmd, Device, DeviceConfig};
 use neolink_core::bc_protocol::{Direction, StreamKind};
@@ -182,6 +184,9 @@ struct DeviceDto {
     battery: Option<u32>,
     charging: bool,
     wifi_dbm: Option<i32>,
+    audio: bool,
+    lens_zoom: bool,
+    lens_focus: bool,
     wifi_level: Option<u8>,
     live: Option<&'static str>,
     clear: bool,
@@ -235,6 +240,9 @@ fn get_state(app: State<App>) -> StateDto {
                 battery: s.battery,
                 charging: s.charging,
                 wifi_dbm: s.wifi_dbm,
+                audio: s.audio,
+                lens_zoom: s.lens_zoom,
+                lens_focus: s.lens_focus,
                 wifi_level: s.wifi_dbm.map(device::wifi_level),
                 live: s.live.map(|k| if k == StreamKind::Main { "main" } else { "sub" }),
                 clear: inner.clear.contains(&d.id),
@@ -420,9 +428,45 @@ fn ptz(app: State<App>, id: u64, dir: String) -> Result<(), String> {
         "left" => Direction::Left,
         "right" => Direction::Right,
         "stop" => Direction::Stop,
+        "zoom_in" => Direction::ZoomIn,
+        "zoom_out" => Direction::ZoomOut,
+        "focus_near" => Direction::FocusNear,
+        "focus_far" => Direction::FocusFar,
         _ => return Err("bad direction".into()),
     };
     send(&app, id, Cmd::Ptz(dir))
+}
+
+async fn request_ptz_presets(app: &State<'_, App>, id: u64, action: device::PresetAction) -> Result<Vec<device::PtzPreset>, String> {
+    let tx = device_cam(app, id)?.0;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Cmd::PtzPreset { action, reply }).map_err(|_| "device was removed".to_string())?;
+    rx.await.map_err(|_| "device restarted; refresh presets before retrying".to_string())?
+}
+
+#[tauri::command]
+async fn ptz_presets(app: State<'_, App>, id: u64) -> Result<Vec<device::PtzPreset>, String> {
+    request_ptz_presets(&app, id, device::PresetAction::List).await
+}
+
+#[tauri::command]
+async fn ptz_preset_go(app: State<'_, App>, id: u64, preset_id: u8) -> Result<Vec<device::PtzPreset>, String> {
+    request_ptz_presets(&app, id, device::PresetAction::Go(preset_id)).await
+}
+
+#[tauri::command]
+async fn ptz_preset_rename(app: State<'_, App>, id: u64, preset_id: u8, name: String) -> Result<Vec<device::PtzPreset>, String> {
+    request_ptz_presets(&app, id, device::PresetAction::Rename(preset_id, name)).await
+}
+
+#[tauri::command]
+async fn ptz_preset_delete(app: State<'_, App>, id: u64, preset_id: u8) -> Result<Vec<device::PtzPreset>, String> {
+    request_ptz_presets(&app, id, device::PresetAction::Delete(preset_id)).await
+}
+
+#[tauri::command]
+async fn ptz_preset_save(app: State<'_, App>, id: u64, name: String) -> Result<Vec<device::PtzPreset>, String> {
+    request_ptz_presets(&app, id, device::PresetAction::Save(name)).await
 }
 
 #[tauri::command]
@@ -596,7 +640,31 @@ struct PageInfo {
 
 #[tauri::command]
 fn camera_pages() -> Vec<PageInfo> {
-    settings::PAGES.iter().map(|p| PageInfo { id: p.id, title: p.title }).collect()
+    // "users" is not a settings page: the dialog renders it from the user commands below.
+    settings::PAGES.iter().map(|p| PageInfo { id: p.id, title: p.title }).chain([PageInfo { id: "users", title: "Users" }]).collect()
+}
+
+async fn user_command(app: &State<'_, App>, id: u64, action: device::UserAction) -> Result<Vec<device::UserInfo>, String> {
+    let tx = device_cam(app, id)?.0;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Cmd::Users { action, reply }).map_err(|_| "device was removed".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), rx).await.map_err(|_| "camera didn't answer in time")?.map_err(|_| "Camera session ended")?
+}
+#[tauri::command]
+async fn camera_users(app: State<'_, App>, id: u64) -> Result<Vec<device::UserInfo>, String> {
+    user_command(&app, id, device::UserAction::List).await
+}
+#[tauri::command]
+async fn camera_user_add(app: State<'_, App>, id: u64, name: String, password: String, admin: bool) -> Result<Vec<device::UserInfo>, String> {
+    user_command(&app, id, device::UserAction::Add { name, password, admin }).await
+}
+#[tauri::command]
+async fn camera_user_password(app: State<'_, App>, id: u64, name: String, password: String) -> Result<Vec<device::UserInfo>, String> {
+    user_command(&app, id, device::UserAction::Password { name, password }).await
+}
+#[tauri::command]
+async fn camera_user_delete(app: State<'_, App>, id: u64, name: String) -> Result<Vec<device::UserInfo>, String> {
+    user_command(&app, id, device::UserAction::Delete { name }).await
 }
 
 #[tauri::command]
@@ -663,6 +731,12 @@ async fn reboot_camera(app: State<'_, App>, id: u64) -> Result<(), String> {
         .await
         .map_err(|_| "camera didn't answer in time".to_string())?
         .map_err(|_| "device restarted; try again".to_string())?
+}
+
+/// Motion events overlapping [from, to) in unix ms, newest first.
+#[tauri::command]
+fn motion_events(from: i64, to: i64) -> Vec<events::Event> {
+    events::range(from, to)
 }
 
 #[tauri::command]
@@ -756,8 +830,13 @@ async fn sd_recordings(app: State<'_,App>, id:u64, day:String) -> Result<Vec<sd:
     tx.send(Cmd::SdSearch{day,reply}).map_err(|_|"Camera removed")?;
     tokio::time::timeout(std::time::Duration::from_secs(90),rx).await.map_err(|_|"SD search timed out")?.map_err(|_|"Camera session ended")?
 }
+/// The one SD download at a time: starting another aborts it (the page has moved on), so the camera and ffmpeg
+/// never serve two clips at once.
+static SD_DOWNLOAD: Mutex<Option<sd::Shared>> = Mutex::new(None);
+
+/// Start (or find) the download of a clip; the page then polls `sd_recording_progress` with the returned key.
 #[tauri::command]
-async fn sd_recording_file(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:String,end:String) -> Result<String,String> {
+fn sd_recording_start(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:String,end:String) -> Result<sd::Progress,String> {
     use std::hash::{Hash,Hasher};
     let (tx,cache)={
         let inner=app.inner.lock().unwrap();let d=&inner.devices[inner.index(id)?];
@@ -765,13 +844,32 @@ async fn sd_recording_file(handle:tauri::AppHandle,app: State<'_,App>,id:u64,sta
         (&d.config.host,&d.config.uid,d.config.channel).hash(&mut h);
         (d.sender(),handle.path().app_cache_dir().map_err(|e|e.to_string())?.join("sd").join(format!("{:x}",h.finish())))
     };
-    // Serialize downloads so repeated clicks cannot write the same temporary file concurrently.
-    static DOWNLOAD:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());
-    let _guard=DOWNLOAD.lock().await;
-    let (reply,rx)=tokio::sync::oneshot::channel();
-    tx.send(Cmd::SdDownload{start,end,cache,reply}).map_err(|_|"Camera removed")?;
-    let path=rx.await.map_err(|_|"Camera session ended")??;
-    allow_asset(&handle,&path);Ok(path.to_string_lossy().into_owned())
+    let dest=sd::dest(&cache,&start,&end)?;
+    let key=dest.to_string_lossy().into_owned();
+    let mut current=SD_DOWNLOAD.lock().unwrap();
+    if let Some(p)=current.as_ref() && p.lock().unwrap().key==key { return Ok(sd_progress(&handle,p)); }
+    if let Some(p)=current.take() && let Some(a)=p.lock().unwrap().abort.take() { a.abort(); }
+    let progress: sd::Shared=std::sync::Arc::new(Mutex::new(sd::Progress { key, ..Default::default() }));
+    if dest.is_file() {
+        let mut p=progress.lock().unwrap(); p.done=true; p.file=Some(dest);
+    } else {
+        tx.send(Cmd::SdDownload{start,end,dest,progress:progress.clone()}).map_err(|_|"Camera removed")?;
+    }
+    *current=Some(progress.clone());
+    Ok(sd_progress(&handle,&progress))
+}
+#[tauri::command]
+fn sd_recording_progress(handle:tauri::AppHandle,key:String) -> Result<sd::Progress,String> {
+    let current=SD_DOWNLOAD.lock().unwrap();
+    match current.as_ref() {
+        Some(p) if p.lock().unwrap().key==key => Ok(sd_progress(&handle,p)),
+        _ => Err("This download was replaced by another clip".into()),
+    }
+}
+fn sd_progress(handle:&tauri::AppHandle,p:&sd::Shared) -> sd::Progress {
+    let snap=sd::snapshot(p);
+    for f in snap.tracks.iter().map(|t|&t.path).chain(snap.file.iter()) { allow_asset(handle,f); }
+    snap
 }
 
 fn allow_asset(handle: &tauri::AppHandle, file: &Path) {
@@ -963,16 +1061,22 @@ fn main() {
         // Must be first: a second launch shows this instance's window and exits before setting anything up.
         .plugin(tauri_plugin_single_instance::init(|handle, _, _| show_window(handle)))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app)
         .invoke_handler(tauri::generate_handler![
             get_state, device_config, save_device, remove_device, set_layout, assign_tile, swap_tiles,
-            set_clear, ptz, light, siren, talk_start, talk_audio, talk_stop, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
+            set_clear, ptz, ptz_presets, ptz_preset_go, ptz_preset_save, ptz_preset_rename, ptz_preset_delete, light, siren, talk_start, talk_audio, talk_stop, snapshot, record, open_media_folder, scan_lan, set_solo, set_view_sizes,
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
-            get_prefs, save_prefs, pick_folder, add_found,
-            set_playback_default, sd_recordings, sd_recording_file, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
+            get_prefs, save_prefs, pick_folder, add_found, motion_events,
+            set_playback_default, sd_recordings, sd_recording_start, sd_recording_progress, camera_users, camera_user_add, camera_user_password, camera_user_delete, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
         ])
-        .setup(|app| Ok(tray(app)?))
+        .setup(|app| {
+            let _ = events::APP.set(app.handle().clone());
+            let _ = events::SHOW_WINDOW.set(show_window);
+            events::prune();
+            Ok(tray(app)?)
+        })
         // Minimizing or closing tucks the window into the tray; Quit is in the tray menu.
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {

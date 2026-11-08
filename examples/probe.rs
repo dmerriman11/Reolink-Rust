@@ -89,3 +89,12 @@ fn main() -> anyhow::Result<()> {
     print!("{}", String::from_utf8_lossy(&probe.stdout));
     Ok(())
 }
+
+#[path = "../src/talk.rs"]
+mod talk;
+
+#[path = "../src/audio.rs"]
+mod audio;
+
+#[path = "../src/events.rs"]
+mod events;

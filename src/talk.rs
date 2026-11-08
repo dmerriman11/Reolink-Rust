@@ -74,26 +74,37 @@ impl Session {
     }
 }
 
+/// Decode one camera IMA block; each block carries its own predictor.
+pub fn decode(block: &[u8]) -> Option<Vec<i16>> {
+    if block.len() < 4 || block[2] > 88 || block[3] != 0 { return None; }
+    let mut predictor = i16::from_le_bytes([block[0], block[1]]) as i32;
+    let mut index = block[2] as i32;
+    let mut out = vec![predictor as i16];
+    for code in block[4..].iter().flat_map(|b| [b & 15, b >> 4]) {
+        let step = STEPS[index as usize];
+        let mut delta = step >> 3;
+        if code & 4 != 0 { delta += step; }
+        if code & 2 != 0 { delta += step >> 1; }
+        if code & 1 != 0 { delta += step >> 2; }
+        predictor = (predictor + if code & 8 != 0 { -delta } else { delta }).clamp(-32768, 32767);
+        index = (index + INDEX_CHANGE[(code & 7) as usize]).clamp(0, 88);
+        out.push(predictor as i16);
+    }
+    Some(out)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A DVI-4 decoder written from the format, as the camera would run it.
-    fn decode(block: &[u8]) -> Vec<i32> {
-        let mut predictor = i16::from_le_bytes([block[0], block[1]]) as i32;
-        let mut index = block[2] as i32;
-        let mut out = vec![predictor];
-        for code in block[4..].iter().flat_map(|b| [b & 15, b >> 4]) {
-            let step = STEPS[index as usize];
-            let mut delta = step >> 3;
-            if code & 4 != 0 { delta += step; }
-            if code & 2 != 0 { delta += step >> 1; }
-            if code & 1 != 0 { delta += step >> 2; }
-            predictor = (predictor + if code & 8 != 0 { -delta } else { delta }).clamp(-32768, 32767);
-            index = (index + INDEX_CHANGE[(code & 7) as usize]).clamp(0, 88);
-            out.push(predictor);
-        }
-        out
+    #[test]
+    fn decoding_validates_headers_and_nibble_order() {
+        assert_eq!(decode(&[0, 0, 0, 0, 0x71]), Some(vec![0, 1, 12]));
+        assert_eq!(decode(&[0xff, 0x7f, 88, 0, 0x77]), Some(vec![32767; 3]));
+        assert_eq!(decode(&[0, 0]), None);
+        assert_eq!(decode(&[0, 0, 89, 0]), None);
+        assert_eq!(decode(&[0, 0, 0, 1]), None);
     }
 
     fn tone(n: usize) -> Vec<i16> {
@@ -106,11 +117,11 @@ mod tests {
         let mut index = 0;
         let block = encode_block(&input, &mut index);
         assert_eq!(block.len(), 4 + 512);
-        let output = decode(&block);
+        let output = decode(&block).unwrap();
         assert_eq!(output.len(), input.len());
         // The step size needs a moment to grow to the signal.
         for (a, b) in input.iter().zip(&output).skip(100) {
-            assert!((*a as i32 - b).abs() < 600, "{a} vs {b}");
+            assert!((*a as i32 - *b as i32).abs() < 600, "{a} vs {b}");
         }
     }
 

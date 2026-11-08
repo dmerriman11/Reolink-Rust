@@ -1,6 +1,6 @@
 [package]
 name = "reolink-rs"
-version = "0.4.17"
+version = "0.4.19"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -25,12 +25,15 @@ tauri-plugin-single-instance = "2"
 thiserror = "2.0.21"
 time = "0.3"
 tokio = { version = "1.54.1", features = ["full"] }
+tauri-plugin-notification = "2"
 
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# Already pulled in by tauri-plugin-notification; used directly for the toast click handler the plugin lacks.
+tauri-winrt-notification = "0.8"
 
 [workspace]
 members = [".", "neolink_core"]

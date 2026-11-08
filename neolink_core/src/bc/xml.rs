@@ -706,6 +706,7 @@ pub struct Preset {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Command: Known values: `"toPos"` and `"setPos"`
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
 }
 

@@ -62,3 +62,12 @@ fn main() -> anyhow::Result<()> {
     println!("motion events seen: {} (now {}), total {:.0}s", s.motion_events, if s.motion { "moving" } else { "still" }, t.elapsed().as_secs_f32());
     Ok(())
 }
+
+#[path = "../src/talk.rs"]
+mod talk;
+
+#[path = "../src/audio.rs"]
+mod audio;
+
+#[path = "../src/events.rs"]
+mod events;

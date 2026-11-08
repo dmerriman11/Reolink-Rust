@@ -52,3 +52,12 @@ fn main() -> anyhow::Result<()> {
     println!("status: {}", dev.state.lock().unwrap().status);
     Ok(())
 }
+
+#[path = "../src/talk.rs"]
+mod talk;
+
+#[path = "../src/audio.rs"]
+mod audio;
+
+#[path = "../src/events.rs"]
+mod events;

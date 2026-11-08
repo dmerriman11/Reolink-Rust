@@ -41,6 +41,7 @@ mod talk;
 mod time;
 mod uid;
 mod raw;
+pub use raw::SdChunk;
 mod wifi;
 mod users;
 mod version;

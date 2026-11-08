@@ -74,11 +74,13 @@ function decoderConfigs(codec, box) {
 
 // Split /raw's byte stream (stream.rs: 1 flag byte, 4-byte length, 4-byte camera time, all big-endian, then the
 // payload) into frames, however the chunks fall. Each payload is allocated once and every byte copied once, so big
-// keyframes spread over many chunks stay cheap.
+// keyframes spread over many chunks stay cheap. `audio`: /audio's packets, whose camera time is 8 bytes; the low 32
+// bits are handed on, matching the video clock /raw carries.
 const FRAME_HEAD = 9;
-function framer(onFrame) {
-  const head = new Uint8Array(FRAME_HEAD);
+function framer(onFrame, audio = false) {
+  const head = new Uint8Array(audio ? 13 : FRAME_HEAD);
   const view = new DataView(head.buffer);
+  const stamp = () => (audio ? Number(view.getBigUint64(5) & 0xffffffffn) : view.getUint32(5));
   let have = 0; // header bytes so far
   let body = null; // payload being filled
   let filled = 0;
@@ -86,11 +88,11 @@ function framer(onFrame) {
     let at = 0;
     while (at < chunk.length) {
       if (!body) {
-        const n = Math.min(FRAME_HEAD - have, chunk.length - at);
+        const n = Math.min(head.length - have, chunk.length - at);
         head.set(chunk.subarray(at, at + n), have);
         have += n;
         at += n;
-        if (have < FRAME_HEAD) return;
+        if (have < head.length) return;
         body = new Uint8Array(view.getUint32(1));
         filled = 0;
       }
@@ -102,7 +104,7 @@ function framer(onFrame) {
         const frame = body;
         body = null;
         have = 0;
-        await onFrame(head[0], view.getUint32(5), frame);
+        await onFrame(head[0], stamp(), frame);
       }
     }
   };

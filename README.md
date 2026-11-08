@@ -91,6 +91,24 @@ Motion recording (0.4.17): only video motion inside the painted detection area s
 alerts (person/vehicle from the camera's AI zones) no longer trigger it. Each alarm event is logged with the camera
 name, status and AI type.
 
+Live audio (0.4.19): a headphones button on each tile plays that camera's sound (one camera at a time, M toggles),
+in step with the picture's delay; it goes quiet while you talk through that camera. Turn on Audio in the camera's
+Clear/Fluent stream settings first.
+
+PTZ presets (0.4.19): the PTZ panel lists the camera's presets; click one to go there, save the current position,
+rename or delete. Cameras with a zoom lens also get zoom and focus buttons (hold to move).
+
+Events and notifications (0.4.19): every motion start is logged (with person/vehicle when the camera says so) for 30
+days in `events.jsonl` next to `devices.json`. Playback has an Events tab (click an event to play that moment) and red
+motion markers on each timeline row; camera SD recordings show their people/vehicle/other markers too. App settings
+has "Notify on motion": a desktop notification per camera at most once a minute, not while you're watching that camera
+live; clicking it (Windows) shows the window on that camera.
+
+SD playback streams (0.4.19): a camera SD clip starts playing while it downloads.
+
+Camera settings (0.4.19): a Users page (list, add, change password, delete; the account the app logs in with and
+administrators are protected; battery cameras refuse it) and AI detection's object types (people, vehicles, animals).
+
 Live view health: a tile whose camera stops sending frames says "No new video for N s" with a Reconnect button
 (the app also reconnects by itself after 20 s); an offline tile shows why, with Retry now. Recording paused (tray)
 shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Shift+arrows move its camera, Enter for single
@@ -101,14 +119,14 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
-Current version: **0.4.17**.
+Current version: **0.4.19**.
 
-Next phases toward parity with the official client (already in place: two-way talk, digital zoom, light/siren,
-motion beep, camera push-notification settings, firmware version and auto-update toggle, Wi-Fi signal, NVR channels):
-1. Live audio playback (talk only sends audio today); PTZ presets and optical zoom/focus (PTZ is pan/tilt only)
-2. Playback: motion/AI markers on the timeline, play SD clips while they download, more NVR models tested
-3. Desktop motion notifications and an event log (today: a beep and a motion counter); manual firmware update
-4. Edit users, switch Wi-Fi networks, configure AI detection (need protocol work; read-only today)
+Next phases toward parity with the official client:
+1. Optical auto-focus; AI detection sensitivity and AI zones (Argus 4 Pro refuses those messages)
+2. NVR hardware testing (channel discovery in Add camera, per-channel playback bitmap, device-wide settings on an NVR)
+3. Manual firmware update and Wi-Fi network switching (message ids known, payloads and order still need a capture of
+   the official client: [docs/lens-preset-firmware-wifi-evidence.md](docs/lens-preset-firmware-wifi-evidence.md))
+4. Editing user permissions (the protocol only offers user vs administrator at creation)
 
 ## Patching the official client instead
 

@@ -22,7 +22,7 @@ pub fn jpeg_box(w: u32, h: u32) -> (u32, u32) {
 pub const DEFAULT_BOX: (u32, u32) = (1280, 720);
 
 
-fn ffmpeg() -> PathBuf {
+pub(crate) fn ffmpeg() -> PathBuf {
     let local = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("ffmpeg.exe")));

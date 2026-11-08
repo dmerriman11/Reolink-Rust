@@ -51,11 +51,11 @@ impl BcCamera {
         self.raw_request(id, !(14..=16).contains(&id), Some(xml)).await?.ok_or(Error::Other("camera replied without XML"))
     }
 
-    /// Download video frames to a temporary elementary stream. A missing end marker is an error.
-    pub async fn download_recording(&self, xml: String, path: &std::path::Path) -> Result<(String, u8)> {
+    /// Download a recording's frames: each chunk is an Annex-B video access unit or an ADTS audio frame, after one
+    /// `Codec` chunk. A missing end marker is an error; a dropped receiver cancels the download.
+    pub async fn download_recording(&self, xml: String, out: tokio::sync::mpsc::UnboundedSender<SdChunk>) -> Result<(String, u8)> {
         use bytes::BytesMut;
         use tokio_util::codec::Decoder;
-        use tokio::io::AsyncWriteExt;
         use crate::bcmedia::{codex::BcMediaCodex, model::BcMedia};
         let conn = self.get_connection();
         let num = self.new_message_num();
@@ -64,8 +64,6 @@ impl BcCamera {
             response_code: 0, stream_type: 0, class: 0x6414 }, body: BcBody::ModernMsg(ModernMsg {
             extension: None, payload: Some(BcPayloads::BcXml(BcXml { raw: Some(xml), ..Default::default() }))
         }) }).await?;
-        let mut out = tokio::fs::File::create(path).await?;
-        let mut audio = tokio::fs::File::create(path.with_extension("aac")).await?;
         let mut buf = BytesMut::new();
         let mut decoder = BcMediaCodex::new(true);
         let mut total = 0usize;
@@ -88,22 +86,27 @@ impl BcCamera {
                     if total > 1024 * 1024 * 1024 { return Err(Error::Other("SD clip exceeds 1 GB download limit")); }
                     buf.extend_from_slice(&data);
                     while let Some(frame) = decoder.decode(&mut buf)? {
-                        match frame {
-                            BcMedia::InfoV1(i) => fps = i.fps,
-                            BcMedia::InfoV2(i) => fps = i.fps,
-                            BcMedia::Iframe(i) => { codec = recording_codec(&i.data, match i.video_type { crate::bcmedia::model::VideoType::H264 => "h264", _ => "hevc" }).into(); out.write_all(&i.data).await?; },
-                            BcMedia::Pframe(p) => out.write_all(&p.data).await?,
-                            BcMedia::Aac(a) => audio.write_all(&a.data).await?,
-                            _ => {}
-                        }
+                        let chunk = match frame {
+                            BcMedia::InfoV1(i) => { fps = i.fps; continue }
+                            BcMedia::InfoV2(i) => { fps = i.fps; continue }
+                            BcMedia::Iframe(i) => {
+                                if codec.is_empty() {
+                                    codec = recording_codec(&i.data, match i.video_type { crate::bcmedia::model::VideoType::H264 => "h264", _ => "hevc" }).into();
+                                    let _ = out.send(SdChunk::Codec { codec: codec.clone(), fps: fps.clamp(1, 60) });
+                                }
+                                SdChunk::Video(i.data)
+                            }
+                            BcMedia::Pframe(p) => SdChunk::Video(p.data),
+                            BcMedia::Aac(a) => SdChunk::Audio(a.data),
+                            _ => continue,
+                        };
+                        if out.send(chunk).is_err() { return Err(Error::Other("SD download cancelled")); }
                     }
                     if buf.len() > 16 * 1024 * 1024 { return Err(Error::Other("invalid SD media frame")); }
                 }
                 _ => {}
             }
         }
-        out.flush().await?;
-        audio.flush().await?;
         if codec.is_empty() || !buf.is_empty() { return Err(Error::Other("SD download was empty or incomplete")); }
         Ok((codec, fps.clamp(1, 60)))
     }
@@ -119,6 +122,22 @@ impl BcCamera {
     pub async fn set_xml(&self, msg_id: u32, channel: bool, xml: String) -> Result<()> {
         self.raw_request(msg_id, channel, Some(xml)).await.map(|_| ())
     }
+}
+
+/// One piece of a downloaded recording; see [`BcCamera::download_recording`].
+#[derive(Debug)]
+pub enum SdChunk {
+    /// The video codec and frame rate, once, before the first video chunk.
+    Codec {
+        /// "h264" or "hevc", from the parameter sets.
+        codec: String,
+        /// Frames per second, 1..=60.
+        fps: u8,
+    },
+    /// One Annex-B access unit.
+    Video(Vec<u8>),
+    /// One ADTS AAC frame.
+    Audio(Vec<u8>),
 }
 
 // SD firmware can label HEVC as H264; parameter-set NAL units carry the actual codec.

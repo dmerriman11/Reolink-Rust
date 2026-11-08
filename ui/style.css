@@ -235,9 +235,9 @@ body.dragging-feed, body.dragging-feed * { cursor: grabbing !important; }
 .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 .bar-btn { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; padding: 5px 8px; border-radius: 6px; color: var(--muted); font-size: 12px; }
 .bar-btn:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
-.bar-btn.recording { color: var(--rec); }
+.bar-btn.recording { color: var(--rec); background: color-mix(in srgb, var(--rec) 16%, transparent); }
 .bar-btn.recording svg { fill: var(--rec); }
-.bar-btn[aria-pressed="true"] { color: var(--accent); }
+.bar-btn[aria-pressed="true"] { color: var(--accent); background: rgba(244, 177, 62, .14); }
 .bar-btn.armed { background: var(--rec); color: #fff; }
 .tile.zoomed img, .tile.zoomed canvas { transform-origin: 0 0; cursor: grab; touch-action: none; }
 .tile.zoomed img:active, .tile.zoomed canvas:active { cursor: grabbing; }
@@ -313,6 +313,13 @@ body.fullscreen:hover .fs-exit, .fs-exit:focus-visible { opacity: 1; }
 }
 .dpad:has(button.active) .d-hub { background: var(--accent); border-color: var(--accent); }
 .ptz-hint { margin: -2px 0 0; color: var(--faint); font-size: 11px; }
+.ptz-presets { width: 100%; font-size: 11px; }
+.ptz-presets fieldset { border: 0; padding: 0; margin: 6px 0 0; min-width: 0; }
+.ptz-presets input, .ptz-presets button { width: 100%; min-width: 0; margin-top: 4px; }
+.ptz-presets input { box-sizing: border-box; }
+#preset-list { max-height: 100px; overflow-y: auto; }
+#preset-list button { overflow-wrap: anywhere; }
+#preset-status { margin: 4px 0 0; overflow-wrap: anywhere; color: var(--muted); }
 /* Smaller tiles: shrink toward the right edge so it stays clear of the tile header and bar; solo a tiny tile to steer it. */
 @container (max-height: 360px) { .ptz { scale: .8; } .ptz-hint { display: none; } }
 @container (max-height: 260px) { .ptz { scale: .62; } }
@@ -425,13 +432,13 @@ button.paused-pill { border: 1px solid transparent; cursor: pointer; }
 button.paused-pill:hover { border-color: var(--rec); }
 
 /* ---------- view switch (sidebar) ---------- */
-.views { display: grid; gap: 2px; margin: 0 0 18px; padding: 3px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+.views { display: grid; gap: 8px; margin: 0 0 18px; }
 .view-btn {
-  display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent;
-  color: var(--muted); font-weight: 600; text-align: left; transition: background .18s, color .18s;
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+  color: var(--muted); font-weight: 600; text-align: left; transition: background .18s, color .18s, border-color .18s;
 }
-.view-btn:hover { color: var(--text); }
-.view-btn[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
+.view-btn:hover { color: var(--text); border-color: var(--line-strong); }
+.view-btn[aria-pressed="true"] { background: var(--panel-2); color: var(--text); border-color: rgba(244, 177, 62, .45); }
 .view-btn[aria-pressed="true"] svg { color: var(--accent); }
 
 /* ---------- playback (NVR) ---------- */
@@ -585,6 +592,19 @@ body.playback .stage { display: none; }
 .tl-seg { position: absolute; top: 5px; bottom: 5px; border-radius: 3px; background: rgba(244, 177, 62, .5); pointer-events: none; }
 .tl-seg.current { background: var(--accent); }
 .tl-mark { position: absolute; top: 0; bottom: 0; background: rgba(63, 214, 138, .22); border-left: 2px solid var(--live); border-right: 2px solid var(--live); pointer-events: none; }
+.tl-ev { position: absolute; top: 0; height: 4px; border-radius: 2px; background: var(--rec); opacity: .85; pointer-events: none; }
+/* Camera SD detection types, one thin row each under the top edge (see SD_TYPES in app.js). */
+.tl-ev.sd-people { top: 0; background: #ffb74d; }
+.tl-ev.sd-vehicle { top: 5px; background: #4fc3f7; }
+.tl-ev.sd-dog_cat { top: 10px; background: #aed581; }
+.tl-ev.sd-other { top: 15px; background: #b0bec5; }
+.set-check { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; }
+.user-actions { display: flex; gap: 8px; }
+.user-add .set-control { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pb-tabs { margin: 0 6px 0 auto; }
+.pb-tabs button { padding: 3px 8px; }
+#pb-event-cam { margin: 0 14px 8px; }
+.pb-event-ai { margin-left: 6px; padding: 1px 6px; border-radius: 4px; background: var(--panel-2); color: var(--muted); font: 600 10.5px/1.4 var(--display); text-transform: uppercase; letter-spacing: .06em; }
 .tl-now { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); pointer-events: none; }
 .tl-head { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--rec); box-shadow: 0 0 6px rgba(255, 74, 74, .6); pointer-events: none; }
 .tl-hint { margin: 6px 0 0 var(--gutter); color: var(--faint); font-size: 11px; }
@@ -717,3 +737,8 @@ button:disabled { cursor: default; opacity: .4; }
   .nvr .pb-summary { grid-column: 1; grid-row: 2; }
   .nvr .topbar-right { grid-column: 2; grid-row: 2; }
 }
+
+#lens-zoom:not([hidden]), #lens-focus:not([hidden]) { display: flex; gap: 4px; width: 100%; }
+#lens-zoom button, #lens-focus button { flex: 1; min-width: 0; font-size: 11px; }
+#preset-list { max-height: 160px; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 0 4px; }
+#preset-list > button:nth-child(3n + 1) { grid-column: 1 / -1; }

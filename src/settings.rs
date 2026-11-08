@@ -135,6 +135,9 @@ pub enum Kind {
     Zone,
     /// Privacy masks: path is the Shelter element; value is JSON {"enable","max","rects":[[x,y,w,h],...]} in 0..1000.
     Masks,
+    /// A comma-separated set of the options (AI detection types); at least one must stay on, as in the official
+    /// client. Values the camera lists that aren't among the options stay selectable.
+    Set(&'static [(&'static str, &'static str)]),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +159,8 @@ const fn f(key: &'static str, label: &'static str, msg: Msg, path: &'static str,
     Field { key, label, msg, path, kind }
 }
 
+/// AiCfg/detectType values and the official client's labels (BC_DETECT_TYPE_PEOPLE/VEHICLE/DOG_CAT).
+const AI_TYPES: &[(&str, &str)] = &[("people", "People"), ("vehicle", "Vehicles"), ("dog_cat", "Animals")];
 const INFO: Kind = Kind::Info(Fmt::Plain);
 const PCT: Kind = Kind::Info(Fmt::Suffix("%"));
 const IMG: Kind = Kind::Range { min: 0, max: 255 };
@@ -352,7 +357,9 @@ pub static PAGES: &[Page] = &[
         id: "smart",
         title: "Smart detection & time-lapse",
         fields: &[
-            f("ai_types", "Detects", AI, "AiCfg/detectType", INFO),
+            // Official "Smart detection" types (setAiCfg, 300): the camera's AiCfg read back with detectType changed.
+            // AI sensitivity and per-type zones (AiDetectCfg 342-344) are refused by Argus cameras (400), so none here.
+            f("ai_types", "Detects", AI, "AiCfg/detectType", Kind::Set(AI_TYPES)),
             f("tl_overwrite", "Time-lapse: overwrite oldest files", TIMELAPSE, "timelapseCfg/overwrite", Kind::Toggle),
             f("tl_max", "Time-lapse: max files", TIMELAPSE, "timelapseCfg/maxFileNum", INFO),
         ],
@@ -732,6 +739,8 @@ fn applied(field: &Field, after: &str, value: &str) -> bool {
             serde_json::from_str::<ZoneValue>(&got).ok() == serde_json::from_str::<ZoneValue>(value).ok()
         }),
         Kind::Password { .. } => xmledit::get(after, field.path).as_deref() == Some(value),
+        // The camera may list the types in its own order.
+        Kind::Set(_) => extract(field, after).is_some_and(|got| got.split(',').collect::<std::collections::BTreeSet<_>>() == value.split(',').collect()),
         _ => extract(field, after).as_deref() == Some(value),
     }
 }
@@ -873,6 +882,13 @@ pub async fn read_page<C: Camera>(cam: &C, page: &Page) -> PageView {
             Kind::Schedule => ("schedule", None, None, None, vec![], schedule_summary(&value)),
             Kind::Zone => ("zone", None, None, None, vec![], String::new()),
             Kind::Masks => ("masks", None, None, None, vec![], String::new()),
+            Kind::Set(fixed) => {
+                let mut opts: Vec<Choice> = fixed.iter().map(|(v, l)| Choice { value: v.to_string(), label: l.to_string() }).collect();
+                for v in value.split(',').filter(|v| !v.is_empty() && !fixed.iter().any(|(f, _)| f == v)) {
+                    opts.push(Choice { value: v.to_string(), label: v.to_string() });
+                }
+                ("set", None, None, None, opts, value.clone())
+            }
             Kind::Choice(o) => {
                 let mut opts = options(cam, o, &mut cache).await;
                 if opts.is_empty() {
@@ -952,6 +968,16 @@ pub fn validate(field: &Field, value: &str, options: &[Choice]) -> Result<(), St
         }
         Kind::Choice(_) => {
             if options.iter().any(|c| c.value == value) { Ok(()) } else { Err(format!("{label} has no option {value:?}")) }
+        }
+        Kind::Set(_) => {
+            let items: Vec<&str> = value.split(',').collect();
+            if value.is_empty() {
+                Err(format!("{label}: keep at least one type on"))
+            } else if let Some(bad) = items.iter().find(|v| !options.iter().any(|c| &c.value == *v)) {
+                Err(format!("{label} has no option {bad:?}"))
+            } else {
+                Ok(())
+            }
         }
         Kind::Schedule => {
             let map: BTreeMap<String, String> = serde_json::from_str(value).map_err(|_| format!("{label} is malformed"))?;
@@ -1048,12 +1074,15 @@ pub async fn write_page<C: Camera>(cam: &C, page: &Page, changes: &BTreeMap<Stri
             results.push(WriteResult { key: key.clone(), ok: false, error: Some(format!("{} is read-only", field.label)) });
             continue;
         }
-        let opts = match field.kind {
-            Kind::Choice(o) => options(cam, o, &mut cache).await,
-            _ => vec![],
-        };
         // The camera's current value is always an acceptable choice (it may predate our option list).
         let current = fetch(cam, field.msg, &mut cache).await.and_then(|x| extract(field, &x));
+        let opts = match field.kind {
+            Kind::Choice(o) => options(cam, o, &mut cache).await,
+            // The fixed options plus whatever the camera lists now, as read_page offers them.
+            Kind::Set(fixed) => fixed.iter().map(|(v, _)| v.to_string()).chain(current.iter().flat_map(|c| c.split(',').map(str::to_string)))
+                .filter(|v| !v.is_empty()).map(|v| Choice { label: v.clone(), value: v }).collect(),
+            _ => vec![],
+        };
         let ok = validate(field, value, &opts).or_else(|e| if current.as_deref() == Some(value.as_str()) { Ok(()) } else { Err(e) });
         match ok {
             Ok(()) => by_msg.entry((field.msg.get, field.msg.set)).or_insert((field.msg, vec![])).1.push((field, value)),
@@ -1529,6 +1558,26 @@ mod tests {
         assert_eq!(xmledit::get(&xml, "SystemGeneral/hour").as_deref(), Some("13"));
         assert_eq!(xmledit::get(&xml, "SystemGeneral/day").as_deref(), Some("24"));
         assert_eq!(xmledit::get(&xml, "SystemGeneral/deviceName").as_deref(), Some("Backyard"));
+    }
+
+    #[test]
+    fn ai_types_edit_as_a_set_of_the_cameras_options() {
+        const AI_XML: &str = "<body><AiCfg version=\"1.1\"><channelId>0</channelId><smartTrack>0</smartTrack><detectType>people,vehicle,package</detectType><smartTrackType>people</smartTrackType></AiCfg></body>";
+        let cam = Fake::new(&[(299, AI_XML)]);
+        let p = page("smart").unwrap();
+        let v = run(read_page(&cam, p));
+        let f = v.fields.iter().find(|f| f.key == "ai_types").unwrap();
+        assert_eq!(f.kind, "set");
+        assert_eq!(f.options.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["people", "vehicle", "dog_cat", "package"], "unknown camera values stay selectable");
+        let r = run(write_page(&cam, p, &changes(&[("ai_types", "")])));
+        assert!(!r[0].ok && r[0].error.as_deref().unwrap().contains("at least one"));
+        let r = run(write_page(&cam, p, &changes(&[("ai_types", "people,face")])));
+        assert!(!r[0].ok, "{r:?}");
+        let r = run(write_page(&cam, p, &changes(&[("ai_types", "people,dog_cat")])));
+        assert!(r[0].ok, "{r:?}");
+        assert!(cam.sets.lock().unwrap().contains(&300));
+        let xml = cam.xml.lock().unwrap()[&299].clone();
+        assert!(xml.contains("<detectType>people,dog_cat</detectType>") && xml.contains("<smartTrackType>people</smartTrackType>"), "{xml}");
     }
 
     #[test]

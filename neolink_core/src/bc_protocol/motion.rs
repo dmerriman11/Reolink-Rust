@@ -24,9 +24,16 @@ pub struct MotionData {
     cancel: CancellationToken,
     rx: Receiver<Result<MotionStatus>>,
     last_update: MotionStatus,
+    /// `AItype` of the latest motion start (people, vehicle, ...), None when the camera sent none.
+    ai: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MotionData {
+    /// The AI type the latest motion start carried, if any.
+    pub fn last_ai(&self) -> Option<String> {
+        self.ai.lock().unwrap().clone()
+    }
+
     /// Get if motion has been detected. Returns None if
     /// no motion data has yet been recieved from the camera
     ///
@@ -227,6 +234,8 @@ impl BcCamera {
         let name = self.name.clone();
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
+        let ai_out = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ai = ai_out.clone();
         set.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
@@ -252,6 +261,10 @@ impl BcCamera {
                                         if alarm_event.channel_id == channel_id {
                                             log::info!("{name}: alarm status={} AItype={}", alarm_event.status, alarm_event.ai_type.as_deref().unwrap_or("-"));
                                             result = classify(alarm_event);
+                                            if matches!(result, MotionStatus::Start(_)) {
+                                                // shortcut: set before the send, read after the recv; no ordering guarantee beyond that
+                                                *ai.lock().unwrap() = alarm_event.ai_type.clone().filter(|t| t != "none");
+                                            }
                                             break;
                                         }
                                     }
@@ -279,6 +292,7 @@ impl BcCamera {
             cancel,
             rx,
             last_update: MotionStatus::NoChange(Instant::now()),
+            ai: ai_out,
         })
     }
 }
