@@ -95,6 +95,9 @@ Live audio (0.4.19): a headphones button on each tile plays that camera's sound 
 in step with the picture's delay; it goes quiet while you talk through that camera. Turn on Audio in the camera's
 Clear/Fluent stream settings first.
 
+Recordings with sound (0.4.20): manual, motion and scheduled recordings include the camera's AAC audio as a second
+track in the MP4 (ADPCM cameras record video only).
+
 PTZ presets (0.4.19): the PTZ panel lists the camera's presets; click one to go there, save the current position,
 rename or delete. Cameras with a zoom lens also get zoom and focus buttons (hold to move).
 
@@ -119,7 +122,7 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
-Current version: **0.4.19**.
+Current version: **0.4.20**.
 
 Next phases toward parity with the official client:
 1. Optical auto-focus; AI detection sensitivity and AI zones (Argus 4 Pro refuses those messages)

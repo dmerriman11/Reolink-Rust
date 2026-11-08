@@ -242,13 +242,14 @@ mod tests {
             assert_eq!((kind, us), (255, 0));
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&data).unwrap(), serde_json::json!({"codec":"pcm","rate":8000,"channels":1}));
             views.audio.push(pcm(), 42);
-            assert_eq!(packet(&mut sock).await, (0, 42, vec![0, 0, 1, 0, 12, 0]));
+            // Each chunk continues the last (250 µs here) while that stays near the video time it was given.
+            assert_eq!(packet(&mut sock).await, (0, 251, vec![0, 0, 1, 0, 12, 0]));
             let aac = vec![255, 241, 0x60, 0x40, 0, 0xff, 0xfc];
             views.audio.push(BcMedia::Aac(BcMediaAac { data: aac.clone() }), 43);
             let (kind, _, data) = packet(&mut sock).await;
             assert_eq!(kind, 255);
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&data).unwrap(), serde_json::json!({"codec":"aac","rate":16000,"channels":1}));
-            assert_eq!(packet(&mut sock).await, (1, 43, aac));
+            assert_eq!(packet(&mut sock).await, (1, 501, aac));
             feeds.lock().unwrap().remove(&7);
             drop(views);
             assert_eq!(sock.read(&mut [0]).await.unwrap(), 0);

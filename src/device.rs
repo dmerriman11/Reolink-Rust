@@ -475,6 +475,9 @@ fn camera_opts(cfg: &DeviceConfig) -> Result<BcCameraOpt> {
 struct Live {
     kind: StreamKind,
     video_us: u32,
+    /// AAC has arrived on this stream, so recordings get a sound track.
+    aac: bool,
+    started: Instant,
     stream: StreamData,
     decoder: Option<Decoder>,
     recorder: Option<Recorder>,
@@ -740,7 +743,7 @@ async fn session(
                         log::info!("{}: live {k}{}", cfg.name, if kind.is_none() { " (recording only)" } else { "" });
                         let stream = cam.start_video(k, 0, false).await.context("start live")?;
                         set(&|s| s.last_frame = Some(Instant::now())); // a stream that never sends counts from here
-                        live = Some(Live { kind: k, video_us: 0, stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
+                        live = Some(Live { kind: k, video_us: 0, aac: false, started: Instant::now(), stream, decoder: None, recorder: None, record, jpeg_box: wanted.jpeg_box, show: true });
                     }
                 }
                 if let Some(l) = live.as_mut() {
@@ -908,7 +911,13 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
         BcMedia::Pframe(f) => (f.video_type, f.data, false, f.microseconds),
         BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
             state.lock().unwrap().audio = true;
-            if live.show { views.audio.push(media, live.video_us); }
+            for f in views.audio.push(media, live.video_us) {
+                live.aac |= f.format.codec == "aac";
+                // shortcut: ADPCM isn't recorded (MPEG-TS has no slot for it); transcode to AAC if those cameras need it.
+                if let (Some(r), "aac") = (live.recorder.as_mut(), f.format.codec) {
+                    r.push_audio(&f.data, f.us as u32);
+                }
+            }
             return;
         }
         _ => return,
@@ -916,10 +925,11 @@ fn on_media(live: &mut Live, media: BcMedia, name: &str, state: &Arc<Mutex<State
     live.video_us = us;
     state.lock().unwrap().last_frame = Some(Instant::now());
 
-    if live.record && live.recorder.is_none() {
+    // A fresh stream's first keyframe can beat its first audio: give the sound a moment so the file gets its track.
+    if live.record && live.recorder.is_none() && (live.aac || live.started.elapsed() > Duration::from_secs(1)) {
         let prefs = crate::prefs::get();
         let dir = prefs.record_dir.clone();
-        let res = std::fs::create_dir_all(&dir).and_then(|_| Recorder::new(codec, &dir, &safe_name(name), prefs.segment_minutes));
+        let res = std::fs::create_dir_all(&dir).and_then(|_| Recorder::new(codec, &dir, &safe_name(name), prefs.segment_minutes, live.aac));
         let mut s = state.lock().unwrap();
         match res {
             Ok(r) => {

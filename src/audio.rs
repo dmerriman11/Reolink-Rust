@@ -41,7 +41,7 @@ impl Feed {
         (*format, self.tx.subscribe())
     }
 
-    fn send(&self, format: Format, video_us: u32, dur_us: u32, data: Vec<u8>) {
+    fn send(&self, format: Format, video_us: u32, dur_us: u32, data: Vec<u8>) -> Arc<Frame> {
         let us = {
             let mut clock = self.clock.lock().unwrap();
             let us = match *clock {
@@ -53,24 +53,29 @@ impl Feed {
         };
         let mut current = self.format.lock().unwrap();
         *current = Some(format);
-        let _ = self.tx.send(Arc::new(Frame { format, us: us.into(), data }));
+        let frame = Arc::new(Frame { format, us: us.into(), data });
+        let _ = self.tx.send(frame.clone());
+        frame
     }
 
-    pub fn push(&self, media: BcMedia, us: u32) {
+    /// Sends the camera's audio to listeners, and returns it stamped (each AAC frame on its own) for recording.
+    pub fn push(&self, media: BcMedia, us: u32) -> Vec<Arc<Frame>> {
+        let mut sent = vec![];
         match media {
             BcMedia::Adpcm(f) if f.data.len() >= 4 && f.data[2] <= 88 && f.data[3] == 0 => {
                 // Incoming BC ADPCM is 8 kHz (BcMediaAdpcm::duration); talk-back has a separate config.
-                self.send(Format { codec: "pcm", rate: 8000, channels: 1 }, us, f.duration().unwrap_or(0), f.data);
+                sent.push(self.send(Format { codec: "pcm", rate: 8000, channels: 1 }, us, f.duration().unwrap_or(0), f.data));
             }
             BcMedia::Aac(f) => {
                 let mut data = f.data.as_slice();
                 while let Some((format, len)) = adts(data) {
-                    self.send(format, us, 1024 * 1_000_000 / format.rate, data[..len].to_vec()); // an AAC-LC frame
+                    sent.push(self.send(format, us, 1024 * 1_000_000 / format.rate, data[..len].to_vec())); // an AAC-LC frame
                     data = &data[len..];
                 }
             }
             _ => {}
         }
+        sent
     }
 }
 

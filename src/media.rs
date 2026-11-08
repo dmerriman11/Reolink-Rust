@@ -227,8 +227,10 @@ impl RawFeed {
 /// frame. A raw stream can only be stamped on arrival, which writes every network stall into the file.
 struct Mpegts {
     stream_type: u8,
-    /// Continuity counters for the PAT, the PMT and the video.
-    counters: [u8; 3],
+    /// An AAC track (ADTS frames) next to the video.
+    audio: bool,
+    /// Continuity counters for the PAT, the PMT, the video and the audio.
+    counters: [u8; 4],
     last_us: Option<u32>,
     /// The last usable step between frames, for a clock that didn't move.
     step_us: u32,
@@ -239,13 +241,14 @@ struct Mpegts {
 impl Mpegts {
     const PMT_PID: u16 = 0x1000;
     const VIDEO_PID: u16 = 0x0100;
+    const AUDIO_PID: u16 = 0x0101;
 
-    fn new(codec: VideoType) -> Self {
+    fn new(codec: VideoType, audio: bool) -> Self {
         let stream_type = match codec {
             VideoType::H264 => 0x1B,
             VideoType::H265 => 0x24,
         };
-        Self { stream_type, counters: [0; 3], last_us: None, step_us: 66_667, total_us: 1_000_000 }
+        Self { stream_type, audio, counters: [0; 4], last_us: None, step_us: 66_667, total_us: 1_000_000 }
     }
 
     /// The 90 kHz timestamp for a frame stamped `us`; never goes backwards, as a file can't.
@@ -273,17 +276,46 @@ impl Mpegts {
 
     fn frame(&mut self, data: &[u8], key: bool, us: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity((data.len() / 184 + 4) * 188);
-        let pid = Self::VIDEO_PID.to_be_bytes();
         if key {
             // Before every keyframe, as a demuxer can only start from these.
+            let pid = Self::VIDEO_PID.to_be_bytes();
             let pmt_pid = Self::PMT_PID.to_be_bytes();
             let pat = [0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0, 0, 1, 0xE0 | pmt_pid[0], pmt_pid[1]];
-            let pmt = [0x02, 0xB0, 18, 0, 1, 0xC1, 0, 0, 0xE0 | pid[0], pid[1], 0xF0, 0, self.stream_type, 0xE0 | pid[0], pid[1], 0xF0, 0];
+            let mut pmt = vec![0x02, 0xB0, 18, 0, 1, 0xC1, 0, 0, 0xE0 | pid[0], pid[1], 0xF0, 0, self.stream_type, 0xE0 | pid[0], pid[1], 0xF0, 0];
+            if self.audio {
+                let a = Self::AUDIO_PID.to_be_bytes();
+                pmt[2] += 5;
+                pmt.extend_from_slice(&[0x0F, 0xE0 | a[0], a[1], 0xF0, 0]); // AAC in ADTS
+            }
             self.table(0, 0, &pat, &mut out);
             self.table(1, Self::PMT_PID, &pmt, &mut out);
         }
         let pts = self.pts(us);
-        let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5];
+        self.pes(2, Self::VIDEO_PID, 0xE0, pts, data, key, &mut out);
+        out
+    }
+
+    /// One ADTS AAC frame stamped `us` on the camera's clock (the same clock as the video). Nothing before the first
+    /// video frame, as the file's timeline starts there.
+    fn audio(&mut self, data: &[u8], us: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let Some(last) = self.last_us else { return out };
+        let total = self.total_us as i64 + us.wrapping_sub(last) as i32 as i64;
+        if total < 0 || !self.audio {
+            return out;
+        }
+        let pts = (total as u64 * 9 / 100) & ((1 << 33) - 1);
+        self.pes(3, Self::AUDIO_PID, 0xC0, pts, data, false, &mut out);
+        out
+    }
+
+    /// A PES packet split into TS packets; the video's carry the clock (PCR) in their first packet.
+    fn pes(&mut self, which: usize, pid: u16, stream_id: u8, pts: u64, data: &[u8], key: bool, out: &mut Vec<u8>) {
+        let pcr_here = stream_id == 0xE0;
+        let pid = pid.to_be_bytes();
+        // Video may leave the length open; audio must give it.
+        let len = if pcr_here { 0 } else { (8 + data.len()).min(0xFFFF) as u16 };
+        let mut pes = vec![0, 0, 1, stream_id, (len >> 8) as u8, len as u8, 0x80, 0x80, 5];
         pes.extend_from_slice(&[
             0x21 | ((pts >> 29) & 0x0E) as u8,
             (pts >> 22) as u8,
@@ -298,18 +330,19 @@ impl Mpegts {
         let mut first = true;
         while !rest.is_empty() {
             // The first packet of a frame carries the clock; the last pads itself out to 188 with an adaptation field.
-            let n = rest.len().min(if first { 176 } else { 184 });
+            let pcr_now = first && pcr_here;
+            let n = rest.len().min(if pcr_now { 176 } else { 184 });
             let field = 184 - n;
             let mut p = [0xFF; 188];
-            p[..4].copy_from_slice(&[0x47, (first as u8) << 6 | pid[0], pid[1], if field > 0 { 0x30 } else { 0x10 } | self.counters[2]]);
-            self.counters[2] = (self.counters[2] + 1) & 15;
+            p[..4].copy_from_slice(&[0x47, (first as u8) << 6 | pid[0], pid[1], if field > 0 { 0x30 } else { 0x10 } | self.counters[which]]);
+            self.counters[which] = (self.counters[which] + 1) & 15;
             if field > 0 {
                 p[4] = field as u8 - 1;
             }
             if field > 1 {
-                p[5] = if first { 0x10 | (key as u8) << 6 } else { 0 };
+                p[5] = if pcr_now { 0x10 | (key as u8) << 6 } else { 0 };
             }
-            if first {
+            if pcr_now {
                 p[6..12].copy_from_slice(&pcr);
             }
             p[188 - n..].copy_from_slice(&rest[..n]);
@@ -317,7 +350,6 @@ impl Mpegts {
             rest = &rest[n..];
             first = false;
         }
-        out
     }
 }
 
@@ -347,6 +379,8 @@ struct RecFrame {
     data: Vec<u8>,
     key: bool,
     us: u32,
+    /// An ADTS AAC frame rather than video.
+    audio: bool,
 }
 
 pub struct Recorder {
@@ -364,7 +398,8 @@ impl Recorder {
     /// (0 = one file). Fragmented MP4 (a fragment per keyframe): a crash loses only the last fragment, and closing
     /// a segment never rewrites it the way faststart did. WebView2 plays and seeks these over the asset protocol.
     /// Timed by the camera's clock, so playback is as steady as the camera however unevenly frames arrived here.
-    pub fn new(codec: VideoType, dir: &Path, base: &str, segment_minutes: u32) -> std::io::Result<Self> {
+    /// `audio`: the camera sends AAC, so the file gets a sound track (fed with [`Recorder::push_audio`]).
+    pub fn new(codec: VideoType, dir: &Path, base: &str, segment_minutes: u32, audio: bool) -> std::io::Result<Self> {
         let template = dir.join(format!("{base}_%Y-%m-%d_%H-%M-%S.mp4")).to_string_lossy().into_owned();
         let seconds = if segment_minutes == 0 { 360_000 } else { segment_minutes * 60 }.to_string();
         let mut child = spawn(
@@ -376,8 +411,8 @@ impl Recorder {
             false,
         )?;
         let stdin = child.stdin.take().expect("piped stdin");
-        let mut mux = Mpegts::new(codec);
-        Ok(Self::with_writer(dir.to_owned(), Some(child), stdin, move |f| mux.frame(&f.data, f.key, f.us)))
+        let mut mux = Mpegts::new(codec, audio);
+        Ok(Self::with_writer(dir.to_owned(), Some(child), stdin, move |f| if f.audio { mux.audio(&f.data, f.us) } else { mux.frame(&f.data, f.key, f.us) }))
     }
 
     /// The writer thread owns all waiting on the disk; the camera loop only ever queues or drops.
@@ -415,10 +450,21 @@ impl Recorder {
         self.waiting = false;
         self.dropping = false;
         self.queued.fetch_add(data.len(), Relaxed);
-        if tx.send(RecFrame { data: data.to_vec(), key: keyframe, us }).is_err() {
+        if tx.send(RecFrame { data: data.to_vec(), key: keyframe, us, audio: false }).is_err() {
             return Pushed::Dead; // the writer stopped: ffmpeg quit
         }
         Pushed::Queued
+    }
+
+    /// One ADTS AAC frame. Skipped while video waits for a keyframe or the queue is full; video reports those.
+    pub fn push_audio(&mut self, data: &[u8], us: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(tx) = &self.tx else { return };
+        if self.waiting || self.queued.load(Relaxed) + data.len() > REC_QUEUE_BYTES {
+            return;
+        }
+        self.queued.fetch_add(data.len(), Relaxed);
+        let _ = tx.send(RecFrame { data: data.to_vec(), key: false, us, audio: true });
     }
 }
 
@@ -471,7 +517,7 @@ mod tests {
         let dir = std::env::temp_dir().join("reolink-rs-rec-gone");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0).unwrap();
+        let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0, false).unwrap();
         assert_eq!(rec.push(b"\0\0\0\x01", true, 0), Pushed::Queued);
         let mut child = rec.child.take().unwrap();
         child.kill().unwrap();
@@ -528,7 +574,7 @@ mod tests {
 
     #[test]
     fn mpegts_time_follows_the_camera_clock() {
-        let mut m = Mpegts::new(VideoType::H265);
+        let mut m = Mpegts::new(VideoType::H265, false);
         let t0 = m.pts(u32::MAX - 33_000);
         assert_eq!(m.pts(u32::MAX) - t0, 2970, "33 ms at 90 kHz");
         assert_eq!(m.pts(32_999) - t0, 5940, "across the clock wrapping");
@@ -540,7 +586,7 @@ mod tests {
     #[test]
     fn mpegts_packets_are_well_formed() {
         for len in [0, 1, 150, 161, 162, 163, 176, 500, 100_000] {
-            let mut m = Mpegts::new(VideoType::H264);
+            let mut m = Mpegts::new(VideoType::H264, false);
             let out = m.frame(&vec![0xAB; len], true, 0);
             assert_eq!(out.len() % 188, 0, "{len} bytes");
             let packets: Vec<_> = out.chunks(188).collect();
@@ -576,7 +622,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("reolink-rs-rec-time-{enc}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut rec = Recorder::new(codec, &dir, "Cam", 0).unwrap();
+        let mut rec = Recorder::new(codec, &dir, "Cam", 0, false).unwrap();
         let start = u32::MAX - 1_000_000; // the camera's clock wraps a second in
         for (i, unit) in units.iter().enumerate() {
             if i == 20 {
@@ -608,6 +654,63 @@ mod tests {
         for w in rows.windows(2) {
             let gap = w[1].0 - w[0].0;
             assert!((gap - 1.0 / 15.0).abs() < 0.002, "frame gap {gap}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// AAC frames stamped on the camera's clock land in the file as a sound track lined up with the video.
+    #[test]
+    fn recording_with_audio_has_a_matching_aac_track() {
+        const N: usize = 45; // 3 s of video at 15 fps
+        let units = access_units("libx264", ("-x264-params", "aud=1:keyint=15:bframes=0"), "h264", &[0, 0, 0, 1, 9], N);
+        let adts = Command::new(ffmpeg())
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=3", "-ac", "1", "-c:a", "aac", "-f", "adts", "pipe:1"])
+            .output()
+            .expect("ffmpeg on PATH")
+            .stdout;
+        let mut frames = vec![];
+        let mut rest = &adts[..];
+        while rest.len() > 7 {
+            let len = ((rest[3] as usize & 3) << 11) | (rest[4] as usize) << 3 | rest[5] as usize >> 5;
+            frames.push(rest[..len].to_vec());
+            rest = &rest[len..];
+        }
+        let dir = std::env::temp_dir().join("reolink-rs-rec-audio");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rec = Recorder::new(VideoType::H264, &dir, "Cam", 0, true).unwrap();
+        let start = u32::MAX - 1_000_000; // the camera's clock wraps a second in
+        let mut next_audio = 0;
+        for (i, unit) in units.iter().enumerate() {
+            let t = i as u64 * 1_000_000 / 15;
+            rec.push(unit, unit.windows(4).any(|w| w == [0, 0, 1, 0x65]), start.wrapping_add(t as u32));
+            // Audio arrives interleaved, each frame 64 ms (1024 samples at 16 kHz) after the last.
+            while next_audio < frames.len() && (next_audio as u64 * 64_000) <= t {
+                rec.push_audio(&frames[next_audio], start.wrapping_add((next_audio as u64 * 64_000) as u32));
+                next_audio += 1;
+            }
+        }
+        let mut child = rec.child.take().unwrap();
+        rec.tx.take();
+        child.wait().unwrap();
+
+        let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let probe = |stream: &str| {
+            let out = Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", stream, "-show_entries", "stream=codec_name:packet=pts_time", "-of", "csv=p=0"])
+                .arg(&file)
+                .output()
+                .expect("ffprobe on PATH");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let audio = probe("a");
+        assert!(audio.lines().any(|l| l == "aac"), "an AAC track: {audio}");
+        let times: Vec<f64> = audio.lines().filter_map(|l| l.parse().ok()).collect();
+        assert!(times.len() >= 40, "{} audio packets", times.len());
+        assert!(times[0].abs() < 0.07, "audio starts with the video, at {}", times[0]);
+        for w in times.windows(2) {
+            assert!((w[1] - w[0] - 0.064).abs() < 0.002, "audio gap {}", w[1] - w[0]);
         }
         let _ = std::fs::remove_dir_all(dir);
     }
