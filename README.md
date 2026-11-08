@@ -83,6 +83,14 @@ Hold Ctrl and scroll over a live picture to zoom in and out around the pointer, 
 resets it. A tile's control bar also has the light (on for 3 minutes per click), the camera's speaker (talk through
 it with this PC's microphone) and the siren (a second click confirms).
 
+Smooth live view (0.4.13): cameras send each keyframe as fast as their uplink allows and the frames behind it
+arrive in a burst, so the player shows every frame at its time on the camera's clock plus a small, self-measured
+delay instead of as it arrives — no more freeze / fast-forward / freeze (`ui/playout.js`).
+
+Motion recording (0.4.17): only video motion inside the painted detection area starts a motion recording; AI-only
+alerts (person/vehicle from the camera's AI zones) no longer trigger it. Each alarm event is logged with the camera
+name, status and AI type.
+
 Live view health: a tile whose camera stops sending frames says "No new video for N s" with a Reconnect button
 (the app also reconnects by itself after 20 s); an offline tile shows why, with Retry now. Recording paused (tray)
 shows in both views, and clicking it resumes. Keyboard: Tab to a tile, arrows move between tiles, Shift+arrows move its camera, Enter for single
@@ -93,8 +101,10 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
+Current version: **0.4.17**.
+
 Next phases toward parity with the official client:
-1. Live audio; PTZ presets/zoom/focus
+1. Live audio playback; PTZ presets and optical zoom/focus
 2. Expanded NVR compatibility, playback while SD clips download, and motion markers on the timeline
 3. Alarm/motion notifications and event log; firmware update
 4. Users, Wi-Fi network switching, AI detection config (need protocol work; read-only today)
