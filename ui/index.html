@@ -281,6 +281,16 @@
     </div>
   </dialog>
 
+  <dialog id="reel-dialog" class="reel-dialog" aria-labelledby="reel-title">
+    <header>
+      <strong id="reel-title"></strong>
+      <button class="icon-btn" id="reel-close" aria-label="Close">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
+    <video id="reel-video" controls autoplay></video>
+  </dialog>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="playout.js"></script>
   <script src="audioplayout.js"></script>

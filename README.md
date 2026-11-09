@@ -98,6 +98,10 @@ Clear/Fluent stream settings first.
 Recordings with sound (0.4.20): manual, motion and scheduled recordings include the camera's AAC audio as a second
 track in the MP4 (ADPCM cameras record video only).
 
+Film strip (0.4.21): a film-strip button on each live tile shows today's recordings as a horizontal reel with
+thumbnails. A Local / SD card switch picks the source, and a clip plays in a pop-up player without leaving live view
+(SD card clips download fully before playing).
+
 PTZ presets (0.4.19): the PTZ panel lists the camera's presets; click one to go there, save the current position,
 rename or delete. Cameras with a zoom lens also get zoom and focus buttons (hold to move).
 
@@ -122,7 +126,7 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
-Current version: **0.4.20**.
+Current version: **0.4.21**.
 
 Next phases toward parity with the official client:
 1. Optical auto-focus; AI detection sensitivity and AI zones (Argus 4 Pro refuses those messages)

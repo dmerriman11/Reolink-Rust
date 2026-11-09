@@ -239,6 +239,24 @@ body.dragging-feed, body.dragging-feed * { cursor: grabbing !important; }
 .bar-btn.recording svg { fill: var(--rec); }
 .bar-btn[aria-pressed="true"] { color: var(--accent); background: rgba(244, 177, 62, .14); }
 .bar-btn.armed { background: var(--rec); color: #fff; }
+/* Today's recordings: a film strip taking the bar's first row, sprocket holes along both edges. */
+.reel {
+  --holes: linear-gradient(90deg, transparent 5px, rgba(255, 255, 255, .28) 5px 11px, transparent 11px);
+  flex: 0 0 100%; min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none;
+  padding: 11px 6px; border-radius: 6px; color: var(--faint); font-size: 11.5px;
+  background: var(--holes) 0 3px / 16px 5px repeat-x local, var(--holes) 0 calc(100% - 3px) / 16px 5px repeat-x local, #08090a;
+}
+.reel-frame { flex: none; display: grid; gap: 3px; width: 104px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.reel-frame .pb-thumb { border-radius: 3px; font-size: 9.5px; outline: 1px solid var(--line-strong); }
+.tile .reel-frame img { position: static; width: 100%; height: 100%; object-fit: cover; visibility: visible; } /* undo the live picture's .tile img rules */
+.reel .seg { position: sticky; left: 0; z-index: 1; flex: none; flex-direction: column; align-self: center; min-height: 0; background: #08090a; }
+.reel .seg button { white-space: nowrap; }
+.reel-note { align-self: center; padding: 0 8px; white-space: nowrap; }
+.reel-frame:hover, .reel-frame:focus-visible { color: var(--accent); }
+.reel-frame:hover .pb-thumb, .reel-frame:focus-visible .pb-thumb { outline-color: var(--accent); }
+.reel-dialog { width: min(1100px, 92vw); overflow: hidden; }
+.reel-dialog header { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 8px 16px; font: 600 13px/1.2 var(--display); }
+.reel-dialog video { display: block; width: 100%; max-height: 80vh; background: #000; }
 .tile.zoomed img, .tile.zoomed canvas { transform-origin: 0 0; cursor: grab; touch-action: none; }
 .tile.zoomed img:active, .tile.zoomed canvas:active { cursor: grabbing; }
 .tile .tile-zoom { top: 44px; left: 12px; right: auto; bottom: auto; }

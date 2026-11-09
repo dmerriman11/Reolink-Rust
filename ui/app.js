@@ -16,6 +16,7 @@ const ICON = {
   camera: '<svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>',
   rec: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  film: '<svg viewBox="0 0 24 24"><path d="M3 5h18v14H3zM7 5v14M17 5v14M3 9.5h4M3 14.5h4M17 9.5h4M17 14.5h4"/></svg>',
   wifi: '<svg viewBox="0 0 24 24"><path class="a3" d="M2.5 9.5a14 14 0 0 1 19 0"/><path class="a2" d="M5.5 13a9.5 9.5 0 0 1 13 0"/><path class="a1" d="M8.6 16.4a4.8 4.8 0 0 1 6.8 0"/><circle cx="12" cy="19.6" r="1.4" fill="currentColor" stroke="none"/></svg>',
   plus: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 9v6M9 12h6"/></svg>',
   grip: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.8"/><circle cx="15" cy="6" r="1.8"/><circle cx="9" cy="12" r="1.8"/><circle cx="15" cy="12" r="1.8"/><circle cx="9" cy="18" r="1.8"/><circle cx="15" cy="18" r="1.8"/></svg>',
@@ -577,7 +578,14 @@ function buildTile(t, d, key) {
   const speaker = toggle(ICON.speaker, "Talk through the camera's speaker using this PC's microphone", talk?.id === d.id, () => (talk?.id === d.id ? stopTalk() : startTalk(d.id)));
   const hearing = audible?.id === d.id;
   const hear = d.audio ? [toggle(ICON.listen, hearing ? "Mute (M)" : "Listen to the camera's microphone (M)", hearing, () => listen(hearing ? null : d.id))] : [];
-  bar.append(seg, snap, rec, light, ...hear, speaker, sirenButton(d), el("span", "spacer"), close);
+  // Today's recordings as a film strip in the bar; kept on the tile so a rebuild doesn't close it.
+  const film = toggle(ICON.film, "Today's recordings", t.reel?.id === d.id, () => {
+    if (t.reel?.id !== d.id) return openReel(t, d, reelSource);
+    t.reel = null;
+    buildTile(t, d, t.key);
+  });
+  if (t.reel?.id === d.id) bar.append(reelStrip(t, d, t.reel));
+  bar.append(seg, snap, rec, film, light, ...hear, speaker, sirenButton(d), el("span", "spacer"), close);
   t.root.append(bar, t.zoomChip);
 }
 
@@ -1762,9 +1770,9 @@ const playTime = () => PB.cur ? PB.cur.start + video.currentTime * SEC : null;
 const camFiles = (cam) => PB.byCam.get(cam) ?? [];
 const dayFiles = (cam) => camFiles(cam).filter((f) => f.end > PB.day && f.start < addDays(PB.day, 1));
 
-function fileSrc(name) {
-  const sep = PB.dir.includes("\\") ? "\\" : "/";
-  const path = PB.dir ? PB.dir.replace(/[\\/]$/, "") + sep + name : name;
+function fileSrc(name, dir = PB.dir) {
+  const sep = dir.includes("\\") ? "\\" : "/";
+  const path = dir ? dir.replace(/[\\/]$/, "") + sep + name : name;
   return window.__TAURI__ ? window.__TAURI__.core.convertFileSrc(path) : "demo.mp4"; // design preview: one sample clip
 }
 
@@ -1984,6 +1992,92 @@ function showThumb(card, src) {
   } else {
     box.textContent = "No preview";
   }
+}
+
+// ---------- live tile: today's recordings as a film strip ----------
+// Concept: asks the recording folder or the camera directly, so it works without opening the NVR view.
+const reelObserver = thumbWatcher();
+let reelSource = "local"; // the storage last picked on a strip; the next strip opens on it
+async function reelFiles(d, source) {
+  const cam = safeName(d.name), day = dayOf(Date.now()), newest = (a, b) => b.start - a.start;
+  if (source === "sd") {
+    const clips = await invoke("sd_recordings", { id: d.id, day: isoDay(day) });
+    return { files: clips.map((c) => ({ name: c.name, cam, start: new Date(c.start).getTime(), end: new Date(c.end).getTime(), size: 0, sd: true, sdId: d.id, sdStart: c.start, sdEnd: c.end, types: c.types || "" })).sort(newest) };
+  }
+  const res = await invoke("list_recordings");
+  return { dir: res.dir, files: res.files.map(parseFile).filter((f) => f && f.cam === cam && f.end > day).sort(newest) };
+}
+
+// Show the tile's strip for `source`: at once with a note (an SD search can take a while), then with what was found.
+async function openReel(t, d, source) {
+  const reel = (t.reel = { id: d.id, source, dir: "", files: [], note: source === "sd" ? "Searching the camera's SD card…" : "" });
+  const draw = () => { if (t.reel === reel && t.dev === d.id) buildTile(t, d, t.key); };
+  draw();
+  try {
+    Object.assign(reel, await reelFiles(d, source));
+    reel.note = reel.files.length ? "" : source === "sd" ? "Nothing on the SD card today" : "Nothing recorded today";
+  } catch (e) { reel.note = source === "sd" ? `Camera SD unavailable: ${e}` : `${e}`; }
+  draw();
+}
+
+function reelStrip(t, d, reel) {
+  const strip = el("div", "reel");
+  strip.setAttribute("role", "group");
+  strip.setAttribute("aria-label", "Today's recordings");
+  strip.onwheel = (e) => { if (!e.ctrlKey) { e.preventDefault(); strip.scrollLeft += e.deltaY; } }; // a plain wheel scrolls the strip sideways
+  const seg = el("div", "seg");
+  for (const [label, source] of [["Local", "local"], ["SD card", "sd"]]) {
+    const b = Object.assign(el("button"), { textContent: label });
+    b.setAttribute("aria-pressed", String(reel.source === source));
+    b.onclick = (e) => { e.stopPropagation(); reelSource = source; openReel(t, d, source); };
+    seg.append(b);
+  }
+  strip.append(seg);
+  if (reel.note) strip.append(Object.assign(el("span", "reel-note"), { textContent: reel.note }));
+  for (const f of reel.files) {
+    const b = el("button", "reel-frame", `<div class="pb-thumb"></div><span>${fmtTime(f.start, false)}</span>`);
+    b._file = f;
+    b.title = `${fmtTime(f.start)} · ${fmtDur(f.end - f.start)}`;
+    b.onclick = (e) => { e.stopPropagation(); playReel(d, reel, f); };
+    if (f.sd) b.firstChild.textContent = sdTypeLabel(f.types) || "SD"; // no picture until the clip is downloaded
+    else if (thumbs.has(thumbKey(f))) showThumb(b, thumbs.get(thumbKey(f)));
+    else reelObserver.observe(b);
+    strip.append(b);
+  }
+  return strip;
+}
+
+function playReel(d, reel, f) {
+  const dlg = $("#reel-dialog"), v = $("#reel-video"), title = $("#reel-title");
+  const show = async (f) => {
+    const label = `${d.name} · ${fmtTime(f.start)}`, current = () => v._file === f;
+    v._file = f;
+    v.removeAttribute("src"); v.load();
+    title.textContent = label;
+    if (f.sd && !f.src) {
+      // shortcut: waits for the whole clip; the NVR view plays while it downloads (feedSd), reuse that if this ships
+      title.textContent = `${label} · downloading from the SD card…`;
+      try {
+        let p = await invoke("sd_recording_start", { id: f.sdId, start: f.sdStart, end: f.sdEnd });
+        while (!p.done) {
+          await sleep(1000);
+          if (!current()) return;
+          p = await invoke("sd_recording_progress", { key: p.key });
+        }
+        if (p.error || !p.file) throw p.error || "no video came back";
+        f.src = fileUrl(p.file);
+      } catch (e) { if (current()) title.textContent = `${label} · camera SD: ${e}`; return; }
+      if (!current()) return;
+      title.textContent = label;
+    }
+    v.src = f.src || fileSrc(f.name, reel.dir);
+  };
+  show(f);
+  v.onended = () => { const next = reel.files[reel.files.indexOf(v._file) - 1]; if (next) show(next); }; // the following recording sits before it (newest first)
+  dlg.onclick = (e) => { if (e.target === dlg) dlg.close(); }; // the backdrop
+  dlg.onclose = () => { v._file = null; v.removeAttribute("src"); v.load(); }; // stop playing (and waiting) and let go of the file
+  $("#reel-close").onclick = () => dlg.close();
+  if (!dlg.open) dlg.showModal();
 }
 
 let gridKey = null;
