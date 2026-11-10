@@ -100,7 +100,9 @@ track in the MP4 (ADPCM cameras record video only).
 
 Film strip (0.4.21): a film-strip button on each live tile shows today's recordings as a horizontal reel with
 thumbnails. A Local / SD card switch picks the source, and a clip plays in a pop-up player without leaving live view
-(SD card clips download fully before playing).
+(SD card clips download fully before playing, with a progress bar). SD card frames get real thumbnails (0.4.22): the
+app fetches each clip's first 3 seconds from the camera, one at a time as frames scroll into view, and takes a frame
+from them (a battery camera wakes for each one).
 
 PTZ presets (0.4.19): the PTZ panel lists the camera's presets; click one to go there, save the current position,
 rename or delete. Cameras with a zoom lens also get zoom and focus buttons (hold to move).
@@ -126,7 +128,7 @@ right-click menu has Show, Pause recording (stops manual and scheduled recording
 
 Reboot a saved camera and time its reconnect: `cargo run --example reboot_check -- "<device name>"`.
 
-Current version: **0.4.21**.
+Current version: **0.4.22**.
 
 Next phases toward parity with the official client:
 1. Optical auto-focus; AI detection sensitivity and AI zones (Argus 4 Pro refuses those messages)
