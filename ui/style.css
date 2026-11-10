@@ -256,6 +256,7 @@ body.dragging-feed, body.dragging-feed * { cursor: grabbing !important; }
 .reel-frame:hover .pb-thumb, .reel-frame:focus-visible .pb-thumb { outline-color: var(--accent); }
 .reel-dialog { width: min(1100px, 92vw); overflow: hidden; }
 .reel-dialog header { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 8px 16px; font: 600 13px/1.2 var(--display); }
+.reel-dialog progress:not([hidden]) { display: block; width: 100%; height: 6px; accent-color: var(--accent); }
 .reel-dialog video { display: block; width: 100%; max-height: 80vh; background: #000; }
 .tile.zoomed img, .tile.zoomed canvas { transform-origin: 0 0; cursor: grab; touch-action: none; }
 .tile.zoomed img:active, .tile.zoomed canvas:active { cursor: grabbing; }

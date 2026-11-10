@@ -2020,6 +2020,29 @@ async function openReel(t, d, source) {
   draw();
 }
 
+// SD thumbnails fetch each clip's first seconds from the camera, so one at a time, newest first, only once on screen.
+const sdThumbKey = (f) => `sd|${f.sdId}|${f.sdStart}`;
+const sdThumbQueue = [];
+let sdThumbBusy = false;
+const sdThumbObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) { sdThumbObserver.unobserve(e.target); sdThumbQueue.push(e.target); }
+  pumpSdThumbs();
+}, { rootMargin: "100px" });
+async function pumpSdThumbs() {
+  if (sdThumbBusy) return;
+  sdThumbBusy = true;
+  while (sdThumbQueue.length) {
+    const b = sdThumbQueue.shift(), f = b._file;
+    if (!b.isConnected) continue; // the strip was rebuilt or closed; a new frame asks again
+    try {
+      const src = fileUrl(await invoke("sd_thumb", { id: f.sdId, start: f.sdStart, end: f.sdEnd }));
+      thumbs.set(sdThumbKey(f), src);
+      if (b.isConnected) showThumb(b, src);
+    } catch { /* not cached: keeps its type label, and reopening the strip tries again */ }
+  }
+  sdThumbBusy = false;
+}
+
 function reelStrip(t, d, reel) {
   const strip = el("div", "reel");
   strip.setAttribute("role", "group");
@@ -2039,8 +2062,11 @@ function reelStrip(t, d, reel) {
     b._file = f;
     b.title = `${fmtTime(f.start)} · ${fmtDur(f.end - f.start)}`;
     b.onclick = (e) => { e.stopPropagation(); playReel(d, reel, f); };
-    if (f.sd) b.firstChild.textContent = sdTypeLabel(f.types) || "SD"; // no picture until the clip is downloaded
-    else if (thumbs.has(thumbKey(f))) showThumb(b, thumbs.get(thumbKey(f)));
+    if (f.sd) {
+      b.title += ` · ${sdTypeLabel(f.types) || "SD"}`;
+      if (thumbs.has(sdThumbKey(f))) showThumb(b, thumbs.get(sdThumbKey(f)));
+      else { b.firstChild.textContent = sdTypeLabel(f.types) || "SD"; sdThumbObserver.observe(b); }
+    } else if (thumbs.has(thumbKey(f))) showThumb(b, thumbs.get(thumbKey(f)));
     else reelObserver.observe(b);
     strip.append(b);
   }
@@ -2048,26 +2074,35 @@ function reelStrip(t, d, reel) {
 }
 
 function playReel(d, reel, f) {
-  const dlg = $("#reel-dialog"), v = $("#reel-video"), title = $("#reel-title");
+  const dlg = $("#reel-dialog"), v = $("#reel-video"), title = $("#reel-title"), bar = $("#reel-progress");
   const show = async (f) => {
     const label = `${d.name} · ${fmtTime(f.start)}`, current = () => v._file === f;
     v._file = f;
     v.removeAttribute("src"); v.load();
     title.textContent = label;
+    bar.hidden = true;
     if (f.sd && !f.src) {
       // shortcut: waits for the whole clip; the NVR view plays while it downloads (feedSd), reuse that if this ships
       title.textContent = `${label} · downloading from the SD card…`;
+      bar.removeAttribute("value"); // moving stripe until the first video arrives
+      bar.hidden = false;
       try {
         let p = await invoke("sd_recording_start", { id: f.sdId, start: f.sdStart, end: f.sdEnd });
         while (!p.done) {
-          await sleep(1000);
+          await sleep(500);
           if (!current()) return;
           p = await invoke("sd_recording_progress", { key: p.key });
+          // An estimate: video seconds received over the clip's length.
+          if (p.seconds > 0) {
+            bar.value = Math.min(1, p.seconds * SEC / (f.end - f.start));
+            title.textContent = `${label} · downloading from the SD card… ${Math.round(bar.value * 100)}%`;
+          }
         }
         if (p.error || !p.file) throw p.error || "no video came back";
         f.src = fileUrl(p.file);
-      } catch (e) { if (current()) title.textContent = `${label} · camera SD: ${e}`; return; }
+      } catch (e) { if (current()) { bar.hidden = true; title.textContent = `${label} · camera SD: ${e}`; } return; }
       if (!current()) return;
+      bar.hidden = true;
       title.textContent = label;
     }
     v.src = f.src || fileSrc(f.name, reel.dir);

@@ -39,6 +39,11 @@ impl Clock {
 }
 fn time_xml(t: NaiveDateTime) -> String { format!("<year>{}</year><month>{}</month><day>{}</day><hour>{}</hour><minute>{}</minute><second>{}</second>",t.year(),t.month(),t.day(),t.hour(),t.minute(),t.second()) }
 fn parse_time(s: &str) -> Result<NaiveDateTime, String> { NaiveDateTime::parse_from_str(s,"%Y-%m-%dT%H:%M:%S").map_err(|_|"Invalid recording time".into()) }
+/// The end of a clip's first few seconds: enough for a thumbnail without fetching the whole clip.
+pub fn head_end(start: &str, end: &str) -> Result<String, String> {
+    let (a, b) = (parse_time(start)?, parse_time(end)?);
+    Ok(b.min(a + chrono::Duration::seconds(3)).format("%Y-%m-%dT%H:%M:%S").to_string())
+}
 fn clip(name: String, a: NaiveDateTime, b: NaiveDateTime, types: String) -> Clip {
     Clip { name, start: a.format("%Y-%m-%dT%H:%M:%S").to_string(), end: b.format("%Y-%m-%dT%H:%M:%S").to_string(), types }
 }
@@ -122,6 +127,8 @@ pub struct Track { pub path: PathBuf, pub mime: String, pub bytes: u64 }
 pub struct Progress {
     pub key: String,
     pub tracks: Vec<Track>,
+    /// Seconds of video received so far (frames / the stream's stated frame rate), for a progress bar.
+    pub seconds: f64,
     pub done: bool,
     pub file: Option<PathBuf>,
     pub error: Option<String>,
@@ -247,12 +254,15 @@ pub async fn download(cam: Arc<BcCamera>, channel:u8, start:&str, end:&str, dest
         let (mut codec, mut fps) = (String::new(), 0u8);
         let (mut pipe_v, mut pipe_a): (Option<Pipe>, Option<Pipe>) = (None, None);
         let mut first_video = true;
+        let mut frames = 0u64;
         let publish = |path: &Path, mime: String| progress.lock().unwrap().tracks.push(Track { path: path.to_owned(), mime, bytes: 0 });
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 SdChunk::Codec { codec: c, fps: f } => { codec = c; fps = f; }
                 SdChunk::Video(data) => {
                     video_file.write_all(&data).await.map_err(|e| e.to_string())?;
+                    frames += 1; // one chunk is one frame
+                    progress.lock().unwrap().seconds = frames as f64 / f64::from(fps.max(1));
                     if first_video {
                         first_video = false;
                         // No parameter sets: play after the download instead.
@@ -300,6 +310,10 @@ pub async fn download(cam: Arc<BcCamera>, channel:u8, start:&str, end:&str, dest
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn thumbnail_heads_stay_inside_the_clip() {
+        assert_eq!(head_end("2026-11-09T10:00:00","2026-11-09T10:05:00").unwrap(),"2026-11-09T10:00:03");
+        assert_eq!(head_end("2026-11-09T10:00:00","2026-11-09T10:00:02").unwrap(),"2026-11-09T10:00:02");
+    }
     #[test] fn camera_clock_and_ranges() {
         assert_eq!(time_xml(parse_time("2026-10-30T12:34:56").unwrap()),"<year>2026</year><month>10</month><day>30</day><hour>12</hour><minute>34</minute><second>56</second>");
         assert!(parse_time("../bad").is_err());

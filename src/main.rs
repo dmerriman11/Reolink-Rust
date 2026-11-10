@@ -830,6 +830,13 @@ async fn sd_recordings(app: State<'_,App>, id:u64, day:String) -> Result<Vec<sd:
     tx.send(Cmd::SdSearch{day,reply}).map_err(|_|"Camera removed")?;
     tokio::time::timeout(std::time::Duration::from_secs(90),rx).await.map_err(|_|"SD search timed out")?.map_err(|_|"Camera session ended")?
 }
+/// Where a camera's SD downloads are cached.
+fn sd_cache(handle:&tauri::AppHandle,c:&DeviceConfig) -> Result<PathBuf,String> {
+    use std::hash::{Hash,Hasher};
+    let mut h=std::collections::hash_map::DefaultHasher::new();
+    (&c.host,&c.uid,c.channel).hash(&mut h);
+    Ok(handle.path().app_cache_dir().map_err(|e|e.to_string())?.join("sd").join(format!("{:x}",h.finish())))
+}
 /// The one SD download at a time: starting another aborts it (the page has moved on), so the camera and ffmpeg
 /// never serve two clips at once.
 static SD_DOWNLOAD: Mutex<Option<sd::Shared>> = Mutex::new(None);
@@ -837,12 +844,9 @@ static SD_DOWNLOAD: Mutex<Option<sd::Shared>> = Mutex::new(None);
 /// Start (or find) the download of a clip; the page then polls `sd_recording_progress` with the returned key.
 #[tauri::command]
 fn sd_recording_start(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:String,end:String) -> Result<sd::Progress,String> {
-    use std::hash::{Hash,Hasher};
     let (tx,cache)={
         let inner=app.inner.lock().unwrap();let d=&inner.devices[inner.index(id)?];
-        let mut h=std::collections::hash_map::DefaultHasher::new();
-        (&d.config.host,&d.config.uid,d.config.channel).hash(&mut h);
-        (d.sender(),handle.path().app_cache_dir().map_err(|e|e.to_string())?.join("sd").join(format!("{:x}",h.finish())))
+        (d.sender(),sd_cache(&handle,&d.config)?)
     };
     let dest=sd::dest(&cache,&start,&end)?;
     let key=dest.to_string_lossy().into_owned();
@@ -857,6 +861,42 @@ fn sd_recording_start(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:St
     }
     *current=Some(progress.clone());
     Ok(sd_progress(&handle,&progress))
+}
+/// A thumbnail for an SD clip: its first seconds are fetched like a clip download (into their own folder) and a
+/// frame is taken from them. Waits rather than interrupt a clip the page is downloading; a clip started meanwhile
+/// interrupts this instead.
+#[tauri::command]
+async fn sd_thumb(handle:tauri::AppHandle,app: State<'_,App>,id:u64,start:String,end:String) -> Result<String,String> {
+    let (tx,dir)={
+        let inner=app.inner.lock().unwrap();let d=&inner.devices[inner.index(id)?];
+        (d.sender(),sd_cache(&handle,&d.config)?.join("thumbs"))
+    };
+    let head=sd::head_end(&start,&end)?;
+    let dest=sd::dest(&dir,&start,&head)?;
+    let jpg=recordings::thumb_dir(&dir).join(dest.with_extension("jpg").file_name().unwrap_or_default());
+    if !jpg.is_file() {
+        let progress: sd::Shared=std::sync::Arc::new(Mutex::new(sd::Progress { key: dest.to_string_lossy().into_owned(), ..Default::default() }));
+        // Guards stay inside these blocks: the future must stay Send across the sleeps.
+        while !{
+            let mut current=SD_DOWNLOAD.lock().unwrap();
+            let free=current.as_ref().is_none_or(|p|p.lock().unwrap().done);
+            if free { *current=Some(progress.clone()); }
+            free
+        } { tokio::time::sleep(std::time::Duration::from_millis(300)).await; }
+        tx.send(Cmd::SdDownload{start,end:head,dest:dest.clone(),progress:progress.clone()}).map_err(|_|"Camera removed")?;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if !SD_DOWNLOAD.lock().unwrap().as_ref().is_some_and(|p|std::sync::Arc::ptr_eq(p,&progress)) { return Err("A clip download took over".into()); }
+            let (done,error)={ let p=progress.lock().unwrap(); (p.done,p.error.clone()) };
+            if let Some(e)=error {return Err(e);}
+            if done {break;}
+        }
+        let r=recordings::thumb(&dest,&dir).await;
+        let _=std::fs::remove_file(&dest);
+        r?;
+    }
+    allow_asset(&handle,&jpg);
+    Ok(jpg.display().to_string())
 }
 #[tauri::command]
 fn sd_recording_progress(handle:tauri::AppHandle,key:String) -> Result<sd::Progress,String> {
@@ -1069,7 +1109,7 @@ fn main() {
             camera_pages, camera_settings, save_camera_settings, sync_camera_time, reboot_camera, camera_test,
             camera_snapshot,
             get_prefs, save_prefs, pick_folder, add_found, motion_events,
-            set_playback_default, sd_recordings, sd_recording_start, sd_recording_progress, camera_users, camera_user_add, camera_user_password, camera_user_delete, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
+            set_playback_default, sd_recordings, sd_recording_start, sd_recording_progress, sd_thumb, camera_users, camera_user_add, camera_user_password, camera_user_delete, set_live_paused, list_recordings, delete_recording, reveal_recording, reveal_clip, reconnect, pause_recording, export_clip, recording_still, recording_thumb
         ])
         .setup(|app| {
             let _ = events::APP.set(app.handle().clone());
