@@ -903,7 +903,16 @@ fn sd_recording_progress(handle:tauri::AppHandle,key:String) -> Result<sd::Progr
     let current=SD_DOWNLOAD.lock().unwrap();
     match current.as_ref() {
         Some(p) if p.lock().unwrap().key==key => Ok(sd_progress(&handle,p)),
-        _ => Err("This download was replaced by another clip".into()),
+        _ => {
+            // A thumbnail fetch takes the slot as soon as a clip finishes, often before the page's next poll.
+            let file=PathBuf::from(&key);
+            let cache=handle.path().app_cache_dir().map_err(|e|e.to_string())?.join("sd");
+            if file.starts_with(&cache) && !file.components().any(|c|matches!(c,std::path::Component::ParentDir)) && file.extension().is_some_and(|e|e=="mp4") && file.is_file() {
+                let done=std::sync::Arc::new(Mutex::new(sd::Progress { key, done: true, file: Some(file), ..Default::default() }));
+                return Ok(sd_progress(&handle,&done));
+            }
+            Err("This download was replaced by another clip".into())
+        }
     }
 }
 fn sd_progress(handle:&tauri::AppHandle,p:&sd::Shared) -> sd::Progress {
